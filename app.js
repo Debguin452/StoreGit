@@ -9,6 +9,8 @@ let _uploadActive    = false;
 let _uploadPaused    = false;
 let _uploadAbortFn   = null;
 let _shareFile       = null;
+let _allRepos        = [];
+let _activeRepoIdx   = 0;
 const _sliceCache = new WeakMap();
 function precacheSlices(file) {
   if (file.size <= CHUNK_THRESHOLD) return;
@@ -67,9 +69,13 @@ on('clear-queue-btn',    'click',  () => clearQueue());
 on('refresh-files-btn',  'click',  () => loadFiles());
 on('fd-overlay',         'click',  e  => { if (e.target === e.currentTarget) closeFileDetail(); });
 on('pause-btn',          'click',  () => togglePause());
-on('fd-share-btn',       'click',  () => _shareFile && shareFile(_shareFile));
-on('share-done-btn',     'click',  () => closeShareModal());
+on('fd-share-btn',       'click',  () => _shareFile && openShareModal(_shareFile));
+on('share-close-btn',    'click',  () => closeShareModal());
+on('share-create-btn',   'click',  () => createShareLink());
 on('share-copy-btn',     'click',  () => copyShareLink());
+on('add-repo-toggle-btn','click',  () => toggleAddRepoForm());
+on('ar-cancel-btn',      'click',  () => toggleAddRepoForm(false));
+on('ar-submit-btn',      'click',  () => submitAddRepo());
 on('goto-reset',         'click',  e  => { e.preventDefault(); showScreen('reset'); });
 on('reset-back',         'click',  e  => { e.preventDefault(); showScreen('login'); });
 on('reset-btn',          'click',  () => doReset());
@@ -84,7 +90,6 @@ document.getElementById('share-ttl-opts')?.addEventListener('click', e => {
   if (!btn) return;
   document.querySelectorAll('.ttl-opt').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
-  if (_shareFile) shareFile(_shareFile);
 });
 on('fd-close-btn',       'click',  () => closeFileDetail());
 function showModal(title, msg, confirmLabel, confirmClass, onConfirm) {
@@ -149,32 +154,100 @@ function bootApp(me) {
   showScreen('app'); loadMeta(); loadFiles();
 }
 function updateRepoChip(repos, activeIdx) {
+  _allRepos = repos || [];
+  _activeRepoIdx = activeIdx || 0;
   const chip = document.getElementById('repo-chip');
-  if (!chip) return;
-  if (!repos || repos.length <= 1) { chip.style.display = 'none'; return; }
-  chip.style.display = 'flex';
-  chip.textContent = repos[activeIdx]?.label || 'Repo';
-  chip.onclick = () => showRepoSwitcher(repos, activeIdx);
+  const card = document.getElementById('repo-card');
+  if (chip) {
+    if (!repos || repos.length <= 1) {
+      chip.style.display = 'none';
+    } else {
+      chip.style.display = 'flex';
+      chip.textContent = repos[activeIdx]?.label || 'Repo';
+      chip.onclick = () => renderRepoList();
+    }
+  }
+  if (card) card.style.display = '';
+  renderRepoList();
 }
-function showRepoSwitcher(repos, activeIdx) {
-  const opts = repos.map((r, i) =>
-    `<div class="repo-opt${i === activeIdx ? ' active' : ''}" data-idx="${i}">${r.label || r.ghRepo}<div class="repo-opt-sub">${r.ghOwner}/${r.ghRepo}</div></div>`
-  ).join('');
-  showModal('Switch Repository', '', '', '', () => {});
-  document.getElementById('modal-msg').innerHTML = `<div class="repo-switcher">${opts}</div>`;
-  document.getElementById('modal-confirm-btn').style.display = 'none';
-  document.getElementById('modal-cancel-btn').textContent = 'Cancel';
-  document.querySelectorAll('.repo-opt').forEach(el => {
-    el.addEventListener('click', async () => {
-      const idx = parseInt(el.dataset.idx, 10);
-      if (idx === activeIdx) { document.getElementById('modal-overlay').classList.remove('open'); return; }
-      document.getElementById('modal-overlay').classList.remove('open');
-      try {
-        const r = await fetch('/api/switch-repo', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repoIdx: idx }) });
-        if (r.ok) { loadMeta(); loadFiles(); }
-      } catch {}
-    });
+function renderRepoList() {
+  const list = document.getElementById('repo-list');
+  if (!list) return;
+  list.innerHTML = '';
+  _allRepos.forEach((repo, i) => {
+    const isActive = i === _activeRepoIdx;
+    const item = elem('div', 'repo-item');
+    const info = elem('div', 'repo-item-info');
+    const labelRow = elem('div', 'repo-item-label');
+    labelRow.textContent = repo.label || `Repo ${i + 1}`;
+    if (isActive) {
+      const tag = elem('span', 'repo-active-tag');
+      tag.textContent = 'upload target';
+      labelRow.appendChild(tag);
+    }
+    const sub = elem('div', 'repo-item-sub');
+    sub.textContent = `${repo.ghOwner}/${repo.ghRepo}`;
+    info.append(labelRow, sub);
+    const acts = elem('div', 'repo-item-acts');
+    if (!isActive) {
+      const setBtn = elem('button', 'btn btn-ghost btn-xs');
+      setBtn.textContent = 'Set target';
+      setBtn.onclick = async () => {
+        try {
+          const r = await fetch('/api/switch-repo', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repoIdx: i }) });
+          if (r.ok) { await loadMeta(); loadFiles(); } else toast('Failed to switch repo.', 'error');
+        } catch { toast('Connection error.', 'error'); }
+      };
+      acts.appendChild(setBtn);
+      const delBtn = elem('button', 'btn btn-ghost btn-xs repo-del-btn');
+      delBtn.textContent = 'Remove';
+      delBtn.onclick = () => showModal(
+        `Remove "${repo.label || `Repo ${i + 1}`}"`,
+        'Files stay on GitHub — only the connection is removed from StoreGit.',
+        'Remove', 'btn-danger',
+        async () => {
+          try {
+            const r = await fetch('/api/remove-repo', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repoIdx: i }) });
+            if (r.ok) { toast('Repository removed.', 'ok'); await loadMeta(); loadFiles(); } else toast('Failed to remove.', 'error');
+          } catch { toast('Connection error.', 'error'); }
+        }
+      );
+      acts.appendChild(delBtn);
+    }
+    item.append(info, acts);
+    list.appendChild(item);
   });
+}
+function toggleAddRepoForm(show) {
+  const form = document.getElementById('add-repo-form');
+  const btn  = document.getElementById('add-repo-toggle-btn');
+  if (!form) return;
+  const open = show !== undefined ? !show : form.style.display !== 'none';
+  form.style.display = open ? 'none' : '';
+  btn.textContent = open ? 'Add' : 'Cancel';
+  if (!open) document.getElementById('ar-owner')?.focus();
+}
+async function submitAddRepo() {
+  const label  = document.getElementById('ar-label')?.value.trim() || '';
+  const owner  = document.getElementById('ar-owner')?.value.trim() || '';
+  const repo   = document.getElementById('ar-repo')?.value.trim() || '';
+  const branch = document.getElementById('ar-branch')?.value.trim() || 'main';
+  const errEl  = document.getElementById('ar-error');
+  const btn    = document.getElementById('ar-submit-btn');
+  errEl.textContent = '';
+  if (!owner || !repo) { errEl.textContent = 'GitHub owner and repository name are required.'; return; }
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    const r = await fetch('/api/add-repo', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ label: label || 'Repo', ghOwner: owner, ghRepo: repo, ghBranch: branch, folder: 'uploads' }) });
+    const d = await r.json();
+    if (r.ok) {
+      toast('Repository added.', 'ok');
+      ['ar-label','ar-owner','ar-repo'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+      toggleAddRepoForm(false);
+      await loadMeta(); loadFiles();
+    } else { errEl.textContent = d.error || 'Failed to add repository.'; }
+  } catch { errEl.textContent = 'Connection error. Please try again.'; }
+  btn.disabled = false; btn.textContent = 'Add Repository';
 }
 async function loadMeta() {
   try {
@@ -182,7 +255,7 @@ async function loadMeta() {
     if (r.ok) {
       const d = await r.json();
       document.getElementById('repo-label').textContent = d.repoLabel ? `${d.repoLabel} — ${d.repo}` : (d.repo || '');
-      updateRepoChip(d.repos, d.activeRepoIdx ?? 0);
+      updateRepoChip(d.repos || [], d.activeRepoIdx ?? 0);
     }
   } catch {}
 }
@@ -721,32 +794,38 @@ async function loadFilePreview(f) {
   noPreview('No preview available.<br>Download to open this file.');
 }
 
-async function shareFile(f) {
-  const overlay = document.getElementById('share-overlay');
-  const body    = document.getElementById('share-body');
+function openShareModal(f) {
+  _shareFile = f;
+  document.getElementById('share-file-name').textContent = f.originalName || f.name;
+  document.getElementById('share-pre').style.display = '';
+  document.getElementById('share-post').style.display = 'none';
+  document.getElementById('share-spinner').style.display = 'none';
+  document.getElementById('share-create-btn').style.display = '';
+  document.getElementById('share-link-input').value = '';
+  document.getElementById('share-exp').textContent = '';
+  document.getElementById('share-overlay').classList.add('open');
+}
+async function createShareLink() {
+  if (!_shareFile) return;
+  const pre     = document.getElementById('share-pre');
+  const post    = document.getElementById('share-post');
   const spinner = document.getElementById('share-spinner');
+  const createBtn = document.getElementById('share-create-btn');
   const input   = document.getElementById('share-link-input');
   const expEl   = document.getElementById('share-exp');
-  document.getElementById('share-file-name').textContent = f.originalName || f.name;
-  body.style.display = 'none';
+  pre.style.display = 'none';
+  createBtn.style.display = 'none';
   spinner.style.display = 'flex';
-  overlay.classList.add('open');
   const ttl = parseInt(document.querySelector('.ttl-opt.active')?.dataset.ttl || '3600', 10);
   try {
-    const r = await fetch(`/api/share-link?name=${encodeURIComponent(f.name)}&ttl=${ttl}`, { credentials: 'same-origin' });
+    const r = await fetch(`/api/share-link?name=${encodeURIComponent(_shareFile.name)}&ttl=${ttl}`, { credentials: 'same-origin' });
     if (r.status === 401) { doLogout(); return; }
     if (!r.ok) { toast('Could not generate share link.', 'error'); closeShareModal(); return; }
     const d = await r.json();
-    const fullUrl = window.location.origin + d.url;
-    input.value = fullUrl;
-    if (!d.exp) {
-      expEl.textContent = 'Never expires';
-    } else {
-      const exp = new Date(d.exp);
-      expEl.textContent = `Expires ${exp.toLocaleString()}`;
-    }
-    body.style.display = '';
+    input.value = window.location.origin + d.url;
+    expEl.textContent = d.exp ? `Expires ${new Date(d.exp).toLocaleString()}` : 'Never expires';
     spinner.style.display = 'none';
+    post.style.display = '';
   } catch {
     toast('Could not generate share link.', 'error');
     closeShareModal();
@@ -754,8 +833,10 @@ async function shareFile(f) {
 }
 function closeShareModal() {
   document.getElementById('share-overlay').classList.remove('open');
-  document.getElementById('share-body').style.display = 'none';
+  document.getElementById('share-pre').style.display = '';
+  document.getElementById('share-post').style.display = 'none';
   document.getElementById('share-spinner').style.display = 'none';
+  document.getElementById('share-create-btn').style.display = '';
   document.getElementById('share-link-input').value = '';
 }
 function copyShareLink() {

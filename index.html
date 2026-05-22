@@ -190,6 +190,24 @@
       <div id="file-list"></div>
     </div>
   </div>
+  <div class="card" id="repo-card" style="display:none">
+    <div class="card-header">
+      <div class="card-title">Repositories</div>
+      <button class="btn btn-ghost btn-sm" id="add-repo-toggle-btn">Add</button>
+    </div>
+    <div id="repo-list"></div>
+    <div id="add-repo-form" style="display:none">
+      <div class="field"><label for="ar-label">Label</label><input id="ar-label" placeholder="e.g. Media Backup" autocomplete="off" autocorrect="off" spellcheck="false"></div>
+      <div class="field"><label for="ar-owner">GitHub Owner</label><input id="ar-owner" placeholder="your-github-username" autocomplete="off" autocorrect="off" spellcheck="false"></div>
+      <div class="field"><label for="ar-repo">Repository Name</label><input id="ar-repo" placeholder="my-storage" autocomplete="off" autocorrect="off" spellcheck="false"></div>
+      <div class="field"><label for="ar-branch">Branch</label><input id="ar-branch" value="main" autocomplete="off"></div>
+      <div class="form-error" id="ar-error"></div>
+      <div class="ar-form-actions">
+        <button class="btn btn-primary btn-sm" id="ar-submit-btn">Add Repository</button>
+        <button class="btn btn-ghost btn-sm" id="ar-cancel-btn">Cancel</button>
+      </div>
+    </div>
+  </div>
   <div class="app-footer">Created by Deb Guin &nbsp;&middot;&nbsp; StoreGit</div>
 </div>
 <div class="dl-progress-bar" id="dl-bar">
@@ -230,8 +248,8 @@
 <div class="modal-overlay" id="share-overlay">
   <div class="modal share-modal">
     <div class="modal-title">Share File</div>
-    <div id="share-body">
-      <div class="share-file-name" id="share-file-name"></div>
+    <div class="share-file-name" id="share-file-name"></div>
+    <div id="share-pre">
       <div class="share-ttl-row">
         <span class="share-ttl-label">Expires in</span>
         <div class="share-ttl-opts" id="share-ttl-opts">
@@ -241,6 +259,8 @@
           <button class="ttl-opt" data-ttl="0">Never</button>
         </div>
       </div>
+    </div>
+    <div id="share-post" style="display:none">
       <div class="share-link-row">
         <input class="share-link-input" id="share-link-input" type="text" readonly>
         <button class="share-copy-btn" id="share-copy-btn">Copy</button>
@@ -249,7 +269,8 @@
     </div>
     <div class="share-spinner" id="share-spinner"><span class="spinner"></span></div>
     <div class="modal-actions">
-      <button class="btn btn-ghost" id="share-done-btn">Done</button>
+      <button class="btn btn-ghost" id="share-close-btn">Close</button>
+      <button class="btn btn-primary" id="share-create-btn">Create Link</button>
     </div>
   </div>
 </div>

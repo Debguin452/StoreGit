@@ -389,6 +389,7 @@ body {
 .share-copy-btn:active { opacity: .75; }
 .share-exp { font-size: .72rem; color: #999; margin-bottom: .5rem; }
 .share-spinner { display: none; align-items: center; justify-content: center; padding: 1.5rem 0; }
+.share-modal .modal-actions .btn-primary { background: #2563eb; color: #fff; }
 
 /* ── Outline button (share) ── */
 .btn-outline { background: transparent; border: 1.5px solid #dbeafe; color: #2563eb; }
@@ -415,6 +416,17 @@ body {
 .fd-actions { display: flex; gap: .5rem; }
 .fd-actions .btn { flex: 1; margin: 0; padding: .72rem .5rem; font-size: .82rem; }
 
+.repo-item { display: flex; align-items: center; justify-content: space-between; gap: .5rem; padding: .7rem 0; border-bottom: 1px solid #f0f4ff; }
+.repo-item:last-child { border-bottom: none; }
+.repo-item-info { flex: 1; min-width: 0; }
+.repo-item-label { font-size: .83rem; font-weight: 600; color: #111; display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; }
+.repo-item-sub { font-size: .72rem; color: #999; margin-top: 2px; }
+.repo-item-acts { display: flex; gap: .35rem; flex-shrink: 0; }
+.btn-xs { width: auto; padding: .3rem .6rem; font-size: .72rem; border-radius: 5px; }
+.repo-active-tag { font-size: .65rem; font-weight: 700; background: #eff6ff; color: #2563eb; border: 1px solid #bfdbfe; border-radius: 4px; padding: .1rem .35rem; letter-spacing: .02em; }
+.repo-del-btn { color: #c0392b; }
+.repo-del-btn:hover { background: #fef0f0 !important; }
+.ar-form-actions { display: flex; gap: .5rem; margin-top: .5rem; }
 @media (prefers-color-scheme: dark) {
   .share-file-name { color: #f0f0f0; }
   .share-ttl-label { color: #888; }
@@ -433,4 +445,11 @@ body {
   .repo-opt-sub { color: #666; }
   .queue-status.paused { color: #666; }
   .share-exp { color: #666; }
+  .repo-item { border-bottom-color: #1e2e50; }
+  .repo-item-label { color: #f0f0f0; }
+  .repo-item-sub { color: #666; }
+  .repo-active-tag { background: #1a2845; color: #60a5fa; border-color: #1e3060; }
+  .repo-del-btn { color: #ff6b6b; }
+  .repo-del-btn:hover { background: #2d1010 !important; }
+  .share-modal .modal-actions .btn-primary { background: #3b82f6; }
 }
