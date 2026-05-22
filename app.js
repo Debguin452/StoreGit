@@ -74,7 +74,7 @@ on('share-close-btn',    'click',  () => closeShareModal());
 on('share-create-btn',   'click',  () => createShareLink());
 on('share-copy-btn',     'click',  () => copyShareLink());
 on('add-repo-toggle-btn','click',  () => toggleAddRepoForm());
-on('ar-cancel-btn',      'click',  () => toggleAddRepoForm(false));
+on('ar-cancel-btn',      'click',  () => closeAddRepoForm());
 on('ar-submit-btn',      'click',  () => submitAddRepo());
 on('goto-reset',         'click',  e  => { e.preventDefault(); showScreen('reset'); });
 on('reset-back',         'click',  e  => { e.preventDefault(); showScreen('login'); });
@@ -218,14 +218,26 @@ function renderRepoList() {
     list.appendChild(item);
   });
 }
-function toggleAddRepoForm(show) {
+function closeAddRepoForm() {
   const form = document.getElementById('add-repo-form');
   const btn  = document.getElementById('add-repo-toggle-btn');
-  if (!form) return;
-  const open = show !== undefined ? !show : form.style.display !== 'none';
-  form.style.display = open ? 'none' : '';
-  btn.textContent = open ? 'Add' : 'Cancel';
-  if (!open) document.getElementById('ar-owner')?.focus();
+  if (!form || !btn) return;
+  form.style.display = 'none';
+  btn.textContent = 'Add';
+  const err = document.getElementById('ar-error');
+  if (err) err.textContent = '';
+}
+function toggleAddRepoForm() {
+  const form = document.getElementById('add-repo-form');
+  const btn  = document.getElementById('add-repo-toggle-btn');
+  if (!form || !btn) return;
+  if (form.style.display === 'none') {
+    form.style.display = '';
+    btn.textContent = 'Cancel';
+    document.getElementById('ar-owner')?.focus();
+  } else {
+    closeAddRepoForm();
+  }
 }
 async function submitAddRepo() {
   const label  = document.getElementById('ar-label')?.value.trim() || '';
@@ -243,7 +255,7 @@ async function submitAddRepo() {
     if (r.ok) {
       toast('Repository added.', 'ok');
       ['ar-label','ar-owner','ar-repo'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
-      toggleAddRepoForm(false);
+      closeAddRepoForm();
       await loadMeta(); loadFiles();
     } else { errEl.textContent = d.error || 'Failed to add repository.'; }
   } catch { errEl.textContent = 'Connection error. Please try again.'; }
