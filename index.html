@@ -153,8 +153,8 @@
       </div>
     </div>
     <div class="topbar-right">
-      <button class="repo-chip" id="repo-chip" title="Switch repository" style="display:none"></button>
-      <div class="user-chip" id="user-chip" title=""></div>
+      <div id="repo-chip" style="display:none"></div>
+      <div id="user-chip" style="display:none"></div>
       <button class="btn-signout" id="signout-btn" title="Sign out" aria-label="Sign out">
         <svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
       </button>
@@ -189,22 +189,29 @@
       </div>
       <div id="file-list"></div>
     </div>
-  </div>
-  <div class="card" id="repo-card" style="display:none">
-    <div class="card-header">
-      <div class="card-title">Repositories</div>
-      <button class="btn btn-ghost btn-sm" id="add-repo-toggle-btn">Add</button>
-    </div>
-    <div id="repo-list"></div>
-    <div id="add-repo-form" style="display:none">
-      <div class="field"><label for="ar-label">Label</label><input id="ar-label" placeholder="e.g. Media Backup" autocomplete="off" autocorrect="off" spellcheck="false"></div>
-      <div class="field"><label for="ar-owner">GitHub Owner</label><input id="ar-owner" placeholder="your-github-username" autocomplete="off" autocorrect="off" spellcheck="false"></div>
-      <div class="field"><label for="ar-repo">Repository Name</label><input id="ar-repo" placeholder="my-storage" autocomplete="off" autocorrect="off" spellcheck="false"></div>
-      <div class="field"><label for="ar-branch">Branch</label><input id="ar-branch" value="main" autocomplete="off"></div>
-      <div class="form-error" id="ar-error"></div>
-      <div class="ar-form-actions">
-        <button class="btn btn-primary btn-sm" id="ar-submit-btn">Add Repository</button>
-        <button class="btn btn-ghost btn-sm" id="ar-cancel-btn">Cancel</button>
+    <div class="card" id="repo-card">
+      <div class="card-header repo-card-header" id="repo-card-header">
+        <div class="card-title">Repositories</div>
+        <div class="repo-header-actions">
+          <button class="btn btn-ghost btn-sm" id="add-repo-toggle-btn" onclick="event.stopPropagation()">Add</button>
+          <button class="repo-toggle-btn" id="repo-toggle-btn" onclick="toggleRepoCard()" aria-label="Toggle">▾</button>
+        </div>
+      </div>
+      <div class="repo-card-body" id="repo-card-body" style="display:none">
+        <div id="repo-list"></div>
+        <div id="add-repo-form" style="display:none">
+          <div class="ar-fields">
+            <div class="field"><label for="ar-label">Label</label><input id="ar-label" placeholder="e.g. Media Backup" autocomplete="off" autocorrect="off" spellcheck="false"></div>
+            <div class="field"><label for="ar-owner">GitHub Owner</label><input id="ar-owner" placeholder="your-github-username" autocomplete="off" autocorrect="off" spellcheck="false"></div>
+            <div class="field"><label for="ar-repo">Repository Name</label><input id="ar-repo" placeholder="my-storage" autocomplete="off" autocorrect="off" spellcheck="false"></div>
+            <div class="field"><label for="ar-branch">Branch</label><input id="ar-branch" value="main" autocomplete="off"></div>
+          </div>
+          <div class="form-error" id="ar-error"></div>
+          <div class="ar-form-actions">
+            <button class="btn btn-primary btn-sm" id="ar-submit-btn">Add Repository</button>
+            <button class="btn btn-ghost btn-sm" id="ar-cancel-btn">Cancel</button>
+          </div>
+        </div>
       </div>
     </div>
   </div>

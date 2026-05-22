@@ -453,3 +453,56 @@ body {
   .repo-del-btn:hover { background: #2d1010 !important; }
   .share-modal .modal-actions .btn-primary { background: #3b82f6; }
 }
+
+/* ── Repo card collapsible ── */
+.repo-card-header { cursor: pointer; -webkit-tap-highlight-color: transparent; user-select: none; }
+.repo-header-actions { display: flex; align-items: center; gap: .35rem; }
+.repo-toggle-btn {
+  width: 26px; height: 26px; border-radius: 6px; border: none;
+  background: #eff6ff; color: #2563eb; font-size: .85rem;
+  cursor: pointer; display: flex; align-items: center; justify-content: center;
+  font-family: inherit; transition: background .12s;
+  -webkit-tap-highlight-color: transparent;
+}
+.repo-toggle-btn:hover { background: #dbeafe; }
+.repo-card-body { padding-top: .2rem; }
+
+/* ── Repo sections in file list ── */
+.repo-section { margin-bottom: .25rem; }
+.repo-section-header {
+  display: flex; flex-direction: column; gap: 1px;
+  padding: .6rem 0 .4rem; border-bottom: 1px solid #e8f0ff; margin-bottom: .1rem;
+}
+.repo-section-label {
+  font-size: .7rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .07em; color: #93c5fd;
+}
+.repo-section-sub { font-size: .68rem; color: #b0c4e8; }
+.repo-section-empty {
+  font-size: .78rem; color: #bbb; padding: .75rem .4rem; text-align: center;
+}
+
+/* ── Auto-routing note ── */
+.repo-auto-note {
+  font-size: .71rem; color: #93c5fd; padding: .3rem .1rem .65rem;
+  display: flex; align-items: center; gap: .3rem;
+}
+.repo-auto-note::before { content: '⚡'; font-size: .75rem; }
+
+/* ── Add repo form fields ── */
+.ar-fields { display: flex; flex-direction: column; gap: 0; padding-top: .5rem; }
+.ar-fields .field { margin-bottom: .75rem; }
+.ar-form-actions {
+  display: flex; gap: .5rem; margin-top: .65rem; padding-bottom: .15rem;
+}
+.ar-form-actions .btn { flex: 1; margin: 0; }
+
+@media (prefers-color-scheme: dark) {
+  .repo-toggle-btn { background: #1a2845; color: #60a5fa; }
+  .repo-toggle-btn:hover { background: #1e3060; }
+  .repo-section-header { border-bottom-color: #1e2e50; }
+  .repo-section-label { color: #3b5a8a; }
+  .repo-section-sub { color: #3a5070; }
+  .repo-section-empty { color: #444; }
+  .repo-auto-note { color: #3b5a8a; }
+}

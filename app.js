@@ -11,6 +11,8 @@ let _uploadAbortFn   = null;
 let _shareFile       = null;
 let _allRepos        = [];
 let _activeRepoIdx   = 0;
+let _repoFiles       = [];   // [{repo, repoIdx, files}] for all repos
+let _currentFileRepoIdx = 0; // repo index of currently open file
 const _sliceCache = new WeakMap();
 function precacheSlices(file) {
   if (file.size <= CHUNK_THRESHOLD) return;
@@ -156,17 +158,8 @@ function bootApp(me) {
 function updateRepoChip(repos, activeIdx) {
   _allRepos = repos || [];
   _activeRepoIdx = activeIdx || 0;
-  const chip = document.getElementById('repo-chip');
+  // Pills removed from topbar — just ensure repo card is visible
   const card = document.getElementById('repo-card');
-  if (chip) {
-    if (!repos || repos.length <= 1) {
-      chip.style.display = 'none';
-    } else {
-      chip.style.display = 'flex';
-      chip.textContent = repos[activeIdx]?.label || 'Repo';
-      chip.onclick = () => renderRepoList();
-    }
-  }
   if (card) card.style.display = '';
   renderRepoList();
 }
@@ -174,46 +167,34 @@ function renderRepoList() {
   const list = document.getElementById('repo-list');
   if (!list) return;
   list.innerHTML = '';
+  if (_allRepos.length > 1) {
+    const note = elem('div', 'repo-auto-note');
+    note.textContent = 'Uploads auto-route to the repo with the least usage.';
+    list.appendChild(note);
+  }
   _allRepos.forEach((repo, i) => {
-    const isActive = i === _activeRepoIdx;
     const item = elem('div', 'repo-item');
     const info = elem('div', 'repo-item-info');
     const labelRow = elem('div', 'repo-item-label');
     labelRow.textContent = repo.label || `Repo ${i + 1}`;
-    if (isActive) {
-      const tag = elem('span', 'repo-active-tag');
-      tag.textContent = 'upload target';
-      labelRow.appendChild(tag);
-    }
     const sub = elem('div', 'repo-item-sub');
     sub.textContent = `${repo.ghOwner}/${repo.ghRepo}`;
     info.append(labelRow, sub);
     const acts = elem('div', 'repo-item-acts');
-    if (!isActive) {
-      const setBtn = elem('button', 'btn btn-ghost btn-xs');
-      setBtn.textContent = 'Set target';
-      setBtn.onclick = async () => {
+    const delBtn = elem('button', 'btn btn-ghost btn-xs repo-del-btn');
+    delBtn.textContent = 'Remove';
+    delBtn.onclick = () => showModal(
+      `Remove "${repo.label || `Repo ${i + 1}`}"`,
+      'Files stay on GitHub — only the connection is removed from StoreGit.',
+      'Remove', 'btn-danger',
+      async () => {
         try {
-          const r = await fetch('/api/switch-repo', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repoIdx: i }) });
-          if (r.ok) { await loadMeta(); loadFiles(); } else toast('Failed to switch repo.', 'error');
+          const r = await fetch('/api/remove-repo', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repoIdx: i }) });
+          if (r.ok) { toast('Repository removed.', 'ok'); await loadMeta(); loadFiles(); } else toast('Failed to remove.', 'error');
         } catch { toast('Connection error.', 'error'); }
-      };
-      acts.appendChild(setBtn);
-      const delBtn = elem('button', 'btn btn-ghost btn-xs repo-del-btn');
-      delBtn.textContent = 'Remove';
-      delBtn.onclick = () => showModal(
-        `Remove "${repo.label || `Repo ${i + 1}`}"`,
-        'Files stay on GitHub — only the connection is removed from StoreGit.',
-        'Remove', 'btn-danger',
-        async () => {
-          try {
-            const r = await fetch('/api/remove-repo', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repoIdx: i }) });
-            if (r.ok) { toast('Repository removed.', 'ok'); await loadMeta(); loadFiles(); } else toast('Failed to remove.', 'error');
-          } catch { toast('Connection error.', 'error'); }
-        }
-      );
-      acts.appendChild(delBtn);
-    }
+      }
+    );
+    acts.appendChild(delBtn);
     item.append(info, acts);
     list.appendChild(item);
   });
@@ -227,10 +208,104 @@ function closeAddRepoForm() {
   const err = document.getElementById('ar-error');
   if (err) err.textContent = '';
 }
+function toggleRepoCard() {
+  const body = document.getElementById('repo-card-body');
+  const btn  = document.getElementById('repo-toggle-btn');
+  if (!body) return;
+  const isOpen = body.style.display !== 'none';
+  body.style.display = isOpen ? 'none' : '';
+  if (btn) btn.textContent = isOpen ? '▾' : '▴';
+  if (isOpen) closeAddRepoForm();
+}
+async function ensureRepoActive(repoIdx) {
+  if (repoIdx === undefined || repoIdx === _activeRepoIdx || _allRepos.length <= 1) return;
+  try {
+    const r = await fetch('/api/switch-repo', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repoIdx })
+    });
+    if (r.ok) _activeRepoIdx = repoIdx;
+  } catch { /* best effort */ }
+}
+async function getSmartRepoIdx() {
+  if (_allRepos.length <= 1 || _repoFiles.length === 0) return _activeRepoIdx;
+  let minSize = Infinity, minIdx = _activeRepoIdx;
+  for (const group of _repoFiles) {
+    const total = (group.files || [])
+      .filter(f => f.name !== '.storegit')
+      .reduce((sum, f) => sum + (f.size || 0), 0);
+    if (total < minSize) { minSize = total; minIdx = group.repoIdx; }
+  }
+  return minIdx;
+}
+function buildFileRow(f) {
+  const row  = elem('div', 'file-row');
+  const badge = elem('div', 'file-type-badge');
+  const displayName = f.originalName || f.name;
+  badge.textContent = fileExt(displayName);
+  badge.style.background = fileColor(fileExtRaw(displayName));
+  badge.style.color = '#fff';
+  const info = elem('div', 'file-info');
+  const nm   = elem('div', 'file-name'); nm.textContent = displayName; nm.title = displayName;
+  const mt   = elem('div', 'file-meta'); mt.textContent = fmtSize(f.size);
+  info.append(nm, mt);
+  const chevron = elem('div', 'file-chevron');
+  chevron.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><polyline points="9 18 15 12 9 6"/></svg>`;
+  row.append(badge, info, chevron);
+  row.onclick = () => openFileDetail(f);
+  return row;
+}
+function renderAllFiles(groups) {
+  const el = document.getElementById('file-list');
+  el.innerHTML = '';
+  const showSections = groups.length > 1;
+  let totalVisible = 0;
+  for (const group of groups) {
+    const visible = (group.files || [])
+      .filter(f => f.name !== '.storegit')
+      .sort((a, b) => {
+        if (!a.uploadedAt && !b.uploadedAt) return 0;
+        if (!a.uploadedAt) return 1;
+        if (!b.uploadedAt) return -1;
+        return new Date(b.uploadedAt) - new Date(a.uploadedAt);
+      });
+    if (showSections) {
+      const totalSize = visible.reduce((sum, f) => sum + (f.size || 0), 0);
+      const repoName = group.repo?.label || `Repo ${group.repoIdx + 1}`;
+      const repoSub  = group.repo ? `${group.repo.ghOwner}/${group.repo.ghRepo}` : '';
+      const section  = elem('div', 'repo-section');
+      const hdr      = elem('div', 'repo-section-header');
+      const lbl      = elem('div', 'repo-section-label'); lbl.textContent = repoName;
+      const sub      = elem('div', 'repo-section-sub');
+      sub.textContent = repoSub + (totalSize ? ' · ' + fmtSize(totalSize) : '');
+      hdr.append(lbl, sub);
+      section.appendChild(hdr);
+      if (visible.length === 0) {
+        const empty = elem('div', 'repo-section-empty'); empty.textContent = 'No files yet.';
+        section.appendChild(empty);
+      } else {
+        visible.forEach(f => section.appendChild(buildFileRow(f)));
+      }
+      el.appendChild(section);
+    } else {
+      visible.forEach(f => el.appendChild(buildFileRow(f)));
+    }
+    totalVisible += visible.length;
+  }
+  if (totalVisible === 0) { el.innerHTML = ''; el.appendChild(emptyState('No files uploaded yet.')); }
+}
 function toggleAddRepoForm() {
   const form = document.getElementById('add-repo-form');
   const btn  = document.getElementById('add-repo-toggle-btn');
   if (!form || !btn) return;
+  // Ensure the repo card body is visible first
+  const body = document.getElementById('repo-card-body');
+  const toggleBtn = document.getElementById('repo-toggle-btn');
+  if (body && body.style.display === 'none') {
+    body.style.display = '';
+    if (toggleBtn) toggleBtn.textContent = '▴';
+  }
   if (form.style.display === 'none') {
     form.style.display = '';
     btn.textContent = 'Cancel';
@@ -331,10 +406,28 @@ async function loadFiles() {
   const el=document.getElementById('file-list');
   el.innerHTML='<div class="loading-row"><span class="spinner"></span> Loading files…</div>';
   try {
-    const r=await fetch('/api/files',{credentials:'same-origin'});
-    if(r.status===401){doLogout();return;}
-    if(!r.ok) throw new Error('Failed to load files.');
-    renderFiles(await r.json());
+    if (_allRepos.length <= 1) {
+      const r=await fetch('/api/files',{credentials:'same-origin'});
+      if(r.status===401){doLogout();return;}
+      if(!r.ok) throw new Error('Failed to load files.');
+      const files=await r.json();
+      _repoFiles=[{repo:_allRepos[0]||null,repoIdx:0,files}];
+    } else {
+      const groups=[];
+      for(let i=0;i<_allRepos.length;i++){
+        try{
+          const sr=await fetch('/api/switch-repo',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({repoIdx:i})});
+          if(!sr.ok) continue;
+          const fr=await fetch('/api/files',{credentials:'same-origin'});
+          if(fr.status===401){doLogout();return;}
+          if(!fr.ok) continue;
+          const files=await fr.json();
+          groups.push({repo:_allRepos[i],repoIdx:i,files:files.map(f=>({...f,_repoIdx:i}))});
+        }catch{/* skip this repo */}
+      }
+      _repoFiles=groups;
+    }
+    renderAllFiles(_repoFiles);
   } catch(e){el.innerHTML='';el.appendChild(emptyState(e.message));}
 }
 function renderFiles(files) {
@@ -512,6 +605,20 @@ function togglePause() {
 async function startUpload() {
   if (_uploadActive) return;
   if (!uploadPending.length) return;
+  // Smart routing: auto-select the repo with the least total file size
+  if (_allRepos.length > 1) {
+    const smartIdx = await getSmartRepoIdx();
+    if (smartIdx !== _activeRepoIdx) {
+      try {
+        const r = await fetch('/api/switch-repo', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ repoIdx: smartIdx })
+        });
+        if (r.ok) _activeRepoIdx = smartIdx;
+      } catch { /* continue with current */ }
+    }
+  }
   _uploadActive = true;
   _uploadPaused = false;
   renderQueue();
@@ -710,6 +817,7 @@ const FD_VIDEO = new Set(['mp4','webm','mov','m4v']);
 const FD_TEXT  = new Set(['txt','md','markdown','csv','json','log','ini','cfg','conf','yaml','yml','toml','nfo','diff','patch']);
 function openFileDetail(f) {
   _shareFile = f;
+  _currentFileRepoIdx = f._repoIdx !== undefined ? f._repoIdx : _activeRepoIdx;
   const displayName = f.originalName || f.name;
   const iconEl = document.getElementById('fd-icon');
   iconEl.textContent = fileExt(displayName);
@@ -717,15 +825,19 @@ function openFileDetail(f) {
   iconEl.style.color = '#fff';
   document.getElementById('fd-name').textContent = displayName;
   document.getElementById('fd-meta').textContent = fmtSize(f.size);
-  document.getElementById('fd-dl-btn').onclick  = () => downloadFile(f.name, f.size, displayName);
-  document.getElementById('fd-del-btn').onclick = () => {
+  document.getElementById('fd-dl-btn').onclick = async () => {
+    await ensureRepoActive(_currentFileRepoIdx);
+    downloadFile(f.name, f.size, displayName);
+  };
+  document.getElementById('fd-del-btn').onclick = async () => {
+    await ensureRepoActive(_currentFileRepoIdx);
     closeFileDetail();
     setTimeout(() => deleteFile(f.name, f.sha, f.chunked || false, displayName), 250);
   };
   document.getElementById('fd-preview').innerHTML =
     '<div class="fd-preview-loading"><span class="spinner"></span> Loading preview…</div>';
   document.getElementById('fd-overlay').classList.add('open');
-  loadFilePreview(f);
+  ensureRepoActive(_currentFileRepoIdx).then(() => loadFilePreview(f));
 }
 function closeFileDetail() {
   document.getElementById('fd-overlay').classList.remove('open');
@@ -819,6 +931,7 @@ function openShareModal(f) {
 }
 async function createShareLink() {
   if (!_shareFile) return;
+  await ensureRepoActive(_currentFileRepoIdx);
   const pre     = document.getElementById('share-pre');
   const post    = document.getElementById('share-post');
   const spinner = document.getElementById('share-spinner');
