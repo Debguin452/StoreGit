@@ -160,6 +160,10 @@ function startLockout(secs) {
   tick(); const t = setInterval(tick, 1000);
 }
 function bootApp(me) {
+  // Ensure drawer is fully closed on boot
+  ['drawer','drawer-overlay'].forEach(id => document.getElementById(id)?.classList.remove('is-open'));
+  document.getElementById('hamburger-btn')?.classList.remove('is-open');
+  document.body.style.overflow = '';
   showScreen('app'); loadMeta(); loadFiles();
 }
 function updateRepoChip(repos, activeIdx) {
@@ -545,19 +549,22 @@ async function loadFiles() {
       const files=await r.json();
       _repoFiles=[{repo:_allRepos[0]||null,repoIdx:0,files}];
     } else {
-      const groups=[];
-      for(let i=0;i<_allRepos.length;i++){
-        try{
-          const sr=await fetch('/api/switch-repo',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({repoIdx:i})});
-          if(!sr.ok) continue;
-          const fr=await fetch('/api/files',{credentials:'same-origin'});
-          if(fr.status===401){doLogout();return;}
-          if(!fr.ok) continue;
-          const files=await fr.json();
-          groups.push({repo:_allRepos[i],repoIdx:i,files:files.map(f=>({...f,_repoIdx:i}))});
-        }catch{/* skip this repo */}
-      }
-      _repoFiles=groups;
+      // Fetch all repos in parallel using ?repoIdx= — no session mutation
+      const results = await Promise.allSettled(
+        _allRepos.map((repo, i) =>
+          fetch(`/api/files?repoIdx=${i}`, { credentials: 'same-origin' })
+            .then(r => {
+              if (r.status === 401) { doLogout(); throw new Error('unauth'); }
+              if (!r.ok) throw new Error(`repo_${i}_fail`);
+              return r.json();
+            })
+            .then(files => ({ repo, repoIdx: i, files: files.map(f => ({ ...f, _repoIdx: i })) }))
+        )
+      );
+      const groups = results
+        .filter(r => r.status === 'fulfilled')
+        .map(r => r.value);
+      _repoFiles = groups;
     }
     renderAllFiles(_repoFiles);
   } catch(e){el.innerHTML='';el.appendChild(emptyState(e.message));}

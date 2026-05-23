@@ -223,7 +223,11 @@ Accessible with API key.
 ### Files
 
 #### `GET /api/files`
-List all files across all repos:
+#### `GET /api/files?repoIdx=<n>`
+
+List files. Without `repoIdx`, returns files from the session's active repo.  
+With `repoIdx`, returns files from that specific repo without mutating session state — used internally to fetch all repos in parallel.
+
 ```json
 [
   { "name": "report_2025.pdf", "originalName": "report 2025.pdf",
@@ -446,6 +450,9 @@ If you created the key with `allowedOrigins: ["https://myapp.com"]`:
 - **`POST /api/remove-repo`** — remove secondary repositories from the UI
 - **Short-link bias fix** — share link IDs now use rejection-sampling via `randomAlphabetString`
 - **Session JTI upgrade** — 24-byte Base64URL (192 bits) instead of 16-byte hex (128 bits)
+- **`GET /api/files?repoIdx=n`** — fetch any repo's files without mutating session state; client now loads all repos in parallel
+- **Unicode-safe registry writes** — replaced `btoa()` with `b64urlEnc(ENC.encode())` in `writeReg`, `readReg`, and `readIndex`; eliminates upstream 502 errors when encrypted API key data contains non-Latin-1 characters
+- **Drawer always closed on load** — boot sequence resets all drawer state; forms inside the drawer are hidden by default
 
 ### v1.x
 - Initial release — upload, download, delete, chunked upload, share links, multi-repo support
