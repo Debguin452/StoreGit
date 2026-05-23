@@ -493,12 +493,12 @@ async function readReg(path, env) {
   if (res.status === 404) return null;
   if (!res.ok) throw new Error('reg_read_fail');
   const d = await res.json();
-  return { content: JSON.parse(atob(d.content.replace(/\s/g,''))), sha: d.sha };
+  return { content: JSON.parse(DEC.decode(b64urlDec(d.content.replace(/\s/g,'')))), sha: d.sha };
 }
 async function writeReg(path, content, msg, env, sha = null) {
   const res = await fetch(`${regBase(env)}/contents/${path}`, {
     method: 'PUT', headers: regH(env),
-    body: JSON.stringify({ message: msg, content: btoa(JSON.stringify(content,null,2)), branch: REGISTRY_BRANCH, ...(sha?{sha}:{}) }),
+    body: JSON.stringify({ message: msg, content: b64urlEnc(ENC.encode(JSON.stringify(content,null,2))), branch: REGISTRY_BRANCH, ...(sha?{sha}:{}) }),
   });
   if (!res.ok) throw new Error('reg_write_fail');
   return (await res.json()).content?.sha;
@@ -534,7 +534,7 @@ async function readIndex(sess) {
   if (res.status === 404) return { data: {}, sha: null };
   if (!res.ok) return { data: {}, sha: null };
   const d = await res.json();
-  return { data: JSON.parse(atob(d.content.replace(/\s/g,''))), sha: d.sha };
+  return { data: JSON.parse(DEC.decode(b64urlDec(d.content.replace(/\s/g,'')))), sha: d.sha };
 }
 async function writeIndex(sess, data, existingSha) {
   const { ghToken, ghOwner, ghRepo, ghBranch, folder } = sess;
@@ -1071,6 +1071,20 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     return jRes({ url, exp });
   }
   if (route === 'files' && method === 'GET') {
+    // Optional ?repoIdx= param lets callers fetch a specific repo without switching session
+    const qRepoIdx = parseInt(new URL(request.url).searchParams.get('repoIdx') ?? '', 10);
+    if (!isNaN(qRepoIdx) && qRepoIdx >= 0 && qRepoIdx < fullSess.repos.length && qRepoIdx !== fullSess.activeRepoIdx) {
+      // Build a one-off session for this repo index without mutating the session
+      const targetRepo = fullSess.repos[qRepoIdx];
+      fullSess = {
+        ...fullSess,
+        ghOwner: targetRepo.ghOwner, ghRepo: targetRepo.ghRepo,
+        ghBranch: targetRepo.ghBranch || 'main',
+        folder: targetRepo.folder || 'uploads',
+        repoLabel: targetRepo.label || `Repo ${qRepoIdx + 1}`,
+        activeRepoIdx: qRepoIdx,
+      };
+    }
     try {
       const [regular, { data: idx }] = await Promise.all([
         listFiles(fullSess),
