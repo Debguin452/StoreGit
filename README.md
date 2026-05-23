@@ -1,467 +1,451 @@
 # StoreGit
 
-A serverless file(or codes) storage service built on **Cloudflare Pages Functions** and the **GitHub Contents / Git Data APIs**. Each registered user is backed by their own GitHub repository. The operator deploys a single Cloudflare Pages project; users bring their own GitHub repository and personal access token.
+A serverless file-storage service built on **Cloudflare Pages Functions** and the **GitHub Contents / Git Data APIs**. Each user is backed by their own GitHub repository. The operator deploys one Cloudflare Pages project; users bring their own GitHub repo and personal access token.
 
 ---
 
 ## Table of Contents
 
-- [Architecture](#architecture)
-- [Authentication](#authentication)
-- [File Storage](#file-storage)
-- [File Operations](#file-operations)
-- [Security Model](#security-model)
-- [Rate Limiting](#rate-limiting)
-- [Blocked File Types](#blocked-file-types)
-- [File Size Limits](#file-size-limits)
-- [API Reference](#api-reference)
-- [Operator Deployment](#operator-deployment)
-- [User Registration](#user-registration)
-- [License](#license)
+1. [Architecture](#architecture)
+2. [Features](#features)
+3. [Security Model](#security-model)
+4. [API Key System](#api-key-system)
+5. [REST API Reference](#rest-api-reference)
+6. [Deployment](#deployment)
+7. [KV Namespace Bindings](#kv-namespace-bindings)
+8. [Environment Variables](#environment-variables)
+9. [Development](#development)
+10. [Using StoreGit from Another Project](#using-storegit-from-another-project)
+11. [Changelog](#changelog)
 
 ---
 
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────┐
-│                  Cloudflare Pages (Operator)                │
-│                                                             │
-│   User A  ──►  GitHub Repo A  (user file storage)          │
-│   User B  ──►  GitHub Repo B  (user file storage)          │
-│   User C  ──►  GitHub Repo C  (user file storage)          │
-│                                                             │
-│   Registry Repo  ──►  Stores all user account records      │
-└───────────────────────────────────────────────────┘
+Browser / External App
+        │
+        │  HTTPS  (X-API-Key header  OR  session cookie)
+        ▼
+Cloudflare Pages (CDN edge)
+        │
+        ├─ functions/_middleware.js   ← Security headers, rate-limit, bot-block
+        ├─ functions/api/[[path]].js  ← All API routes
+        └─ functions/[id].js          ← Short-link share resolver
+        │
+        │  GitHub REST API + Git Data API
+        ▼
+GitHub Repository (one per user — the actual file store)
 ```
 
-The operator maintains one **registry repository** on GitHub that stores all user account records as JSON files. Each user owns and controls their own separate **storage repository**; the operator never has direct write access to user data beyond what the user's encrypted token permits.
+File data never transits Cloudflare KV. KV holds only:
 
-All API logic runs inside a single Cloudflare Pages Function at `functions/api/[[path]].js`. There is no origin server, database, or persistent compute outside of Cloudflare KV (used for rate limiting).
+| KV key pattern | Value |
+|---|---|
+| `apikey:sha256:<hex>` | `{ username, label, allowedOrigins, keyId }` |
+| `sess_cache:<jti>` | Cached session payload |
+| `revoked:<jti>` | Revoked session marker |
+| `rate:<scope>:<window>` | Rate-limit counters |
+| `sl:<shortId>` | Share-link metadata |
 
 ---
 
-## Authentication
+## Features
 
-### Session Lifecycle
-
-- **Login** — credentials are verified server-side; on success a signed, encrypted session token is set as an `HttpOnly` cookie.
-- **Session token format** — the payload is encrypted with **AES-256-GCM** and signed with **HMAC-SHA256**. The client receives an opaque blob; the plaintext is never exposed.
-- **Session TTL** — 8 hours. Tokens are validated on every authenticated request.
-- **Logout** — the session cookie is cleared server-side; the client receives a `Set-Cookie` header that expires immediately.
-
-### Password Hashing
-
-Passwords are hashed with **PBKDF2-SHA256** using the Web Crypto API (`crypto.subtle`).
-
-| Parameter | Value | Rationale |
-|---|---|---|
-| Hash function | SHA-256 | — |
-| Iterations (current) | 100,000 | 600,000 would exceed Cloudflare Worker CPU limits (~5–15 ms at 100k vs. ~60–200 ms at 600k, which causes a Worker kill) |
-| Iterations (legacy) | 50,000 | Accounts created before the 100k migration; auto-upgraded on next successful login |
-| Salt | 16 bytes, random per user | `crypto.getRandomValues` |
-| Output | 256-bit derived key | — |
-
-Legacy accounts (hashed at 50,000 iterations) are transparently re-hashed to 100,000 iterations on the next successful login without any user action.
-
-### Timing Attack Mitigation
-
-- All credential comparisons use constant-time equality checks.
-- On a failed login for an unknown username, a dummy `pbkdf2Hash` call is executed against a random salt to ensure the response time is indistinguishable from a valid user lookup, preventing username enumeration via timing.
-
----
-
-## File Storage
-
-### Repository Layout (per user)
-
-```
-<folder>/                              ← configurable at signup (default: uploads/)
-├── document.pdf                       ← small files (≤ 5 MB), stored via Contents API
-├── archive.zip                        ← small files (≤ 5 MB), stored via Contents API
-├── .chunks/
-│   └── large-video.mp4/
-│       ├── large-video.mp4.part0      ← 10 MB chunk
-│       ├── large-video.mp4.part1
-│       └── large-video.mp4.part2
-└── .manifests/
-    ├── large-video.mp4.json           ← per-file chunk manifest
-    └── _index.json                    ← master index: filename → { totalSize, totalChunks }
-```
-
-Chunks, manifests, and the index file are filtered out of all file listing responses. Users interact only with logical filenames.
-
-### Small Files (≤ 5 MB)
-
-Uploaded directly via the **GitHub Contents API** (`PUT /repos/{owner}/{repo}/contents/{path}`), encoded as Base64. The SHA of the resulting blob is stored and used for subsequent update and delete operations.
-
-### Large Files (> 5 MB)
-
-Uploaded in **10 MB chunks** via the **GitHub Git Data API**:
-
-1. Each chunk is uploaded as a Git blob (`POST /git/blobs`).
-2. A tree is constructed containing all chunk blobs (`POST /git/trees`).
-3. A commit is created referencing the tree (`POST /git/commits`).
-4. The branch ref is updated to point at the new commit (`PATCH /git/refs/heads/{branch}`).
-
-A manifest file (`<folder>/.manifests/<filename>.json`) records the blob SHA, size, and part index for each chunk. The master index (`_index.json`) maps each chunked filename to its total size and total chunk count.
-
-**Chunk pre-slicing** — files above the 5 MB threshold are pre-sliced into `Blob` segments and cached in a `WeakMap` on the client as soon as they are queued, so no re-slicing is needed at upload time.
-
-**Maximum chunk count** — 512 chunks × 10 MB = ~5 GB theoretical maximum per file.
-
-### Download and Reassembly
-
-All downloads are proxied through the Cloudflare Worker. GitHub repository URLs are never sent to the client.
-
-- **Small files** — fetched via the Contents API and streamed to the client.
-- **Chunked files** — the Worker reads `_index.json` to identify chunked files, fetches each part blob in sequence, concatenates them, and streams the complete file. The client receives a single uninterrupted byte stream.
-
-A `Content-Length` header is set on the response where the total size is known.
-
----
-
-## File Operations
-
-### Upload
-
-| Path | API used | Condition |
-|---|---|---|
-| Direct | GitHub Contents API | File ≤ 5 MB |
-| Chunked | GitHub Git Data API | File > 5 MB |
-
-Chunked uploads use three endpoints: `/api/upload-chunk` (one call per part) followed by `/api/upload-finalize` (writes the manifest and updates `_index.json`).
-
-### Delete
-
-- **Small file** — issues a `DELETE` to the GitHub Contents API using the stored blob SHA.
-- **Chunked file** — deletes every part blob from `.chunks/<filename>/`, the per-file manifest from `.manifests/`, and removes the entry from `_index.json`, all in a single atomic commit.
-
-### File Listing
-
-`GET /api/files` returns metadata for all top-level files in the user's upload folder. Internal paths (`.chunks/`, `.manifests/`, `.storegit`) are excluded from all responses. For chunked files, metadata (name, total size) is sourced from `_index.json` rather than the raw GitHub tree.
+- **File upload / download / delete** via GitHub Contents API (small files) and Git Data API (chunked, up to ~5 GB)
+- **Multiple repositories** per account, with auto-routing to the repo with the least usage
+- **Shareable links** with configurable expiry (1 hr → 7 days → never), shortened to 4–6 character Base64URL IDs
+- **Hamburger drawer menu** — repositories and API key management in a slide-in panel
+- **API keys** — generate keys in-app, bind to specific origins, revoke instantly
+- **Security middleware** — CSP, HSTS, CORS, bot-blocking, rate-limiting on every edge request
+- **Dark mode** — system preference via `prefers-color-scheme`
+- **Offline-tolerant** — upload queue survives page refresh
 
 ---
 
 ## Security Model
 
-| Concern | Implementation |
+### Global middleware (`functions/_middleware.js`)
+
+Every request — HTML, API, static asset — passes through `_middleware.js` before anything else runs. It enforces:
+
+| Check | Detail |
 |---|---|
-| Password storage | PBKDF2-SHA256, 100,000 iterations, 16-byte random salt per user |
-| GitHub token storage | AES-256-GCM; encryption key derived from `TOKEN_SECRET` + username via HKDF-SHA256 |
-| Session tokens | AES-256-GCM encrypted payload + HMAC-SHA256 signature; 8-hour TTL |
-| GitHub repository URLs | Never sent to the client; all file transfers are proxied server-side |
-| Brute-force protection | 5 login attempts per IP / 15-minute window; 10 per username; 3 signup attempts per IP |
-| Timing attack mitigation | Dummy `pbkdf2Hash` on unknown username; constant-time equality for all comparisons |
-| File extension blocklist | Enforced on both client and server |
-| Magic byte scanning | Server inspects the first 16 bytes of every upload for known executable signatures, regardless of declared extension |
-| Content Security Policy | Blocks all inline scripts; `connect-src` restricted to `'self'` and `api.github.com` |
-| CORS | `Access-Control-Allow-Origin` set to the exact request `Origin` only when it matches `https://<Host>`; wildcard never used |
-| Security headers | `Strict-Transport-Security` (2 years, `includeSubDomains`, `preload`), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy` (disables camera, microphone, geolocation, payment, USB, display-capture, clipboard, wake-lock, and sensors) |
-| Input validation | Username, repo owner, repo name, branch, and folder validated with strict regex server-side before any GitHub API call |
-| Filename sanitisation | Filenames validated against `/^[a-zA-Z0-9][a-zA-Z0-9._\-()\s]{0,253}$/`; path traversal characters rejected |
+| **HTTPS redirect** | HTTP → HTTPS 301 in production |
+| **Bad user-agent block** | sqlmap, nikto, nmap, masscan, dirbuster, nuclei, burpsuite, … |
+| **Global rate limit** | 600 req/min per IP (in-process `Map` with 1-min sliding window) |
+| **Method allowlist** | `GET POST DELETE OPTIONS HEAD` only — all others → 405 |
+| **Path traversal** | Rejects `..`, null bytes, `%00` in path |
+| **Scanner probe block** | `/wp-admin`, `/.env`, `/.git`, `/phpmyadmin`, `/xmlrpc`, … → 404 |
+| **Body size cap** | 10 MB hard limit on non-API routes |
+| **Security headers** | See table below |
+| **Information stripping** | Removes `Server`, `X-Powered-By`, `X-AspNet-Version` |
 
-### Token Encryption Detail
+**Security headers set on every response:**
 
-Each user's GitHub personal access token is encrypted before being written to the registry repository:
+```
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+Referrer-Policy: no-referrer
+X-Permitted-Cross-Domain-Policies: none
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+Cross-Origin-Resource-Policy: same-origin
+Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), …
+Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
+Content-Security-Policy: (HTML pages only — strict default-src 'none')
+```
 
-1. A per-user encryption key is derived using **HKDF-SHA256** from the operator's `TOKEN_SECRET` and the username as the HKDF info parameter.
-2. The token is encrypted with **AES-256-GCM** using a 12-byte random IV.
-3. The ciphertext and IV are stored in the user's registry record. The plaintext token is never persisted.
+### Session security
+
+- Sessions use HMAC-SHA-256 signed JWTs stored in `HttpOnly; Secure; SameSite=Strict` cookies
+- JTI is **24 bytes of CSPRNG encoded as Base64URL** (192 bits — unguessable)
+- Sessions refresh automatically when within 1 hour of expiry
+- Revoked sessions are marked in KV and rejected immediately
+
+### API key security
+
+See [API Key System](#api-key-system) below.
 
 ---
 
-## Rate Limiting
+## API Key System
 
-Rate-limit state is stored in a **Cloudflare KV** namespace (`RATE_LIMIT_KV`). Without the KV binding, a fallback in-memory `Map` is used; this resets on every Worker cold start and is not suitable for production.
-
-| Limit | Window | Scope |
-|---|---|---|
-| 5 login attempts | 15 minutes | Per IP address |
-| 10 login attempts | 15 minutes | Per username |
-| 3 signup attempts | 15 minutes | Per IP address |
-
-On exceeding the IP-based login limit, the server responds with HTTP `429`. KV entries are stored with a TTL matching the window expiry so records are cleaned up automatically.
-
----
-
-## Blocked File Types
-
-Extension blocklist (enforced client-side and server-side):
+### Key format
 
 ```
-exe  bat  cmd  com  msi  ps1  psm1
-sh   bash zsh  fish command
-php  php3 php4 php5 php7 php8 phtml phar
-asp  aspx cshtml jsp jspx
-py   pyc  pyw  rb   pl   cgi  lua
-js   mjs  cjs  ts   tsx  jsx
-html htm  xhtml svg  xml
-htaccess htpasswd
-dll  so   dylib sys
-vbs  vbe  wsf  wsh  hta
-jar  war  ear  class
-scr  pif  reg  lnk
-app  dmg  pkg  deb  rpm  apk
+sgk_<43 Base64URL characters>
 ```
 
-In addition, the server inspects the **first 16 bytes** of every uploaded file for known executable magic byte sequences, regardless of the declared extension:
-
-| Bytes (hex) | Format |
+| Property | Value |
 |---|---|
-| `4D 5A` | Windows PE (MZ) |
-| `7F 45 4C 46` | ELF binary |
-| `FE ED FA CE` / `FE ED FA CF` / `CE FA ED FE` / `CF FA ED FE` | Mach-O (32/64-bit, big/little-endian) |
-| `CA FE BA BE` | Java class file |
-| `23 21` | Shell shebang (`#!`) |
-| `3C 3F 70 68 70` | PHP opening tag (`<?php`) |
-| `3C 73 63 72 69 70 74` | `<script` tag |
-| `3C 68 74 6D 6C` / `3C 48 54 4D 4C` | HTML tag (lower/upper case) |
+| Entropy | 32 bytes = **256 bits** of CSPRNG |
+| Alphabet | Base64URL — `A-Z a-z 0-9 - _` (64 chars, 6 bits/char) |
+| Encoding | RFC 4648 §5, bias-free (no modulo bias) |
+| Total chars | `sgk_` + 43 = **47 characters** |
+| Visual footprint | Smaller than hex (hex needs 68 chars for the same 256-bit key) |
 
----
+**Why Base64URL over hex:**
 
-## File Size Limits
-
-| Boundary | Value | Enforced by |
-|---|---|---|
-| Small-file threshold | 5 MB | Server (`SMALL_MAX_BYTES`) |
-| Chunk size | 10 MB | Client + server (`CHUNK_SIZE`) |
-| Chunked-upload trigger | 5 MB | Client (`CHUNK_THRESHOLD`) |
-| Max base64 payload per chunk | ~14 MB (10 MB raw → ~13.4 MB Base64) | Server (`CHUNK_B64_MAX`) |
-| Max chunk count | 512 | Server (`MAX_TOTAL_CHUNKS`) |
-| Theoretical max file size | ~5 GB | 512 × 10 MB |
-| GitHub Git Blobs hard cap | 100 MB | GitHub API |
-| Cloudflare Pages Free request body | ~70 MB | Cloudflare |
-| Cloudflare Pages Pro request body | ~95 MB | Cloudflare |
-
-Practical maximum per upload on Cloudflare Pages Pro: **~95 MB**, constrained by Cloudflare's request body limit ahead of the GitHub 100 MB Git Blobs cap.
-
----
-
-## API Reference
-
-All endpoints are served under `/api/` by the Cloudflare Pages Function at `functions/api/[[path]].js`. Every response includes the security headers described in the [Security Model](#security-model) section. All request and response bodies are JSON unless otherwise noted.
-
-### `GET /api/status`
-
-Returns whether all required operator environment variables are present.
-
-**Response**
-```json
-{ "ready": true }
+```
+hex   : 16 bytes → 32 chars → 4.0 bits/char  (128-bit key)
+B64URL: 32 bytes → 43 chars → 5.95 bits/char (256-bit key, smaller string)
 ```
 
----
+Same or smaller string, double the security margin.
 
-### `POST /api/auth`
+### Bias-free random generation
 
-Authenticates a user and issues a session cookie.
+Standard `byte % alphabetSize` has modulo bias when `alphabetSize` doesn't divide 256 evenly. StoreGit uses **rejection sampling**:
 
-**Request body**
-```json
-{ "username": "alice", "password": "..." }
+```js
+// Bias-free Base64URL encoding — processes 3 bytes → 4 chars (exactly 6 bits/char)
+function base64urlFromBytes(bytes) { … }
+
+// Bias-free string from any alphabet using rejection sampling
+function randomAlphabetString(alphabet, length) {
+  const cutoff = 256 - (256 % alphabet.length); // reject bytes ≥ cutoff
+  // sample until length chars collected
+}
+
+// 32 bytes (256 bits) → sgk_<43 B64URL chars>
+function generateRawApiKey() {
+  return `sgk_${base64urlFromBytes(crypto.getRandomValues(new Uint8Array(32)))}`;
+}
 ```
 
-**Responses**
+### Storage design — hashed keys
 
-| Status | Meaning |
-|---|---|
-| `200` | Authenticated; `Set-Cookie` header contains the encrypted session token |
-| `401` | Invalid credentials |
-| `429` | Rate limit exceeded |
+Raw keys are **never stored anywhere**. Only their SHA-256 digest is used as the KV lookup key:
 
----
-
-### `GET /api/me`
-
-Returns the current session's user metadata. Used to validate an existing session on page load.
-
-**Response**
-```json
-{ "username": "alice", "display": "alice", "repo": "owner/repo-name" }
+```
+KV key: "apikey:sha256:<SHA-256(rawKey) as hex>"
+KV val: { username, label, allowedOrigins, keyId }
 ```
 
+If KV is fully compromised, the attacker gets usernames, labels, and allowed origins — but **cannot reconstruct any raw key** or impersonate a user.
+
+The `encKey` field in the user record stores the raw key encrypted with AES-GCM (the same secret used for session tokens) so that revocation can clean up the KV entry.
+
+### Origin binding (CORS restriction)
+
+When creating an API key you may supply a list of allowed origins:
+
+```json
+{ "label": "My Blog", "allowedOrigins": ["https://myblog.com"] }
+```
+
+- If `allowedOrigins` is empty → any origin is permitted (useful for server-to-server calls)
+- If non-empty → `Access-Control-Allow-Origin` is set to the request origin only if it appears in the list; otherwise the request is rejected with 403
+
+### Rate limiting
+
+- **Per-key**: 120 requests/minute (checked in KV via `apikey_rate:<kvKey>`)
+- **Global**: 600 requests/minute per IP (in-process, via `_middleware.js`)
+
+### Maximum keys
+
+10 API keys per account. Revoke old keys to create new ones.
+
 ---
 
-### `POST /api/logout`
+## REST API Reference
 
-Clears the session cookie server-side, invalidating the current session.
+All API endpoints are under `/api/`. Session-based calls require the `credentials: 'same-origin'` cookie. API-key calls require the `X-API-Key` header.
 
----
+### Authentication
 
-### `POST /api/signup`
+#### `POST /api/login`
+```json
+{ "username": "…", "password": "…" }
+```
+Sets a session cookie. Returns `{ ok: true }`.
 
-Registers a new user account.
+#### `POST /api/logout`
+Clears the session cookie.
 
-**Request body**
+#### `GET /api/me`
+Returns current user info:
 ```json
 {
   "username": "alice",
-  "password": "...",
-  "ghToken": "ghp_...",
-  "ghOwner": "github-username",
-  "ghRepo": "my-storage",
-  "ghBranch": "main",
-  "folder": "uploads"
+  "display": "Alice",
+  "repo": "alice/my-storage",
+  "repoLabel": "Primary",
+  "repos": [{ "label": "Primary", "ghOwner": "alice", "ghRepo": "my-storage" }],
+  "activeRepoIdx": 0
 }
 ```
-
-**Responses**
-
-| Status | Meaning |
-|---|---|
-| `200` | Account created |
-| `409` | Username already taken |
-| `400` | Validation error |
-| `429` | Rate limit exceeded |
+Accessible with API key.
 
 ---
 
-### `GET /api/files`
+### Files
 
-Lists all logical files in the current user's upload folder. Internal paths (`.chunks/`, `.manifests/`, `.storegit`) are excluded.
-
-**Response**
+#### `GET /api/files`
+List all files across all repos:
 ```json
 [
-  { "name": "document.pdf", "size": 204800, "sha": "abc123...", "chunked": false },
-  { "name": "large-video.mp4", "size": 52428800, "chunked": true }
+  { "name": "report_2025.pdf", "originalName": "report 2025.pdf",
+    "size": 204800, "sha": "abc…", "chunked": false, "uploadedAt": "2025-01-01T00:00:00.000Z" }
 ]
 ```
 
----
-
-### `POST /api/upload`
-
-Uploads a single file ≤ 5 MB via the GitHub Contents API.
-
-**Request body** — `multipart/form-data` with a `file` field.
-
----
-
-### `POST /api/upload-chunk`
-
-Uploads one part of a multi-chunk file.
-
-**Request body** — `multipart/form-data`
-
-| Field | Type | Description |
-|---|---|---|
-| `file` | binary | Raw chunk bytes (max 10 MB) |
-| `name` | string | Original logical filename |
-| `chunkIndex` | number | Zero-based part index |
-| `totalChunks` | number | Total number of parts |
-| `chunkSize` | number | Nominal chunk size in bytes |
-
----
-
-### `POST /api/upload-finalize`
-
-Called after all chunks have been uploaded. Writes the per-file manifest and updates `_index.json`.
-
-**Request body**
+#### `POST /api/upload`
+Upload a file (≤ 5 MB single call, > 5 MB use chunked upload):
 ```json
-{
-  "name": "large-video.mp4",
-  "totalChunks": 5,
-  "totalSize": 52428800,
-  "blobs": ["sha1", "sha2", "sha3", "sha4", "sha5"]
-}
+{ "name": "notes.txt", "content": "<base64>" }
+```
+Returns `{ ok: true, name: "notes.txt", size: 1234 }`.
+
+#### `GET /api/download?name=<filename>`
+Streams the file. For chunked files, streams all parts in order with integrity verification.
+
+#### `DELETE /api/delete`
+```json
+{ "name": "notes.txt", "sha": "abc…", "chunked": false }
 ```
 
 ---
 
-### `GET /api/download?name={filename}`
+### Repositories
 
-Fetches a file by logical name and streams the bytes to the client. For chunked files, the Worker reassembles all parts before streaming. GitHub URLs are never forwarded to the client.
+#### `GET /api/repos`
+Returns all repos and active index.
 
-**Response** — raw file bytes with `Content-Type` and `Content-Length` headers set.
+#### `POST /api/add-repo`
+```json
+{ "label": "Backups", "ghOwner": "alice", "ghRepo": "backups", "ghBranch": "main", "folder": "uploads" }
+```
+Verifies the token has write access before adding.
+
+#### `POST /api/remove-repo`
+```json
+{ "repoIdx": 1 }
+```
+The primary repo (index 0) cannot be removed.
 
 ---
 
-### `DELETE /api/delete`
+### API Keys (session only)
 
-Deletes a file and all associated storage.
-
-**Request body — small file**
+#### `GET /api/apikeys/list`
 ```json
-{ "name": "document.pdf", "sha": "abc123..." }
+{ "keys": [{ "keyId": "…", "preview": "sgk_AAAA…", "label": "My Blog", "allowedOrigins": ["https://myblog.com"], "createdAt": "…" }] }
 ```
 
-**Request body — chunked file**
+#### `POST /api/apikeys/create`
 ```json
-{ "name": "large-video.mp4", "chunked": true }
+{ "label": "My Blog", "allowedOrigins": ["https://myblog.com"] }
 ```
+Returns:
+```json
+{ "ok": true, "rawKey": "sgk_…", "keyId": "…", "preview": "sgk_AAAA…", "label": "My Blog", "allowedOrigins": ["https://myblog.com"] }
+```
+> **The `rawKey` is shown only once and never stored. Copy it immediately.**
 
-Chunked deletion removes all part blobs, the per-file manifest, and the `_index.json` entry in a single commit.
+#### `DELETE /api/apikeys/revoke`
+```json
+{ "keyId": "…" }
+```
 
 ---
 
-## Operator Deployment
+### Share links
 
-### Prerequisites
+#### `GET /api/share-link?name=<file>&ttl=<seconds>`
+Creates a signed share token and (if KV is available) a short link like `/aBcD`.
+Returns `{ url: "/aBcD", exp: 1234567890 }`.
 
-- A Cloudflare account with Pages enabled.
-- A GitHub account to host the registry repository.
+---
 
-### Step 1 — Create the Registry Repository
+## Deployment
 
-Create a dedicated **private** GitHub repository to store user account records. This repository must be separate from any user storage repository.
+### 1. Fork / clone
 
-### Step 2 — Generate a Registry Token
+```bash
+git clone https://github.com/your-org/storegit
+cd storegit
+```
 
-Generate a GitHub personal access token with the **`repo`** scope scoped to the registry repository. This token is stored as an environment variable and is never exposed to end users.
+### 2. Create a Cloudflare Pages project
 
-### Step 3 — Fork and Connect
+```bash
+npx wrangler pages project create storegit
+```
 
-1. Fork this repository to your GitHub account.
-2. In the Cloudflare dashboard, go to **Workers & Pages → Create → Pages → Connect to Git** and connect the fork.
+### 3. Create KV namespace
 
-### Step 4 — Set Environment Variables
+```bash
+npx wrangler kv:namespace create RATE_LIMIT_KV
+# copy the id into wrangler.toml / Pages dashboard bindings
+```
 
-In the Cloudflare Pages project settings, add the following environment variables:
+### 4. Set environment variables (Pages dashboard → Settings → Variables)
 
 | Variable | Description |
 |---|---|
-| `TOKEN_SECRET` | Random 32-byte hex string — generate with `openssl rand -hex 32` |
-| `REGISTRY_GITHUB_TOKEN` | GitHub PAT with `repo` scope for the registry repository |
-| `REGISTRY_GITHUB_OWNER` | GitHub username or organisation that owns the registry repository |
-| `REGISTRY_GITHUB_REPO` | Repository name of the registry |
+| `APP_SECRET` | 32+ char random secret for JWT and AES-GCM signing |
+| `GITHUB_CLIENT_ID` | OAuth app client ID (optional — for GitHub OAuth login) |
+| `GITHUB_CLIENT_SECRET` | OAuth app client secret (optional) |
 
-### Step 5 — Bind a KV Namespace (Strongly Recommended)
+### 5. Deploy
 
-1. In the Cloudflare dashboard, create a KV namespace under **Workers & Pages → KV → Create namespace**.
-2. Bind it to the Pages project with the binding name **`RATE_LIMIT_KV`**.
-
-Without this binding, rate-limit state is held in an in-memory `Map` that resets on every Worker cold start, rendering brute-force protection ineffective across separate requests.
-
-### Step 6 — Deploy
-
-Trigger a deployment from the Cloudflare Pages dashboard or by pushing to the connected branch. The service is available at the assigned `*.pages.dev` URL or any configured custom domain.
+```bash
+npx wrangler pages deploy . --project-name storegit
+```
 
 ---
 
-## User Registration
+## KV Namespace Bindings
 
-To register, a user must provide:
+Bind a KV namespace named **`RATE_LIMIT_KV`** in your Pages project settings. This single namespace is used for:
 
-1. A username — 3–32 characters; letters, numbers, hyphens, and underscores only.
-2. A password — minimum 8 characters.
-3. A GitHub repository (private recommended) they own and have write access to.
-4. A GitHub personal access token with the **`repo`** scope for that repository.
-
-The server verifies repository access using the provided token before creating the account. The token is encrypted with AES-256-GCM (key derived via HKDF-SHA256 from `TOKEN_SECRET` and the username) before being written to the registry. The plaintext token is not retained after the signup request completes.
-
-After registration, users authenticate using only their username and password. The GitHub token is decrypted server-side per request and is never transmitted to the client.
+- Session revocation
+- Session caching
+- API key storage (hashed)
+- Rate-limit counters
+- Share-link metadata
 
 ---
 
-## Credits
+## Environment Variables
 
-Conceived by **Deb Guin** • [storegit.pages.dev](https://storegit.pages.dev)
+| Variable | Required | Notes |
+|---|---|---|
+| `APP_SECRET` | Yes | Min 32 chars. Used for HMAC-JWT, AES-GCM key derivation, blob tokens |
+| `GITHUB_CLIENT_ID` | No | Only needed for GitHub OAuth login flow |
+| `GITHUB_CLIENT_SECRET` | No | Only needed for GitHub OAuth login flow |
+| `REGISTRY_OWNER` | Yes | GitHub owner of the user-registry repo |
+| `REGISTRY_REPO` | Yes | GitHub repo name of the user registry |
+| `REGISTRY_TOKEN` | Yes | GitHub PAT with repo write access to the registry |
 
 ---
 
-## License
+## Development
 
-This project is licensed under the **MIT License**. See [LICENSE](LICENSE) for full terms.
+```bash
+npm install -g wrangler
+wrangler pages dev . --kv RATE_LIMIT_KV
+```
+
+The dev server runs on `http://localhost:8788`.
+
+---
+
+## Using StoreGit from Another Project
+
+### 1. Generate an API key
+
+Open StoreGit → click the hamburger menu (top right) → **API Keys** → **New Key**.
+
+Enter a label and optionally restrict to your app's origin (e.g. `https://myapp.com`). Copy the key — it is shown only once.
+
+### 2. Use the API
+
+```js
+const BASE  = 'https://your-storegit.pages.dev';
+const KEY   = 'sgk_…'; // your 47-char key
+
+// List files
+const files = await fetch(`${BASE}/api/files`, {
+  headers: { 'X-API-Key': KEY }
+}).then(r => r.json());
+
+// Upload a file (≤ 5 MB)
+const toBase64 = file => new Promise((res, rej) => {
+  const r = new FileReader();
+  r.onload = () => res(r.result.split(',')[1]);
+  r.onerror = rej;
+  r.readAsDataURL(file);
+});
+
+await fetch(`${BASE}/api/upload`, {
+  method: 'POST',
+  headers: { 'X-API-Key': KEY, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ name: file.name, content: await toBase64(file) })
+});
+
+// Download a file
+const blob = await fetch(`${BASE}/api/download?name=notes.txt`, {
+  headers: { 'X-API-Key': KEY }
+}).then(r => r.blob());
+
+// Delete a file
+await fetch(`${BASE}/api/delete`, {
+  method: 'DELETE',
+  headers: { 'X-API-Key': KEY, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ name: 'notes.txt', sha: '<sha from /api/files>' })
+});
+```
+
+### 3. Origin binding in practice
+
+If you created the key with `allowedOrigins: ["https://myapp.com"]`:
+
+- Requests from `https://myapp.com` → allowed, CORS headers returned
+- Requests from any other origin → 403 Forbidden
+- Server-to-server requests (no `Origin` header) → allowed regardless of binding
+
+### 4. Key security best practices
+
+- Treat your API key like a password — never commit it to source control
+- Use `allowedOrigins` for browser-side keys to prevent misuse if the key leaks
+- Keep server-side keys unrestricted (no origin binding needed — no CORS headers sent)
+- Rotate keys periodically — revoke and regenerate in the StoreGit UI
+
+---
+
+## Changelog
+
+### v2.0.0
+- **Hamburger drawer** — repositories and API key management moved to a slide-in drawer, freeing the main canvas for files
+- **API key system** — generate, label, bind to origins, and revoke keys in-app
+- **256-bit Base64URL API keys** — `sgk_<43 chars>`, bias-free CSPRNG, SHA-256 hashed in KV (raw key never stored)
+- **Global security middleware** — `functions/_middleware.js` enforces security headers, HTTPS redirect, bot-blocking, rate limiting, and path-traversal protection on every request
+- **`POST /api/remove-repo`** — remove secondary repositories from the UI
+- **Short-link bias fix** — share link IDs now use rejection-sampling via `randomAlphabetString`
+- **Session JTI upgrade** — 24-byte Base64URL (192 bits) instead of 16-byte hex (128 bits)
+
+### v1.x
+- Initial release — upload, download, delete, chunked upload, share links, multi-repo support
