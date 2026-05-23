@@ -75,9 +75,19 @@ on('fd-share-btn',       'click',  () => _shareFile && openShareModal(_shareFile
 on('share-close-btn',    'click',  () => closeShareModal());
 on('share-create-btn',   'click',  () => createShareLink());
 on('share-copy-btn',     'click',  () => copyShareLink());
-on('add-repo-toggle-btn','click',  () => toggleAddRepoForm());
-on('ar-cancel-btn',      'click',  () => closeAddRepoForm());
-on('ar-submit-btn',      'click',  () => submitAddRepo());
+on('hamburger-btn',       'click',  () => openDrawer());
+on('drawer-close-btn',   'click',  () => closeDrawer());
+on('drawer-overlay',     'click',  () => closeDrawer());
+on('drawer-add-repo-btn','click',  () => toggleDrawerAddRepoForm());
+on('dar-cancel-btn',     'click',  () => closeDrawerAddRepoForm());
+on('dar-submit-btn',     'click',  () => submitDrawerAddRepo());
+on('apikey-new-btn',     'click',  () => toggleApiKeyForm());
+on('ak-cancel-btn',      'click',  () => closeApiKeyForm());
+on('ak-submit-btn',      'click',  () => submitApiKey());
+on('apikey-copy-btn',    'click',  () => {
+  const code = document.getElementById('apikey-reveal-code');
+  if (code) { navigator.clipboard?.writeText(code.textContent).then(() => toast('API key copied.', 'ok')).catch(() => {}); }
+});
 on('goto-reset',         'click',  e  => { e.preventDefault(); showScreen('reset'); });
 on('reset-back',         'click',  e  => { e.preventDefault(); showScreen('login'); });
 on('reset-btn',          'click',  () => doReset());
@@ -150,72 +160,234 @@ function startLockout(secs) {
   tick(); const t = setInterval(tick, 1000);
 }
 function bootApp(me) {
-  const chip = document.getElementById('user-chip');
-  chip.textContent = me.display || me.username;
-  chip.title = me.display || me.username;
   showScreen('app'); loadMeta(); loadFiles();
 }
 function updateRepoChip(repos, activeIdx) {
   _allRepos = repos || [];
   _activeRepoIdx = activeIdx || 0;
-  // Pills removed from topbar — just ensure repo card is visible
-  const card = document.getElementById('repo-card');
-  if (card) card.style.display = '';
-  renderRepoList();
+  renderDrawerRepoList();
 }
-function renderRepoList() {
-  const list = document.getElementById('repo-list');
+
+// ── Drawer open / close ───────────────────────────────────────────────────────
+function openDrawer() {
+  document.getElementById('drawer').classList.add('is-open');
+  document.getElementById('drawer-overlay').classList.add('is-open');
+  document.getElementById('hamburger-btn').classList.add('is-open');
+  document.body.style.overflow = 'hidden';
+  loadApiKeys();
+}
+function closeDrawer() {
+  document.getElementById('drawer').classList.remove('is-open');
+  document.getElementById('drawer-overlay').classList.remove('is-open');
+  document.getElementById('hamburger-btn').classList.remove('is-open');
+  document.body.style.overflow = '';
+  closeDrawerAddRepoForm();
+  closeApiKeyForm();
+  hideApiKeyReveal();
+}
+
+// ── Drawer repo list ──────────────────────────────────────────────────────────
+function renderDrawerRepoList() {
+  const list = document.getElementById('drawer-repo-list');
   if (!list) return;
   list.innerHTML = '';
-  if (_allRepos.length > 1) {
-    const note = elem('div', 'repo-auto-note');
-    note.textContent = 'Uploads auto-route to the repo with the least usage.';
-    list.appendChild(note);
+  if (!_allRepos.length) {
+    const empty = elem('div', 'apikey-empty');
+    empty.textContent = 'No repositories connected.';
+    list.appendChild(empty);
+    return;
   }
   _allRepos.forEach((repo, i) => {
-    const item = elem('div', 'repo-item');
-    const info = elem('div', 'repo-item-info');
-    const labelRow = elem('div', 'repo-item-label');
-    labelRow.textContent = repo.label || `Repo ${i + 1}`;
-    const sub = elem('div', 'repo-item-sub');
-    sub.textContent = `${repo.ghOwner}/${repo.ghRepo}`;
-    info.append(labelRow, sub);
-    const acts = elem('div', 'repo-item-acts');
-    const delBtn = elem('button', 'btn btn-ghost btn-xs repo-del-btn');
-    delBtn.textContent = 'Remove';
-    delBtn.onclick = () => showModal(
-      `Remove "${repo.label || `Repo ${i + 1}`}"`,
-      'Files stay on GitHub — only the connection is removed from StoreGit.',
-      'Remove', 'btn-danger',
-      async () => {
-        try {
-          const r = await fetch('/api/remove-repo', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repoIdx: i }) });
-          if (r.ok) { toast('Repository removed.', 'ok'); await loadMeta(); loadFiles(); } else toast('Failed to remove.', 'error');
-        } catch { toast('Connection error.', 'error'); }
-      }
-    );
-    acts.appendChild(delBtn);
-    item.append(info, acts);
+    const item = elem('div', 'drawer-repo-item' + (i === _activeRepoIdx ? ' active' : ''));
+    const label = elem('div', 'drawer-repo-item-label');
+    label.textContent = repo.label || `Repo ${i + 1}`;
+    const slug = elem('div', 'drawer-repo-item-slug');
+    slug.textContent = `${repo.ghOwner}/${repo.ghRepo}`;
+    item.append(label, slug);
+    if (i === _activeRepoIdx) {
+      const badge = elem('span', 'drawer-repo-item-badge');
+      badge.textContent = 'Active';
+      item.appendChild(badge);
+    }
+    if (i > 0) {
+      const rmBtn = elem('button', 'drawer-repo-remove-btn');
+      rmBtn.title = 'Remove repository';
+      rmBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+      rmBtn.onclick = e => {
+        e.stopPropagation();
+        showModal(
+          `Remove "${repo.label || `Repo ${i + 1}`}"`,
+          'Files stay on GitHub — only the connection is removed from StoreGit.',
+          'Remove', 'btn-danger',
+          async () => {
+            try {
+              const r = await fetch('/api/remove-repo', { method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ repoIdx: i }) });
+              if (r.ok) { toast('Repository removed.', 'ok'); await loadMeta(); loadFiles(); }
+              else toast('Failed to remove.', 'error');
+            } catch { toast('Connection error.', 'error'); }
+          }
+        );
+      };
+      item.appendChild(rmBtn);
+    }
     list.appendChild(item);
   });
 }
-function closeAddRepoForm() {
-  const form = document.getElementById('add-repo-form');
-  const btn  = document.getElementById('add-repo-toggle-btn');
+
+// ── Drawer add-repo form ──────────────────────────────────────────────────────
+function toggleDrawerAddRepoForm() {
+  const form = document.getElementById('drawer-add-repo-form');
+  const btn  = document.getElementById('drawer-add-repo-btn');
   if (!form || !btn) return;
-  form.style.display = 'none';
-  btn.textContent = 'Add';
-  const err = document.getElementById('ar-error');
-  if (err) err.textContent = '';
+  if (form.style.display === 'none') {
+    form.style.display = '';
+    btn.textContent = 'Cancel';
+    document.getElementById('dar-owner')?.focus();
+  } else {
+    closeDrawerAddRepoForm();
+  }
 }
-function toggleRepoCard() {
-  const body = document.getElementById('repo-card-body');
-  const btn  = document.getElementById('repo-toggle-btn');
-  if (!body) return;
-  const isOpen = body.style.display !== 'none';
-  body.style.display = isOpen ? 'none' : '';
-  if (btn) btn.textContent = isOpen ? '▾' : '▴';
-  if (isOpen) closeAddRepoForm();
+function closeDrawerAddRepoForm() {
+  const form = document.getElementById('drawer-add-repo-form');
+  const btn  = document.getElementById('drawer-add-repo-btn');
+  if (form) form.style.display = 'none';
+  if (btn)  btn.textContent = 'Add';
+  const err = document.getElementById('dar-error');
+  if (err) err.textContent = '';
+  ['dar-label','dar-owner','dar-repo'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = '';
+  });
+  const branch = document.getElementById('dar-branch');
+  if (branch) branch.value = 'main';
+}
+async function submitDrawerAddRepo() {
+  const label  = document.getElementById('dar-label')?.value.trim() || '';
+  const owner  = document.getElementById('dar-owner')?.value.trim() || '';
+  const repo   = document.getElementById('dar-repo')?.value.trim() || '';
+  const branch = document.getElementById('dar-branch')?.value.trim() || 'main';
+  const errEl  = document.getElementById('dar-error');
+  const btn    = document.getElementById('dar-submit-btn');
+  errEl.textContent = '';
+  if (!owner || !repo) { errEl.textContent = 'GitHub owner and repository name are required.'; return; }
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    const r = await fetch('/api/add-repo', { method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ label: label || 'Repo', ghOwner: owner, ghRepo: repo, ghBranch: branch, folder:'uploads' }) });
+    const d = await r.json();
+    if (r.ok) {
+      toast('Repository added.', 'ok');
+      closeDrawerAddRepoForm();
+      await loadMeta(); loadFiles();
+    } else { errEl.textContent = d.error || 'Failed to add repository.'; }
+  } catch { errEl.textContent = 'Connection error. Please try again.'; }
+  btn.disabled = false; btn.textContent = 'Add Repository';
+}
+
+// ── API Key management ────────────────────────────────────────────────────────
+async function loadApiKeys() {
+  const list = document.getElementById('apikey-list');
+  if (!list) return;
+  list.innerHTML = '<div class="apikey-empty">Loading…</div>';
+  try {
+    const r = await fetch('/api/apikeys/list', { credentials:'same-origin' });
+    if (!r.ok) { list.innerHTML = '<div class="apikey-empty">Could not load keys.</div>'; return; }
+    const { keys } = await r.json();
+    renderApiKeyList(keys);
+  } catch { list.innerHTML = '<div class="apikey-empty">Connection error.</div>'; }
+}
+function renderApiKeyList(keys) {
+  const list = document.getElementById('apikey-list');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!keys || !keys.length) {
+    const empty = elem('div', 'apikey-empty');
+    empty.textContent = 'No API keys yet.';
+    list.appendChild(empty);
+    return;
+  }
+  keys.forEach(k => {
+    const item = elem('div', 'apikey-item');
+    const top  = elem('div', 'apikey-item-top');
+    const lbl  = elem('div', 'apikey-item-label');
+    lbl.textContent = k.label;
+    const revokeBtn = elem('button', 'apikey-revoke-btn');
+    revokeBtn.textContent = 'Revoke';
+    revokeBtn.onclick = () => showModal(
+      `Revoke "${k.label}"`,
+      'This key will stop working immediately. This cannot be undone.',
+      'Revoke', 'btn-danger',
+      async () => {
+        try {
+          const r = await fetch('/api/apikeys/revoke', { method:'DELETE', credentials:'same-origin', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ keyId: k.keyId }) });
+          if (r.ok) { toast('API key revoked.', 'ok'); loadApiKeys(); }
+          else toast('Failed to revoke key.', 'error');
+        } catch { toast('Connection error.', 'error'); }
+      }
+    );
+    top.append(lbl, revokeBtn);
+    const preview = elem('div', 'apikey-item-preview');
+    preview.textContent = k.preview;
+    const origins = elem('div', 'apikey-item-origins');
+    if (!k.allowedOrigins || !k.allowedOrigins.length) {
+      origins.classList.add('any');
+      origins.innerHTML = 'Origins: <span>Any (unrestricted)</span>';
+    } else {
+      origins.innerHTML = `Origins: <span>${k.allowedOrigins.join(', ')}</span>`;
+    }
+    item.append(top, preview, origins);
+    list.appendChild(item);
+  });
+}
+function toggleApiKeyForm() {
+  const form = document.getElementById('apikey-form');
+  const btn  = document.getElementById('apikey-new-btn');
+  if (!form || !btn) return;
+  hideApiKeyReveal();
+  if (form.style.display === 'none') {
+    form.style.display = '';
+    btn.textContent = 'Cancel';
+    document.getElementById('ak-label')?.focus();
+  } else {
+    closeApiKeyForm();
+  }
+}
+function closeApiKeyForm() {
+  const form = document.getElementById('apikey-form');
+  const btn  = document.getElementById('apikey-new-btn');
+  if (form) form.style.display = 'none';
+  if (btn)  btn.textContent = 'New Key';
+  const err = document.getElementById('ak-error');
+  if (err) err.textContent = '';
+  const lbl = document.getElementById('ak-label');
+  if (lbl) lbl.value = '';
+  const orig = document.getElementById('ak-origins');
+  if (orig) orig.value = '';
+}
+function hideApiKeyReveal() {
+  const box = document.getElementById('apikey-reveal');
+  if (box) box.style.display = 'none';
+}
+async function submitApiKey() {
+  const label      = document.getElementById('ak-label')?.value.trim() || '';
+  const originsRaw = document.getElementById('ak-origins')?.value || '';
+  const allowedOrigins = originsRaw.split('\n').map(s => s.trim()).filter(Boolean);
+  const errEl = document.getElementById('ak-error');
+  const btn   = document.getElementById('ak-submit-btn');
+  errEl.textContent = '';
+  if (!label) { errEl.textContent = 'Please enter a label for this key.'; return; }
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    const r = await fetch('/api/apikeys/create', { method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ label, allowedOrigins }) });
+    const d = await r.json();
+    if (r.ok) {
+      closeApiKeyForm();
+      const box  = document.getElementById('apikey-reveal');
+      const code = document.getElementById('apikey-reveal-code');
+      if (box && code) { code.textContent = d.rawKey; box.style.display = ''; }
+      toast('API key created. Copy it now!', 'ok');
+      loadApiKeys();
+    } else { errEl.textContent = d.error || 'Failed to create API key.'; }
+  } catch { errEl.textContent = 'Connection error. Please try again.'; }
+  btn.disabled = false; btn.textContent = 'Generate Key';
 }
 async function ensureRepoActive(repoIdx) {
   if (repoIdx === undefined || repoIdx === _activeRepoIdx || _allRepos.length <= 1) return;
@@ -295,47 +467,7 @@ function renderAllFiles(groups) {
   }
   if (totalVisible === 0) { el.innerHTML = ''; el.appendChild(emptyState('No files uploaded yet.')); }
 }
-function toggleAddRepoForm() {
-  const form = document.getElementById('add-repo-form');
-  const btn  = document.getElementById('add-repo-toggle-btn');
-  if (!form || !btn) return;
-  // Ensure the repo card body is visible first
-  const body = document.getElementById('repo-card-body');
-  const toggleBtn = document.getElementById('repo-toggle-btn');
-  if (body && body.style.display === 'none') {
-    body.style.display = '';
-    if (toggleBtn) toggleBtn.textContent = '▴';
-  }
-  if (form.style.display === 'none') {
-    form.style.display = '';
-    btn.textContent = 'Cancel';
-    document.getElementById('ar-owner')?.focus();
-  } else {
-    closeAddRepoForm();
-  }
-}
-async function submitAddRepo() {
-  const label  = document.getElementById('ar-label')?.value.trim() || '';
-  const owner  = document.getElementById('ar-owner')?.value.trim() || '';
-  const repo   = document.getElementById('ar-repo')?.value.trim() || '';
-  const branch = document.getElementById('ar-branch')?.value.trim() || 'main';
-  const errEl  = document.getElementById('ar-error');
-  const btn    = document.getElementById('ar-submit-btn');
-  errEl.textContent = '';
-  if (!owner || !repo) { errEl.textContent = 'GitHub owner and repository name are required.'; return; }
-  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
-  try {
-    const r = await fetch('/api/add-repo', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ label: label || 'Repo', ghOwner: owner, ghRepo: repo, ghBranch: branch, folder: 'uploads' }) });
-    const d = await r.json();
-    if (r.ok) {
-      toast('Repository added.', 'ok');
-      ['ar-label','ar-owner','ar-repo'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
-      closeAddRepoForm();
-      await loadMeta(); loadFiles();
-    } else { errEl.textContent = d.error || 'Failed to add repository.'; }
-  } catch { errEl.textContent = 'Connection error. Please try again.'; }
-  btn.disabled = false; btn.textContent = 'Add Repository';
-}
+// toggleAddRepoForm and submitAddRepo moved to drawer functions above
 async function loadMeta() {
   try {
     const r = await fetch('/api/me', { credentials:'same-origin' });

@@ -153,8 +153,9 @@
       </div>
     </div>
     <div class="topbar-right">
-      <div id="repo-chip" style="display:none"></div>
-      <div id="user-chip" style="display:none"></div>
+      <button class="hamburger-btn" id="hamburger-btn" aria-label="Open menu" title="Menu">
+        <span></span><span></span><span></span>
+      </button>
       <button class="btn-signout" id="signout-btn" title="Sign out" aria-label="Sign out">
         <svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
       </button>
@@ -189,33 +190,84 @@
       </div>
       <div id="file-list"></div>
     </div>
-    <div class="card" id="repo-card">
-      <div class="card-header repo-card-header" id="repo-card-header">
-        <div class="card-title">Repositories</div>
-        <div class="repo-header-actions">
-          <button class="btn btn-ghost btn-sm" id="add-repo-toggle-btn" onclick="event.stopPropagation()">Add</button>
-          <button class="repo-toggle-btn" id="repo-toggle-btn" onclick="toggleRepoCard()" aria-label="Toggle">▾</button>
-        </div>
-      </div>
-      <div class="repo-card-body" id="repo-card-body" style="display:none">
-        <div id="repo-list"></div>
-        <div id="add-repo-form" style="display:none">
-          <div class="ar-fields">
-            <div class="field"><label for="ar-label">Label</label><input id="ar-label" placeholder="e.g. Media Backup" autocomplete="off" autocorrect="off" spellcheck="false"></div>
-            <div class="field"><label for="ar-owner">GitHub Owner</label><input id="ar-owner" placeholder="your-github-username" autocomplete="off" autocorrect="off" spellcheck="false"></div>
-            <div class="field"><label for="ar-repo">Repository Name</label><input id="ar-repo" placeholder="my-storage" autocomplete="off" autocorrect="off" spellcheck="false"></div>
-            <div class="field"><label for="ar-branch">Branch</label><input id="ar-branch" value="main" autocomplete="off"></div>
-          </div>
-          <div class="form-error" id="ar-error"></div>
-          <div class="ar-form-actions">
-            <button class="btn btn-primary btn-sm" id="ar-submit-btn">Add Repository</button>
-            <button class="btn btn-ghost btn-sm" id="ar-cancel-btn">Cancel</button>
-          </div>
-        </div>
+  </div>
+  <div class="app-footer">Created by Deb Guin &nbsp;&middot;&nbsp; StoreGit</div>
+</div>
+
+<!-- Drawer overlay -->
+<div class="drawer-overlay" id="drawer-overlay"></div>
+
+<!-- Side drawer -->
+<div class="drawer" id="drawer" role="dialog" aria-modal="true" aria-label="Menu">
+  <div class="drawer-header">
+    <span class="drawer-title">Menu</span>
+    <button class="drawer-close-btn" id="drawer-close-btn" aria-label="Close menu">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+
+  <!-- Repositories -->
+  <div class="drawer-section">
+    <div class="drawer-section-header">
+      <span class="drawer-section-title">Repositories</span>
+      <button class="btn btn-ghost btn-sm" id="drawer-add-repo-btn">Add</button>
+    </div>
+    <div id="drawer-repo-list" class="drawer-repo-list"></div>
+    <div id="drawer-add-repo-form" style="display:none" class="drawer-form">
+      <div class="field"><label for="dar-label">Label</label><input id="dar-label" placeholder="e.g. Media Backup" autocomplete="off" autocorrect="off" spellcheck="false"></div>
+      <div class="field"><label for="dar-owner">GitHub Owner</label><input id="dar-owner" placeholder="your-github-username" autocomplete="off" autocorrect="off" spellcheck="false"></div>
+      <div class="field"><label for="dar-repo">Repository Name</label><input id="dar-repo" placeholder="my-storage" autocomplete="off" autocorrect="off" spellcheck="false"></div>
+      <div class="field"><label for="dar-branch">Branch</label><input id="dar-branch" value="main" autocomplete="off"></div>
+      <div class="form-error" id="dar-error"></div>
+      <div class="drawer-form-actions">
+        <button class="btn btn-primary btn-sm" id="dar-submit-btn">Add Repository</button>
+        <button class="btn btn-ghost btn-sm" id="dar-cancel-btn">Cancel</button>
       </div>
     </div>
   </div>
-  <div class="app-footer">Created by Deb Guin &nbsp;&middot;&nbsp; StoreGit</div>
+
+  <!-- API Keys -->
+  <div class="drawer-section">
+    <div class="drawer-section-header">
+      <span class="drawer-section-title">API Keys</span>
+      <button class="btn btn-ghost btn-sm" id="apikey-new-btn">New Key</button>
+    </div>
+    <p class="drawer-section-sub">Use API keys to access your storage from external apps. Bind a key to specific origins for maximum security.</p>
+    <div id="apikey-list" class="apikey-list"></div>
+    <div id="apikey-reveal" style="display:none" class="apikey-reveal-box">
+      <div class="apikey-reveal-label">Copy your new key now — it will never be shown again:</div>
+      <div class="apikey-reveal-row">
+        <code class="apikey-reveal-code" id="apikey-reveal-code"></code>
+        <button class="btn btn-ghost btn-sm" id="apikey-copy-btn">Copy</button>
+      </div>
+    </div>
+    <div id="apikey-form" style="display:none" class="drawer-form">
+      <div class="field"><label for="ak-label">Key Label</label><input id="ak-label" placeholder="e.g. My Blog, Dev Project" autocomplete="off" autocorrect="off" spellcheck="false"></div>
+      <div class="field">
+        <label for="ak-origins">Allowed Origins <span class="field-hint-inline">(one per line, blank = any)</span></label>
+        <textarea id="ak-origins" rows="3" placeholder="https://myapp.com&#10;https://localhost:3000" spellcheck="false" autocomplete="off"></textarea>
+        <div class="field-hint">Restricts which websites can use this key via CORS. Leave blank to allow any origin.</div>
+      </div>
+      <div class="form-error" id="ak-error"></div>
+      <div class="drawer-form-actions">
+        <button class="btn btn-primary btn-sm" id="ak-submit-btn">Generate Key</button>
+        <button class="btn btn-ghost btn-sm" id="ak-cancel-btn">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- API reference -->
+  <div class="drawer-section drawer-api-docs">
+    <div class="drawer-section-title">API Reference</div>
+    <p class="drawer-section-sub">Pass your key as the <code class="ic">X-API-Key</code> header. All endpoints return JSON.</p>
+    <div class="api-doc-list">
+      <div class="api-doc-row"><span class="api-badge api-get">GET</span><code class="ic">/api/files</code><span class="api-doc-desc">List all files</span></div>
+      <div class="api-doc-row"><span class="api-badge api-get">GET</span><code class="ic">/api/download?name=…</code><span class="api-doc-desc">Download a file</span></div>
+      <div class="api-doc-row"><span class="api-badge api-post">POST</span><code class="ic">/api/upload</code><span class="api-doc-desc">Upload (JSON body)</span></div>
+      <div class="api-doc-row"><span class="api-badge api-del">DELETE</span><code class="ic">/api/delete</code><span class="api-doc-desc">Delete a file</span></div>
+      <div class="api-doc-row"><span class="api-badge api-get">GET</span><code class="ic">/api/me</code><span class="api-doc-desc">Current user + repos</span></div>
+    </div>
+  </div>
 </div>
 <div class="dl-progress-bar" id="dl-bar">
   <div class="dl-filename" id="dl-filename"></div>
