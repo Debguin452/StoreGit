@@ -159,14 +159,16 @@ function startLockout(secs) {
   };
   tick(); const t = setInterval(tick, 1000);
 }
-function bootApp(me) {
+async function bootApp(me) {
   ['drawer','drawer-overlay'].forEach(id => document.getElementById(id)?.classList.remove('is-open'));
   document.getElementById('hamburger-btn')?.classList.remove('is-open');
   document.body.style.overflow = '';
   closeDrawerAddRepoForm();
   closeApiKeyForm();
   hideApiKeyReveal();
-  showScreen('app'); loadMeta(); loadFiles();
+  showScreen('app');
+  await loadMeta();
+  loadFiles();
 }
 function updateRepoChip(repos, activeIdx) {
   _allRepos = repos || [];
@@ -204,18 +206,13 @@ function renderDrawerRepoList() {
     return;
   }
   _allRepos.forEach((repo, i) => {
-    const item = elem('div', 'drawer-repo-item' + (i === _activeRepoIdx ? ' active' : ''));
+    const item = elem('div', 'drawer-repo-item');
     const label = elem('div', 'drawer-repo-item-label');
     const customLabel = repo.label && repo.label !== 'Default' ? repo.label : null;
     label.textContent = customLabel || `${repo.ghOwner}/${repo.ghRepo}`;
     const slug = elem('div', 'drawer-repo-item-slug');
     slug.textContent = customLabel ? `${repo.ghOwner}/${repo.ghRepo}` : '';
     item.append(label, slug);
-    if (i === _activeRepoIdx) {
-      const badge = elem('span', 'drawer-repo-item-badge');
-      badge.textContent = 'Active';
-      item.appendChild(badge);
-    }
     if (i > 0) {
       const rmBtn = elem('button', 'drawer-repo-remove-btn');
       rmBtn.title = 'Remove repository';
@@ -453,7 +450,7 @@ function renderAllFiles(groups) {
       const totalSize = visible.reduce((sum, f) => sum + (f.size || 0), 0);
       const customLabel = group.repo?.label && group.repo.label !== 'Default' ? group.repo.label : null;
       const repoName = customLabel || (group.repo ? `${group.repo.ghOwner}/${group.repo.ghRepo}` : `Repo ${group.repoIdx + 1}`);
-      const repoSub  = customLabel && group.repo ? `${group.repo.ghOwner}/${group.repo.ghRepo}` : '';
+      const repoSub  = (customLabel && group.repo) ? `${group.repo.ghOwner}/${group.repo.ghRepo}` : '';
       const section  = elem('div', 'repo-section');
       const hdr      = elem('div', 'repo-section-header');
       const lbl      = elem('div', 'repo-section-label'); lbl.textContent = repoName;
