@@ -706,7 +706,7 @@ async function _handleRequest({ request, env, params }) {
           { method: 'POST',   path: '/api/switch-repo',      auth: ['session'] },
           { method: 'POST',   path: '/api/add-repo',         auth: ['session'] },
           { method: 'POST',   path: '/api/remove-repo',      auth: ['session'] },
-          { method: 'GET',    path: '/api/files',            auth: ['session', 'apiKey'], note: 'Returns { files, storage } — supports ?repoIdx=N' },
+          { method: 'GET',    path: '/api/files',            auth: ['session', 'apiKey'], note: 'Returns file array — supports ?repoIdx=N. Use /api/storage for size totals.' },
           { method: 'POST',   path: '/api/upload',           auth: ['session', 'apiKey'] },
           { method: 'POST',   path: '/api/upload-chunk',     auth: ['session', 'apiKey'] },
           { method: 'POST',   path: '/api/finalize-upload',  auth: ['session', 'apiKey'] },
@@ -1202,7 +1202,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
         if (!b.uploadedAt) return -1;
         return new Date(b.uploadedAt) - new Date(a.uploadedAt);
       });
-      return jRes({ files: all, storage: computeStorageStats(all) });
+      return jRes(all);
     } catch { return jRes({ error: ERRS[502] }, 502); }
   }
   if (route === 'upload' && method === 'POST') {
