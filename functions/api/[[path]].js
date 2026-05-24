@@ -181,7 +181,7 @@ async function resolveApiKey(request, env, secret) {
     username: user.username, display: user.displayName || user.username,
     ghToken, ghOwner: repo.ghOwner, ghRepo: repo.ghRepo,
     ghBranch: repo.ghBranch, folder: repo.folder,
-    repoLabel: repo.label || 'Default',
+    repoLabel: (repo.label && repo.label !== 'Default') ? repo.label : '',
     repos: repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo })),
     activeRepoIdx: 0,
   };
@@ -341,7 +341,7 @@ async function verifyShareToken(token, secret) {
 }
 function getUserRepos(user) {
   if (Array.isArray(user.repos) && user.repos.length > 0) return user.repos;
-  return [{ label: 'Default', ghOwner: user.ghOwner, ghRepo: user.ghRepo, ghBranch: user.ghBranch, folder: user.folder }];
+  return [{ label: '', ghOwner: user.ghOwner, ghRepo: user.ghRepo, ghBranch: user.ghBranch, folder: user.folder }];
 }
 async function getFullSession(sess, env, secret) {
   if (!sess || !sess.username) return null;
@@ -355,7 +355,7 @@ async function getFullSession(sess, env, secret) {
         const repoIdx = typeof sess.repoIdx === 'number' ? sess.repoIdx : 0;
         const repos   = cached.repos || [];
         const repo    = repos[repoIdx] || repos[0] || {};
-        return { ...sess, ghToken, ghOwner: repo.ghOwner, ghRepo: repo.ghRepo, ghBranch: repo.ghBranch, folder: repo.folder, repoLabel: repo.label || 'Default', repos, activeRepoIdx: repoIdx };
+        return { ...sess, ghToken, ghOwner: repo.ghOwner, ghRepo: repo.ghRepo, ghBranch: repo.ghBranch, folder: repo.folder, repoLabel: (repo.label && repo.label !== 'Default') ? repo.label : '', repos, activeRepoIdx: repoIdx };
       } catch {}
     }
   }
@@ -374,7 +374,7 @@ async function getFullSession(sess, env, secret) {
       await kv.put(cacheKey, JSON.stringify({ username: user.username, encGhToken: user.encGhToken, repos }), { expirationTtl: ttl }).catch(() => {});
     }
   }
-  return { ...sess, ghToken, ghOwner: repo.ghOwner, ghRepo: repo.ghRepo, ghBranch: repo.ghBranch, folder: repo.folder, repoLabel: repo.label || 'Default', repos: repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo })), activeRepoIdx: repoIdx };
+  return { ...sess, ghToken, ghOwner: repo.ghOwner, ghRepo: repo.ghRepo, ghBranch: repo.ghBranch, folder: repo.folder, repoLabel: (repo.label && repo.label !== 'Default') ? repo.label : '', repos: repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo })), activeRepoIdx: repoIdx };
 }
 function isHttps(req) {
   try { return new URL(req.url).protocol === 'https:'; } catch { return false; }
@@ -687,7 +687,7 @@ async function _handleRequest({ request, env, params }) {
     const salt       = crypto.getRandomValues(new Uint8Array(16));
     const pwHash     = await pbkdf2Hash(password, salt);
     const encGhToken = await aesEncrypt(ghToken, secret, `user-token:${username.toLowerCase()}`);
-    const firstRepo  = { label: 'Default', ghOwner, ghRepo, ghBranch, folder };
+    const firstRepo  = { label: '', ghOwner, ghRepo, ghBranch, folder };
     const userRecord = {
       username: username.toLowerCase(), displayName: username,
       pwSalt: b64urlEnc(salt), pwHash: b64urlEnc(pwHash),
@@ -766,7 +766,7 @@ async function _handleRequest({ request, env, params }) {
       return fail(request, 403);
     }
     if (!isDownload && (request.headers.get('Accept') || '').includes('text/html')) {
-      const page = buildSharePage(data.filename, data.displayName || data.filename, data.size || 0, new Date(data.exp).toISOString(), tok);
+      const page = buildSharePage(data.filename, data.displayName || data.filename, data.size || 0, data.exp === 0 ? null : new Date(data.exp).toISOString(), tok);
       return new Response(page, { status:200, headers:{'Content-Type':'text/html;charset=utf-8','X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'no-referrer','Cache-Control':'no-store','Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self'; media-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none';"} });
     }
     const rec = await getUser(data.username, env);
@@ -1081,7 +1081,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
         ghOwner: targetRepo.ghOwner, ghRepo: targetRepo.ghRepo,
         ghBranch: targetRepo.ghBranch || 'main',
         folder: targetRepo.folder || 'uploads',
-        repoLabel: targetRepo.label || `Repo ${qRepoIdx + 1}`,
+        repoLabel: (targetRepo.label && targetRepo.label !== 'Default') ? targetRepo.label : '',
         activeRepoIdx: qRepoIdx,
       };
     }
