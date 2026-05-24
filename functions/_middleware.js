@@ -117,6 +117,10 @@ export async function onRequest({ request, next, env }) {
   // ── 9. Attach security headers to every response ──────────────────────────
   const headers = new Headers(response.headers);
   for (const [k, v] of Object.entries(GLOBAL_SEC)) {
+    // For API routes the worker sets Cross-Origin-Resource-Policy itself
+    // (cross-origin for API key requests, same-origin otherwise).
+    // Skip here so we don't overwrite the worker's intentional choice.
+    if (k === 'Cross-Origin-Resource-Policy' && path.startsWith('/api/')) continue;
     if (!headers.has(k)) headers.set(k, v);
   }
 
