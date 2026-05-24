@@ -84,6 +84,11 @@ function corsHeaders(req, allowedOrigins = null) {
   };
 }
 
+// Generate a short random request ID for tracing
+function newRequestId() {
+  return base64urlFromBytes(crypto.getRandomValues(new Uint8Array(9))); // 12 chars
+}
+
 // ── API key — production-grade entropy design ────────────────────────────────
 //
 //  Format : sgk_<43 Base64URL chars>
@@ -188,19 +193,32 @@ async function resolveApiKey(request, env, secret) {
   return { fullSess, allowedOrigins: origins, keyData };
 }
 function jsonRes(req, data, status = 200, extra = {}) {
+  const reqId = extra['X-Request-Id'] || newRequestId();
   return new Response(JSON.stringify(data), {
     status,
-    headers: { ...SEC, ...corsHeaders(req), 'Content-Type': 'application/json', ...extra },
+    headers: {
+      ...SEC,
+      ...corsHeaders(req),
+      'Content-Type': 'application/json',
+      'X-Request-Id': reqId,
+      ...extra,
+    },
   });
 }
+// Human-readable messages + machine-readable codes for every error status
 const ERRS = {
-  400:'Bad request', 401:'Invalid credentials', 403:'Forbidden',
-  404:'Not found',   409:'Username already taken',
-  413:'Payload too large', 415:'File type not permitted',
-  429:'Too many attempts — please wait and try again',
-  500:'Server error', 502:'Upstream error',
+  400: { error: 'Bad request',                        code: 'bad_request'        },
+  401: { error: 'Invalid credentials',                code: 'unauthorized'       },
+  403: { error: 'Forbidden',                          code: 'forbidden'          },
+  404: { error: 'Not found',                          code: 'not_found'          },
+  409: { error: 'Username already taken',             code: 'conflict'           },
+  413: { error: 'Payload too large',                  code: 'payload_too_large'  },
+  415: { error: 'File type not permitted',            code: 'unsupported_media'  },
+  429: { error: 'Too many attempts — please wait and try again', code: 'rate_limited' },
+  500: { error: 'Server error',                       code: 'server_error'       },
+  502: { error: 'Upstream error',                     code: 'upstream_error'     },
 };
-const fail = (req, code) => jsonRes(req, { error: ERRS[code] || 'Error' }, code);
+const fail = (req, code) => jsonRes(req, ERRS[code] || { error: 'Error', code: 'unknown' }, code);
 const ENC = new TextEncoder();
 const DEC = new TextDecoder();
 function b64Enc(u8) {
@@ -651,13 +669,99 @@ export async function onRequest({ request, env, params }) {
 async function _handleRequest({ request, env, params }) {
   const method = request.method.toUpperCase();
   const route  = (params.path || []).join('/');
+
+  // ── OPTIONS preflight — must resolve API key origins BEFORE responding ────
+  // Without this, browsers reject cross-origin API key requests at preflight
+  // because the server would return allowOrigin='null' for every external origin.
   if (method === 'OPTIONS') {
-    return new Response(null, { status:204, headers: { ...SEC, ...corsHeaders(request) } });
+    let preflightOrigins = null; // default: same-origin only
+    const apiKeyHdr = request.headers.get('X-API-Key') || '';
+    if (apiKeyHdr && APIKEY_RE.test(apiKeyHdr)) {
+      const kv = env.RATE_LIMIT_KV;
+      if (kv) {
+        try {
+          const kvKey  = await apiKeyKvKey(apiKeyHdr);
+          const keyData = await kv.get(kvKey, 'json').catch(() => null);
+          if (keyData) {
+            // Check origin binding before granting broad CORS
+            const origin = request.headers.get('Origin') || '';
+            const origins = keyData.allowedOrigins || [];
+            if (origins.length === 0 || !origin || origins.includes(origin)) {
+              preflightOrigins = origins; // [] = unrestricted, [...] = whitelist
+            }
+          }
+        } catch { /* fall through to same-origin */ }
+      }
+    }
+    return new Response(null, {
+      status: 204,
+      headers: { ...SEC, ...corsHeaders(request, preflightOrigins) },
+    });
   }
   const secret = env.TOKEN_SECRET;
   if (!secret) return fail(request, 500);
   if (route === 'status' && method === 'GET') {
-    return jsonRes(request, { ready: !!(env.REGISTRY_GITHUB_TOKEN && env.REGISTRY_GITHUB_OWNER && env.REGISTRY_GITHUB_REPO) });
+    const ready = !!(env.REGISTRY_GITHUB_TOKEN && env.REGISTRY_GITHUB_OWNER && env.REGISTRY_GITHUB_REPO);
+    return jsonRes(request, {
+      ready,
+      version: '1',
+      kvAvailable: !!(env.RATE_LIMIT_KV),
+      ...(!ready && { hint: 'Missing one or more required environment variables: REGISTRY_GITHUB_TOKEN, REGISTRY_GITHUB_OWNER, REGISTRY_GITHUB_REPO' }),
+    });
+  }
+
+  // ── API Discovery ─────────────────────────────────────────────────────────
+  // GET /api/ — returns all available routes with descriptions and auth requirements.
+  // Useful for SDK authors, automated tooling, and onboarding.
+  if (route === '' && method === 'GET') {
+    return jsonRes(request, {
+      description: 'StoreGit API — GitHub-backed file storage',
+      docsUrl: 'https://github.com/your-org/storegit#api',
+      authentication: {
+        session: 'POST /api/auth → sets HttpOnly cookie used automatically by browsers',
+        apiKey:  'Include X-API-Key: sgk_<key> header on every request',
+      },
+      routes: {
+        public: [
+          { method: 'GET',    path: '/api/',               description: 'This discovery document' },
+          { method: 'GET',    path: '/api/status',         description: 'Health check — confirms required env vars are present' },
+          { method: 'POST',   path: '/api/signup',         description: 'Create account', body: { username: 'string', password: 'string (≥8 chars)', ghToken: 'string', ghOwner: 'string', ghRepo: 'string', ghBranch: 'string (default: main)', folder: 'string (default: uploads)' } },
+          { method: 'POST',   path: '/api/auth',           description: 'Login — sets session cookie', body: { username: 'string', password: 'string' } },
+          { method: 'POST',   path: '/api/reset-password', description: 'Reset password via GitHub token', body: { username: 'string', ghToken: 'string', newPassword: 'string (≥8 chars)' } },
+          { method: 'GET',    path: '/api/dl?tok=<token>', description: 'Download a shared file (public share link)' },
+          { method: 'GET',    path: '/<shortId>',          description: 'Short share link redirect (e.g. /aB3x)' },
+        ],
+        authenticated: [
+          { method: 'POST',   path: '/api/logout',          description: 'Invalidate session', auth: ['session'] },
+          { method: 'GET',    path: '/api/me',              description: 'Current user info and active repo', auth: ['session', 'apiKey'] },
+          { method: 'GET',    path: '/api/repos',           description: 'List all linked repos', auth: ['session', 'apiKey'] },
+          { method: 'POST',   path: '/api/switch-repo',     description: 'Switch active repo', body: { repoIdx: 'number' }, auth: ['session'] },
+          { method: 'POST',   path: '/api/add-repo',        description: 'Link an additional GitHub repo', body: { label: 'string', ghOwner: 'string', ghRepo: 'string', ghBranch: 'string', folder: 'string' }, auth: ['session'] },
+          { method: 'POST',   path: '/api/remove-repo',     description: 'Remove a linked repo (index 0 is permanent)', body: { repoIdx: 'number' }, auth: ['session'] },
+          { method: 'GET',    path: '/api/files',           description: 'List all files in active repo (supports ?repoIdx=N)', auth: ['session', 'apiKey'] },
+          { method: 'POST',   path: '/api/upload',          description: 'Upload a file (≤5 MB, base64)', body: { name: 'string', content: 'base64 string' }, auth: ['session', 'apiKey'] },
+          { method: 'POST',   path: '/api/upload-chunk',    description: 'Upload one chunk of a large file', body: { name: 'string', chunkIndex: 'number', totalChunks: 'number', content: 'base64 string' }, auth: ['session', 'apiKey'] },
+          { method: 'POST',   path: '/api/finalize-upload', description: 'Commit a chunked upload after all chunks are sent', body: { name: 'string', totalSize: 'number', totalChunks: 'number', chunkSize: 'number', blobs: 'array of { index, blobSha, blobToken, size }' }, auth: ['session', 'apiKey'] },
+          { method: 'GET',    path: '/api/download?name=<name>', description: 'Download a file by stored name', auth: ['session', 'apiKey'] },
+          { method: 'DELETE', path: '/api/delete',          description: 'Delete a file', body: { name: 'string', sha: 'string (for regular files)', chunked: 'boolean' }, auth: ['session', 'apiKey'] },
+          { method: 'GET',    path: '/api/share-link?name=<name>&ttl=<seconds>', description: 'Generate a share link (ttl=0 for no expiry)', auth: ['session', 'apiKey'] },
+          { method: 'GET',    path: '/api/apikeys/list',    description: 'List your API keys (metadata only)', auth: ['session'] },
+          { method: 'POST',   path: '/api/apikeys/create',  description: 'Create an API key', body: { label: 'string', allowedOrigins: 'array of URLs (empty = unrestricted)' }, auth: ['session'] },
+          { method: 'DELETE', path: '/api/apikeys/revoke',  description: 'Revoke an API key', body: { keyId: 'string' }, auth: ['session'] },
+        ],
+      },
+      limits: {
+        uploadSmallMax:   '5 MB (single request)',
+        uploadChunkMax:   '10 MB per chunk',
+        maxChunks:        512,
+        maxFileSizeTotal: '~5 GB (512 chunks × 10 MB)',
+        apiKeyRateLimit:  '120 requests/minute per key',
+        globalRateLimit:  '600 requests/minute per IP',
+        sessionTTL:       '8 hours (auto-refreshed within last hour)',
+        shareTokenMaxTTL: '7 days',
+        apiKeysPerUser:   10,
+      },
+    });
   }
   if (route === 'signup' && method === 'POST') {
     const ip = getIP(request);
@@ -889,9 +993,28 @@ async function _handleRequest({ request, env, params }) {
   return response;
 }
 async function _dispatchRoute(route, method, request, env, fullSess, sess, secret, apiKeyOrigins = null) {
-  const cors = corsHeaders(request, apiKeyOrigins);
-  function jRes(data, status=200, extra={}) {
-    return new Response(JSON.stringify(data), { status, headers: { ...SEC, ...cors, 'Content-Type':'application/json', ...extra } });
+  const cors  = corsHeaders(request, apiKeyOrigins);
+  const reqId = newRequestId();
+
+  // For API key requests, override Cross-Origin-Resource-Policy so the
+  // middleware's 'same-origin' value doesn't block cross-origin responses.
+  // The middleware only sets headers that aren't already present.
+  const corpHeader = apiKeyOrigins !== null
+    ? { 'Cross-Origin-Resource-Policy': 'cross-origin' }
+    : {};
+
+  function jRes(data, status = 200, extra = {}) {
+    return new Response(JSON.stringify(data), {
+      status,
+      headers: {
+        ...SEC,
+        ...cors,
+        ...corpHeader,
+        'Content-Type': 'application/json',
+        'X-Request-Id': reqId,
+        ...extra,
+      },
+    });
   }
   const kv = env.RATE_LIMIT_KV || null;
 
@@ -908,17 +1031,17 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
   }
   if (route === 'switch-repo' && method === 'POST') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
-    let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
+    let body; try { body = await request.json(); } catch { return jRes(ERRS[400], 400); }
     const { repoIdx } = body||{};
-    if (typeof repoIdx !== 'number' || repoIdx < 0 || repoIdx >= fullSess.repos.length) return jRes({ error: ERRS[400] }, 400);
+    if (typeof repoIdx !== 'number' || repoIdx < 0 || repoIdx >= fullSess.repos.length) return jRes(ERRS[400], 400);
     const newToken = await createToken({ username: sess.username, display: sess.display, repoIdx }, secret);
     return jRes({ ok:true, repoIdx }, 200, { 'Set-Cookie': buildSetCookie(request, newToken, SESSION_TTL / 1000) });
   }
   if (route === 'add-repo' && method === 'POST') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
-    let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
+    let body; try { body = await request.json(); } catch { return jRes(ERRS[400], 400); }
     const { label='New Repo', ghOwner, ghRepo, ghBranch='main', folder='uploads' } = body||{};
-    if (!ghOwner||!ghRepo) return jRes({ error: ERRS[400] }, 400);
+    if (!ghOwner||!ghRepo) return jRes(ERRS[400], 400);
     if (!OWNER_RE.test(ghOwner))   return jRes({error:'Invalid GitHub owner name'},400);
     if (!REPO_RE.test(ghRepo))     return jRes({error:'Invalid GitHub repository name'},400);
     if (!BRANCH_RE.test(ghBranch)) return jRes({error:'Invalid branch name'},400);
@@ -932,31 +1055,31 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     if (!repoData.permissions?.push && !repoData.permissions?.admin)
       return jRes({error:'Token requires write access to this repository'},400);
     const rec = await getUser(sess.username, env);
-    if (!rec) return jRes({ error: ERRS[404] }, 404);
+    if (!rec) return jRes(ERRS[404], 404);
     const { content: user, sha: userSha } = rec;
     const repos = getUserRepos(user);
     repos.push({ label: String(label).slice(0,40), ghOwner, ghRepo, ghBranch, folder });
     const updated = { ...user, repos };
     try { await writeReg(userPath(sess.username), updated, `Add repo ${ghOwner}/${ghRepo}`, env, userSha); }
-    catch { return jRes({ error: ERRS[502] }, 502); }
+    catch { return jRes(ERRS[502], 502); }
     if (kv) await env.RATE_LIMIT_KV.delete(`sess_cache:${sess.jti}`).catch(() => {});
     return jRes({ ok:true, repos: repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo })) });
   }
   if (route === 'remove-repo' && method === 'POST') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
-    let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
+    let body; try { body = await request.json(); } catch { return jRes(ERRS[400], 400); }
     const { repoIdx } = body||{};
-    if (typeof repoIdx !== 'number' || repoIdx < 0) return jRes({ error: ERRS[400] }, 400);
+    if (typeof repoIdx !== 'number' || repoIdx < 0) return jRes(ERRS[400], 400);
     const rec = await getUser(sess.username, env);
-    if (!rec) return jRes({ error: ERRS[404] }, 404);
+    if (!rec) return jRes(ERRS[404], 404);
     const { content: user, sha: userSha } = rec;
     const repos = getUserRepos(user);
     if (repoIdx === 0) return jRes({ error: 'Cannot remove the primary repository' }, 400);
-    if (repoIdx >= repos.length) return jRes({ error: ERRS[400] }, 400);
+    if (repoIdx >= repos.length) return jRes(ERRS[400], 400);
     repos.splice(repoIdx, 1);
     const updated = { ...user, repos };
     try { await writeReg(userPath(sess.username), updated, `Remove repo ${repoIdx}`, env, userSha); }
-    catch { return jRes({ error: ERRS[502] }, 502); }
+    catch { return jRes(ERRS[502], 502); }
     if (kv) await env.RATE_LIMIT_KV.delete(`sess_cache:${sess.jti}`).catch(() => {});
     return jRes({ ok:true });
   }
@@ -965,7 +1088,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
   if (route === 'apikeys/list' && method === 'GET') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
     const rec = await getUser(sess.username, env);
-    if (!rec) return jRes({ error: ERRS[404] }, 404);
+    if (!rec) return jRes(ERRS[404], 404);
     const keys = (rec.content.apiKeys || []).map(k => ({
       keyId: k.keyId, preview: k.preview, label: k.label,
       allowedOrigins: k.allowedOrigins || [], createdAt: k.createdAt,
@@ -974,7 +1097,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
   }
   if (route === 'apikeys/create' && method === 'POST') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
-    let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
+    let body; try { body = await request.json(); } catch { return jRes(ERRS[400], 400); }
     const label          = String(body?.label || 'My App').slice(0, 60);
     const rawOrigins     = Array.isArray(body?.allowedOrigins) ? body.allowedOrigins : [];
     const allowedOrigins = rawOrigins
@@ -985,7 +1108,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       })
       .slice(0, 20);
     const rec = await getUser(sess.username, env);
-    if (!rec) return jRes({ error: ERRS[404] }, 404);
+    if (!rec) return jRes(ERRS[404], 404);
     const { content: user, sha: userSha } = rec;
     const existingKeys = user.apiKeys || [];
     if (existingKeys.length >= 10) return jRes({ error: 'Maximum of 10 API keys allowed' }, 400);
@@ -1003,16 +1126,16 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const keyMeta = { keyId, preview, label, allowedOrigins, createdAt: new Date().toISOString(), encKey };
     const updated = { ...user, apiKeys: [...existingKeys, keyMeta] };
     try { await writeReg(userPath(sess.username), updated, `Create API key: ${label}`, env, userSha); }
-    catch { const _k = await apiKeyKvKey(rawKey); await kv.delete(_k).catch(() => {}); return jRes({ error: ERRS[502] }, 502); }
+    catch { const _k = await apiKeyKvKey(rawKey); await kv.delete(_k).catch(() => {}); return jRes(ERRS[502], 502); }
     return jRes({ ok: true, rawKey, keyId, preview, label, allowedOrigins });
   }
   if (route === 'apikeys/revoke' && method === 'DELETE') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
-    let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
+    let body; try { body = await request.json(); } catch { return jRes(ERRS[400], 400); }
     const { keyId } = body||{};
-    if (!keyId || typeof keyId !== 'string') return jRes({ error: ERRS[400] }, 400);
+    if (!keyId || typeof keyId !== 'string') return jRes(ERRS[400], 400);
     const rec = await getUser(sess.username, env);
-    if (!rec) return jRes({ error: ERRS[404] }, 404);
+    if (!rec) return jRes(ERRS[404], 404);
     const { content: user, sha: userSha } = rec;
     const existing = user.apiKeys || [];
     const target   = existing.find(k => k.keyId === keyId);
@@ -1027,7 +1150,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     }
     const updated = { ...user, apiKeys: existing.filter(k => k.keyId !== keyId) };
     try { await writeReg(userPath(sess.username), updated, `Revoke API key: ${target.label}`, env, userSha); }
-    catch { return jRes({ error: ERRS[502] }, 502); }
+    catch { return jRes(ERRS[502], 502); }
     return jRes({ ok: true });
   }
   if (route === 'share-link' && method === 'GET') {
@@ -1104,17 +1227,17 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
         return new Date(b.uploadedAt) - new Date(a.uploadedAt);
       });
       return jRes(all);
-    } catch { return jRes({ error: ERRS[502] }, 502); }
+    } catch { return jRes(ERRS[502], 502); }
   }
   if (route === 'upload' && method === 'POST') {
-    if (!(request.headers.get('Content-Type')||'').includes('application/json')) return jRes({ error: ERRS[400] },400);
-    let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] },400); }
+    if (!(request.headers.get('Content-Type')||'').includes('application/json')) return jRes(ERRS[400], 400);
+    let body; try { body = await request.json(); } catch { return jRes(ERRS[400], 400); }
     const { name: rawName, content: b64 } = body||{};
-    if (!rawName || !b64 || typeof b64 !== 'string') return jRes({ error: ERRS[400] },400);
-    if (b64.length > CHUNK_B64_MAX) return jRes({ error: ERRS[413] },413);
+    if (!rawName || !b64 || typeof b64 !== 'string') return jRes(ERRS[400], 400);
+    if (b64.length > CHUNK_B64_MAX) return jRes(ERRS[413], 413);
     const safe = sanitize(String(rawName));
-    if (!safe) return jRes({ error: ERRS[415] },415);
-    if (!checkMagicBase64(b64)) return jRes({ error: ERRS[415] },415);
+    if (!safe) return jRes(ERRS[415], 415);
+    if (!checkMagicBase64(b64)) return jRes(ERRS[415], 415);
     const decodedSize = Math.floor(b64.length * 3 / 4);
     try {
       if (decodedSize > SMALL_MAX_BYTES) {
@@ -1141,21 +1264,21 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
         await writeIndex(fullSess, idx, idxSha);
       } catch {}
       return jRes({ ok:true, name:safe, size:decodedSize });
-    } catch { return jRes({ error: ERRS[502] }, 502); }
+    } catch { return jRes(ERRS[502], 502); }
   }
   if (route === 'upload-chunk' && method === 'POST') {
-    if (!(request.headers.get('Content-Type')||'').includes('application/json')) return jRes({ error: ERRS[400] },400);
-    let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] },400); }
+    if (!(request.headers.get('Content-Type')||'').includes('application/json')) return jRes(ERRS[400], 400);
+    let body; try { body = await request.json(); } catch { return jRes(ERRS[400], 400); }
     const { name: rawName, chunkIndex, totalChunks, content: b64 } = body||{};
-    if (!rawName || !b64 || typeof b64 !== 'string') return jRes({ error: ERRS[400] },400);
-    if (b64.length > CHUNK_B64_MAX) return jRes({ error: ERRS[413] },413);
+    if (!rawName || !b64 || typeof b64 !== 'string') return jRes(ERRS[400], 400);
+    if (b64.length > CHUNK_B64_MAX) return jRes(ERRS[413], 413);
     const chunkIdx = parseInt(chunkIndex, 10);
     const tot = parseInt(totalChunks, 10);
-    if (isNaN(chunkIdx)||chunkIdx<0) return jRes({ error: ERRS[400] },400);
-    if (isNaN(tot)||tot<1||tot>MAX_TOTAL_CHUNKS) return jRes({ error: ERRS[400] },400);
+    if (isNaN(chunkIdx)||chunkIdx<0) return jRes(ERRS[400], 400);
+    if (isNaN(tot)||tot<1||tot>MAX_TOTAL_CHUNKS) return jRes(ERRS[400], 400);
     const safe = sanitize(String(rawName));
-    if (!safe) return jRes({ error: ERRS[415] },415);
-    if (chunkIdx === 0 && !checkMagicBase64(b64)) return jRes({ error: ERRS[415] },415);
+    if (!safe) return jRes(ERRS[415], 415);
+    if (chunkIdx === 0 && !checkMagicBase64(b64)) return jRes(ERRS[415], 415);
     const decodedSize = Math.floor(b64.length * 3 / 4);
     // For API key sessions, use a synthetic jti
     const jti = sess ? sess.jti : `ak:${fullSess.username}`;
@@ -1163,27 +1286,27 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       const blobSha   = await createBlob(fullSess, b64);
       const blobToken = await blobTokenSign(jti, safe, chunkIdx, blobSha, secret);
       return jRes({ ok:true, blobSha, blobToken, index: chunkIdx, size: decodedSize });
-    } catch { return jRes({ error: ERRS[502] }, 502); }
+    } catch { return jRes(ERRS[502], 502); }
   }
   if (route === 'finalize-upload' && method === 'POST') {
-    let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] },400); }
+    let body; try { body = await request.json(); } catch { return jRes(ERRS[400], 400); }
     const { name, totalSize, totalChunks, chunkSize, blobs } = body||{};
-    if (!name||!totalSize||!totalChunks||!Array.isArray(blobs)) return jRes({ error: ERRS[400] },400);
-    if (blobs.length !== totalChunks) return jRes({ error: ERRS[400] },400);
-    if (totalChunks > MAX_TOTAL_CHUNKS) return jRes({ error: ERRS[413] },413);
+    if (!name||!totalSize||!totalChunks||!Array.isArray(blobs)) return jRes(ERRS[400], 400);
+    if (blobs.length !== totalChunks) return jRes(ERRS[400], 400);
+    if (totalChunks > MAX_TOTAL_CHUNKS) return jRes(ERRS[413], 413);
     const MAX_FILE_BYTES = MAX_TOTAL_CHUNKS * CHUNK_B64_MAX;
-    if (!Number.isInteger(totalSize) || totalSize < 1 || totalSize > MAX_FILE_BYTES) return jRes({ error: ERRS[400] }, 400);
-    if (chunkSize !== undefined && (!Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > CHUNK_B64_MAX)) return jRes({ error: ERRS[400] }, 400);
+    if (!Number.isInteger(totalSize) || totalSize < 1 || totalSize > MAX_FILE_BYTES) return jRes(ERRS[400], 400);
+    if (chunkSize !== undefined && (!Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > CHUNK_B64_MAX)) return jRes(ERRS[400], 400);
     const safe = sanitize(String(name));
-    if (!safe) return jRes({ error: ERRS[415] }, 415);
+    if (!safe) return jRes(ERRS[415], 415);
     const jti = sess ? sess.jti : `ak:${fullSess.username}`;
     for (const b of blobs) {
-      if (typeof b.blobSha   !== 'string' || !SHA_RE.test(b.blobSha)) return jRes({ error: ERRS[400] },400);
-      if (typeof b.blobToken !== 'string')                             return jRes({ error: ERRS[400] },400);
-      if (typeof b.index     !== 'number' || b.index < 0)             return jRes({ error: ERRS[400] },400);
-      if (typeof b.size      !== 'number' || b.size  < 1)             return jRes({ error: ERRS[400] },400);
+      if (typeof b.blobSha   !== 'string' || !SHA_RE.test(b.blobSha)) return jRes(ERRS[400], 400);
+      if (typeof b.blobToken !== 'string')                             return jRes(ERRS[400], 400);
+      if (typeof b.index     !== 'number' || b.index < 0)             return jRes(ERRS[400], 400);
+      if (typeof b.size      !== 'number' || b.size  < 1)             return jRes(ERRS[400], 400);
       const expected = await blobTokenSign(jti, safe, b.index, b.blobSha, secret);
-      if (!(await timingSafeEq(b.blobToken, expected))) return jRes({ error: ERRS[403] }, 403);
+      if (!(await timingSafeEq(b.blobToken, expected))) return jRes(ERRS[403], 403);
     }
     try {
       await finalizeChunkedUpload(fullSess, safe, blobs, totalSize, chunkSize);
@@ -1191,12 +1314,12 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       idx[safe] = { originalName: getOriginalName(name, safe), totalSize, totalChunks, uploadedAt: new Date().toISOString() };
       await writeIndex(fullSess, idx, idxSha);
       return jRes({ ok:true, name:safe });
-    } catch { return jRes({ error: ERRS[502] }, 502); }
+    } catch { return jRes(ERRS[502], 502); }
   }
   if (route === 'download' && method === 'GET') {
     const nameParam = new URL(request.url).searchParams.get('name') || '';
     const safe = sanitize(nameParam);
-    if (!safe) return jRes({ error: ERRS[400] },400);
+    if (!safe) return jRes(ERRS[400], 400);
     const { ghToken, ghOwner, ghRepo, ghBranch, folder } = fullSess;
     let manifest = null, serveAs = safe;
     try {
@@ -1226,23 +1349,23 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
           } catch (e) { controller.error(e); }
         },
       });
-      return new Response(stream, { status:200, headers: { ...SEC, ...cors, 'Content-Type': safeMime(serveAs), 'Content-Disposition': contentDisposition(serveAs), 'Content-Length': String(manifest.totalSize), 'Accept-Ranges':'none' } });
+      return new Response(stream, { status:200, headers: { ...SEC, ...cors, ...corpHeader, 'Content-Type': safeMime(serveAs), 'Content-Disposition': contentDisposition(serveAs), 'Content-Length': String(manifest.totalSize), 'Accept-Ranges':'none', 'X-Request-Id': reqId } });
     }
     const rawUrl = `https://raw.githubusercontent.com/${ghOwner}/${ghRepo}/${ghBranch}/${folder}/${encodeURIComponent(safe)}`;
     let ghRes;
     try { ghRes = await fetch(rawUrl, { headers:{ Authorization:`token ${ghToken}`, 'User-Agent':'StoreGit/1' } }); }
-    catch { return jRes({ error: ERRS[502] },502); }
-    if (ghRes.status===404) return jRes({ error: ERRS[404] },404);
-    if (!ghRes.ok) return jRes({ error: ERRS[502] },502);
+    catch { return jRes(ERRS[502], 502); }
+    if (ghRes.status===404) return jRes(ERRS[404], 404);
+    if (!ghRes.ok) return jRes(ERRS[502], 502);
     const len = ghRes.headers.get('Content-Length')||'';
-    return new Response(ghRes.body, { status:200, headers: { ...SEC, ...cors, 'Content-Type': safeMime(serveAs), 'Content-Disposition': contentDisposition(serveAs), ...(len?{'Content-Length':len}:{}), 'Accept-Ranges':'bytes' } });
+    return new Response(ghRes.body, { status:200, headers: { ...SEC, ...cors, ...corpHeader, 'Content-Type': safeMime(serveAs), 'Content-Disposition': contentDisposition(serveAs), ...(len?{'Content-Length':len}:{}), 'Accept-Ranges':'bytes', 'X-Request-Id': reqId } });
   }
   if (route === 'delete' && method === 'DELETE') {
-    let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] },400); }
+    let body; try { body = await request.json(); } catch { return jRes(ERRS[400], 400); }
     const { name, sha, chunked } = body||{};
-    if (typeof name !== 'string') return jRes({ error: ERRS[400] },400);
+    if (typeof name !== 'string') return jRes(ERRS[400], 400);
     const safe = sanitize(name);
-    if (!safe) return jRes({ error: ERRS[400] },400);
+    if (!safe) return jRes(ERRS[400], 400);
     if (chunked) {
       try {
         await deleteChunked(fullSess, safe);
@@ -1250,9 +1373,9 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
         delete idx[safe];
         await writeIndex(fullSess, idx, idxSha);
         return jRes({ ok:true });
-      } catch { return jRes({ error: ERRS[502] },502); }
+      } catch { return jRes(ERRS[502], 502); }
     } else {
-      if (typeof sha !== 'string' || !SHA_RE.test(sha)) return jRes({ error: ERRS[400] },400);
+      if (typeof sha !== 'string' || !SHA_RE.test(sha)) return jRes(ERRS[400], 400);
       try {
         await deleteRegular(fullSess, safe, sha);
         try {
@@ -1260,8 +1383,8 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
           if (idx[safe]) { delete idx[safe]; await writeIndex(fullSess, idx, idxSha); }
         } catch {}
         return jRes({ ok:true });
-      } catch { return jRes({ error: ERRS[502] },502); }
+      } catch { return jRes(ERRS[502], 502); }
     }
   }
-  return jRes({ error: ERRS[404] }, 404);
+  return jRes(ERRS[404], 404);
 }
