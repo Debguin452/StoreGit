@@ -670,32 +670,19 @@ async function _handleRequest({ request, env, params }) {
   const method = request.method.toUpperCase();
   const route  = (params.path || []).join('/');
 
-  // ── OPTIONS preflight — must resolve API key origins BEFORE responding ────
-  // Without this, browsers reject cross-origin API key requests at preflight
-  // because the server would return allowOrigin='null' for every external origin.
+  // ── OPTIONS preflight ─────────────────────────────────────────────────────
+  // Browsers do NOT send the X-API-Key value in preflight requests — only the
+  // header *name* appears in Access-Control-Request-Headers. Attempting to look
+  // up the key here always yields an empty string, so allowOrigin comes back
+  // 'null' and the browser rejects every cross-origin API key request.
+  //
+  // The correct approach: allow all preflights unconditionally. Origin/key
+  // enforcement happens on the real request that follows, where the header
+  // value is actually present. This is standard CORS practice.
   if (method === 'OPTIONS') {
-    let preflightOrigins = null; // default: same-origin only
-    const apiKeyHdr = request.headers.get('X-API-Key') || '';
-    if (apiKeyHdr && APIKEY_RE.test(apiKeyHdr)) {
-      const kv = env.RATE_LIMIT_KV;
-      if (kv) {
-        try {
-          const kvKey  = await apiKeyKvKey(apiKeyHdr);
-          const keyData = await kv.get(kvKey, 'json').catch(() => null);
-          if (keyData) {
-            // Check origin binding before granting broad CORS
-            const origin = request.headers.get('Origin') || '';
-            const origins = keyData.allowedOrigins || [];
-            if (origins.length === 0 || !origin || origins.includes(origin)) {
-              preflightOrigins = origins; // [] = unrestricted, [...] = whitelist
-            }
-          }
-        } catch { /* fall through to same-origin */ }
-      }
-    }
     return new Response(null, {
       status: 204,
-      headers: { ...SEC, ...corsHeaders(request, preflightOrigins) },
+      headers: { ...SEC, ...corsHeaders(request, []) },
     });
   }
   const secret = env.TOKEN_SECRET;
