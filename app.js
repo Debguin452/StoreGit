@@ -159,14 +159,14 @@ function startLockout(secs) {
   };
   tick(); const t = setInterval(tick, 1000);
 }
-async function bootApp(me) {
-  // Ensure drawer is fully closed on boot
+function bootApp(me) {
   ['drawer','drawer-overlay'].forEach(id => document.getElementById(id)?.classList.remove('is-open'));
   document.getElementById('hamburger-btn')?.classList.remove('is-open');
   document.body.style.overflow = '';
-  showScreen('app');
-  await loadMeta();   // must complete first so _allRepos is populated
-  loadFiles();
+  closeDrawerAddRepoForm();
+  closeApiKeyForm();
+  hideApiKeyReveal();
+  showScreen('app'); loadMeta(); loadFiles();
 }
 function updateRepoChip(repos, activeIdx) {
   _allRepos = repos || [];
@@ -206,9 +206,10 @@ function renderDrawerRepoList() {
   _allRepos.forEach((repo, i) => {
     const item = elem('div', 'drawer-repo-item' + (i === _activeRepoIdx ? ' active' : ''));
     const label = elem('div', 'drawer-repo-item-label');
-    label.textContent = repo.label || `Repo ${i + 1}`;
+    const customLabel = repo.label && repo.label !== 'Default' ? repo.label : null;
+    label.textContent = customLabel || `${repo.ghOwner}/${repo.ghRepo}`;
     const slug = elem('div', 'drawer-repo-item-slug');
-    slug.textContent = `${repo.ghOwner}/${repo.ghRepo}`;
+    slug.textContent = customLabel ? `${repo.ghOwner}/${repo.ghRepo}` : '';
     item.append(label, slug);
     if (i === _activeRepoIdx) {
       const badge = elem('span', 'drawer-repo-item-badge');
@@ -437,6 +438,7 @@ function buildFileRow(f) {
 function renderAllFiles(groups) {
   const el = document.getElementById('file-list');
   el.innerHTML = '';
+  const showSections = true;
   let totalVisible = 0;
   for (const group of groups) {
     const visible = (group.files || [])
@@ -447,23 +449,28 @@ function renderAllFiles(groups) {
         if (!b.uploadedAt) return -1;
         return new Date(b.uploadedAt) - new Date(a.uploadedAt);
       });
-    const totalSize = visible.reduce((sum, f) => sum + (f.size || 0), 0);
-    const repoName  = group.repo?.label || `Repo ${group.repoIdx + 1}`;
-    const repoSlug  = group.repo ? `${group.repo.ghOwner}/${group.repo.ghRepo}` : '';
-    const section   = elem('div', 'repo-section');
-    const hdr       = elem('div', 'repo-section-header');
-    const lbl       = elem('div', 'repo-section-label'); lbl.textContent = repoName;
-    const sub       = elem('div', 'repo-section-sub');
-    sub.textContent = repoSlug + (totalSize ? '  ·  ' + fmtSize(totalSize) : '');
-    hdr.append(lbl, sub);
-    section.appendChild(hdr);
-    if (visible.length === 0) {
-      const empty = elem('div', 'repo-section-empty'); empty.textContent = 'No files yet.';
-      section.appendChild(empty);
+    if (showSections) {
+      const totalSize = visible.reduce((sum, f) => sum + (f.size || 0), 0);
+      const customLabel = group.repo?.label && group.repo.label !== 'Default' ? group.repo.label : null;
+      const repoName = customLabel || (group.repo ? `${group.repo.ghOwner}/${group.repo.ghRepo}` : `Repo ${group.repoIdx + 1}`);
+      const repoSub  = customLabel && group.repo ? `${group.repo.ghOwner}/${group.repo.ghRepo}` : '';
+      const section  = elem('div', 'repo-section');
+      const hdr      = elem('div', 'repo-section-header');
+      const lbl      = elem('div', 'repo-section-label'); lbl.textContent = repoName;
+      const sub      = elem('div', 'repo-section-sub');
+      sub.textContent = repoSub + (totalSize ? ' · ' + fmtSize(totalSize) : '');
+      hdr.append(lbl, sub);
+      section.appendChild(hdr);
+      if (visible.length === 0) {
+        const empty = elem('div', 'repo-section-empty'); empty.textContent = 'No files yet.';
+        section.appendChild(empty);
+      } else {
+        visible.forEach(f => section.appendChild(buildFileRow(f)));
+      }
+      el.appendChild(section);
     } else {
-      visible.forEach(f => section.appendChild(buildFileRow(f)));
+      visible.forEach(f => el.appendChild(buildFileRow(f)));
     }
-    el.appendChild(section);
     totalVisible += visible.length;
   }
   if (totalVisible === 0) { el.innerHTML = ''; el.appendChild(emptyState('No files uploaded yet.')); }
@@ -474,7 +481,7 @@ async function loadMeta() {
     const r = await fetch('/api/me', { credentials:'same-origin' });
     if (r.ok) {
       const d = await r.json();
-      document.getElementById('repo-label').textContent = d.repoLabel ? `${d.repoLabel} — ${d.repo}` : (d.repo || '');
+
       updateRepoChip(d.repos || [], d.activeRepoIdx ?? 0);
     }
   } catch {}
@@ -539,22 +546,30 @@ async function loadFiles() {
   const el=document.getElementById('file-list');
   el.innerHTML='<div class="loading-row"><span class="spinner"></span> Loading files…</div>';
   try {
-    // Fetch each assigned repo in parallel using ?repoIdx= — no session mutation
-    if (!_allRepos.length) { el.innerHTML = ''; el.appendChild(emptyState('No repositories connected.')); return; }
-    const results = await Promise.allSettled(
-      _allRepos.map((repo, i) =>
-        fetch(`/api/files?repoIdx=${i}`, { credentials: 'same-origin' })
-          .then(r => {
-            if (r.status === 401) { doLogout(); throw new Error('unauth'); }
-            if (!r.ok) throw new Error(`repo_${i}_fail`);
-            return r.json();
-          })
-          .then(files => ({ repo, repoIdx: i, files: files.map(f => ({ ...f, _repoIdx: i })) }))
-      )
-    );
-    _repoFiles = results
-      .filter(r => r.status === 'fulfilled')
-      .map(r => r.value);
+    if (_allRepos.length <= 1) {
+      const r=await fetch('/api/files',{credentials:'same-origin'});
+      if(r.status===401){doLogout();return;}
+      if(!r.ok) throw new Error('Failed to load files.');
+      const files=await r.json();
+      _repoFiles=[{repo:_allRepos[0]||null,repoIdx:0,files}];
+    } else {
+      // Fetch all repos in parallel using ?repoIdx= — no session mutation
+      const results = await Promise.allSettled(
+        _allRepos.map((repo, i) =>
+          fetch(`/api/files?repoIdx=${i}`, { credentials: 'same-origin' })
+            .then(r => {
+              if (r.status === 401) { doLogout(); throw new Error('unauth'); }
+              if (!r.ok) throw new Error(`repo_${i}_fail`);
+              return r.json();
+            })
+            .then(files => ({ repo, repoIdx: i, files: files.map(f => ({ ...f, _repoIdx: i })) }))
+        )
+      );
+      const groups = results
+        .filter(r => r.status === 'fulfilled')
+        .map(r => r.value);
+      _repoFiles = groups;
+    }
     renderAllFiles(_repoFiles);
   } catch(e){el.innerHTML='';el.appendChild(emptyState(e.message));}
 }
