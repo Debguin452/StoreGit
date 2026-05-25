@@ -1,0 +1,28 @@
+{
+  "_comment": "StoreGit runtime configuration. Edit this file in GitHub to change limits — restart/redeploy not required (changes take effect within 5 minutes via KV cache).",
+
+  "session_ttl_ms":               28800000,
+  "session_refresh_threshold_ms":  3600000,
+
+  "share_ttl_max_seconds": 604800,
+
+  "rate_window_ms":              900000,
+  "login_lockout_ms":             30000,
+  "login_lockout_attempts":           3,
+  "rate_max_signup":                  3,
+  "rate_max_reset":                   3,
+
+  "apikey_rate_max":       120,
+  "apikey_rate_window_ms": 60000,
+
+  "chunk_b64_max":          14680064,
+  "small_max_bytes":         5242880,
+  "dist_threshold_bytes":  524288000,
+  "max_total_chunks":            512,
+
+  "middleware_rate_max":        600,
+  "middleware_rate_window_ms": 60000,
+
+  "max_repos_per_user":          20,
+  "max_apikeys_per_user":        10
+}
