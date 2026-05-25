@@ -566,36 +566,6 @@ async function loadFiles() {
     renderAllFiles(_repoFiles);
   } catch(e){el.innerHTML='';el.appendChild(emptyState(e.message));}
 }
-function renderFiles(files) {
-  const el=document.getElementById('file-list');
-  el.innerHTML='';
-  const visible=files
-    .filter(f=>f.name!=='.storegit')
-    .sort((a,b)=>{
-      if(!a.uploadedAt&&!b.uploadedAt)return 0;
-      if(!a.uploadedAt)return 1;
-      if(!b.uploadedAt)return -1;
-      return new Date(b.uploadedAt)-new Date(a.uploadedAt);
-    });
-  if(!visible.length){el.appendChild(emptyState('No files uploaded yet.'));return;}
-  for(const f of visible){
-    const row  = elem('div','file-row');
-    const badge = elem('div','file-type-badge');
-    const displayName = f.originalName || f.name;
-    badge.textContent = fileExt(displayName);
-    badge.style.background = fileColor(fileExtRaw(displayName));
-    badge.style.color = '#fff';
-    const info = elem('div','file-info');
-    const nm   = elem('div','file-name'); nm.textContent=displayName; nm.title=displayName;
-    const mt   = elem('div','file-meta'); mt.textContent=fmtSize(f.size);
-    info.append(nm,mt);
-    const chevron = elem('div','file-chevron');
-    chevron.innerHTML=`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><polyline points="9 18 15 12 9 6"/></svg>`;
-    row.append(badge,info,chevron);
-    row.onclick = () => openFileDetail(f);
-    el.appendChild(row);
-  }
-}
 async function deleteFile(name, sha, chunked, displayName, repoIdx = 0) {
   const label = displayName || name;
   showModal('Delete file', `“${label}” will be permanently deleted and cannot be recovered.`, 'Delete', 'btn-danger', async () => {
@@ -702,14 +672,15 @@ function renderQueue() {
 async function retryItem(idx) {
   const st = uploadPending[idx]?.status;
   if (st !== 'fail' && st !== 'paused') return;
+  const targetRepoIdx = getSmartRepoIdx();
   const btn = document.getElementById('upload-btn');
   btn.disabled = true; btn.textContent = 'Uploading…';
   setQ(idx, 'go', 0);
   try {
     if (uploadPending[idx].file.size > CHUNK_THRESHOLD) {
-      await chunkedUpload(uploadPending[idx].file, idx);
+      await chunkedUpload(uploadPending[idx].file, idx, targetRepoIdx);
     } else {
-      await xhrUpload(uploadPending[idx].file, idx);
+      await xhrUpload(uploadPending[idx].file, idx, targetRepoIdx);
     }
     setQ(idx, 'ok', 100);
     toast('File uploaded.', 'ok');
@@ -985,47 +956,44 @@ async function loadFilePreview(f) {
     wrap.append(icon, textEl);
     el.replaceChildren(wrap);
   }
-  async function fetchAsDataURL() {
-    const r = await fetch(`/api/download?name=${encodeURIComponent(f.name)}&repoIdx=${_currentFileRepoIdx}`, {
-      credentials: 'same-origin'
-    });
-    if (!r.ok) throw new Error('fetch_failed');
-    const blob = await r.blob();
-    return new Promise((res, rej) => {
-      const reader = new FileReader();
-      reader.onload  = e => res(e.target.result);
-      reader.onerror = () => rej(new Error('read_failed'));
-      reader.readAsDataURL(blob);
-    });
-  }
+  // Build inline URL — browser streams directly, no blob buffering needed
+  const inlineUrl = `/api/download?name=${encodeURIComponent(f.name)}&repoIdx=${_currentFileRepoIdx}&inline=1`;
   if (FD_IMG.has(ext)) {
-    if (f.size > 8 * 1024 * 1024) { noPreview('Image too large to preview.<br>Download to view.'); return; }
-    try {
-      const dataUrl = await fetchAsDataURL();
-      const _img = document.createElement('img'); _img.className = 'fd-preview-img'; _img.src = dataUrl; _img.alt = f.name; el.replaceChildren(_img);
-    } catch { noPreview('Could not load image preview.'); }
+    if (f.size > 20 * 1024 * 1024) { noPreview('Image too large to preview.<br>Download to view.'); return; }
+    const _img = document.createElement('img');
+    _img.className = 'fd-preview-img';
+    _img.alt = f.name;
+    _img.onerror = () => noPreview('Could not load image preview.');
+    el.replaceChildren(_img);
+    _img.src = inlineUrl; // set src after attaching so onerror fires correctly
     return;
   }
   if (FD_AUDIO.has(ext)) {
-    if (f.size > 8 * 1024 * 1024) { noPreview('Audio file is large.<br>Download to listen.'); return; }
-    try {
-      const dataUrl = await fetchAsDataURL();
-      const _aud = document.createElement('audio'); _aud.className = 'fd-preview-audio'; _aud.controls = true; _aud.src = dataUrl; el.replaceChildren(_aud);
-    } catch { noPreview('Could not load audio preview.'); }
+    if (f.size > 50 * 1024 * 1024) { noPreview('Audio file is large.<br>Download to listen.'); return; }
+    const _aud = document.createElement('audio');
+    _aud.className = 'fd-preview-audio';
+    _aud.controls = true;
+    _aud.preload = 'metadata';
+    _aud.onerror = () => noPreview('Could not load audio preview.');
+    el.replaceChildren(_aud);
+    _aud.src = inlineUrl;
     return;
   }
   if (FD_VIDEO.has(ext)) {
-    if (f.size > 15 * 1024 * 1024) { noPreview('Video too large to preview here.<br>Download to watch.'); return; }
-    try {
-      const dataUrl = await fetchAsDataURL();
-      const _vid = document.createElement('video'); _vid.className = 'fd-preview-video'; _vid.controls = true; _vid.src = dataUrl; el.replaceChildren(_vid);
-    } catch { noPreview('Could not load video preview.'); }
+    if (f.size > 200 * 1024 * 1024) { noPreview('Video too large to preview here.<br>Download to watch.'); return; }
+    const _vid = document.createElement('video');
+    _vid.className = 'fd-preview-video';
+    _vid.controls = true;
+    _vid.preload = 'metadata';
+    _vid.onerror = () => noPreview('Could not load video preview.');
+    el.replaceChildren(_vid);
+    _vid.src = inlineUrl;
     return;
   }
   if (FD_TEXT.has(ext) || f.size <= 200 * 1024) {
     if (f.size > 500 * 1024) { noPreview('File too large to preview as text.<br>Download to open.'); return; }
     try {
-      const r = await fetch(`/api/download?name=${encodeURIComponent(f.name)}&repoIdx=${_currentFileRepoIdx}`, {
+      const r = await fetch(`/api/download?name=${encodeURIComponent(f.name)}&repoIdx=${_currentFileRepoIdx}&inline=1`, {
         credentials: 'same-origin'
       });
       if (!r.ok) throw new Error();
