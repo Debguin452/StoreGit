@@ -497,6 +497,53 @@ const regH = env => ({
 });
 const regBase = env =>
   `https://api.github.com/repos/${encodeURIComponent(env.REGISTRY_GITHUB_OWNER)}/${encodeURIComponent(env.REGISTRY_GITHUB_REPO)}`;
+
+// ── Runtime config — stored in config/config.json in the registry repo ──────
+// Never exposed via any API. Change via GitHub file edit; takes effect within
+// CONFIG_KV_TTL seconds (KV cache). Falls back to compiled-in defaults if the
+// file is absent or unreadable.
+const CONFIG_KV_KEY = 'storegit:config:v1';
+const CONFIG_KV_TTL = 300; // 5 min
+
+async function loadConfig(env) {
+  const kv = env.RATE_LIMIT_KV;
+  if (kv) {
+    const cached = await kv.get(CONFIG_KV_KEY, 'json').catch(() => null);
+    if (cached && typeof cached === 'object') return cached;
+  }
+  try {
+    const res = await fetch(
+      `${regBase(env)}/contents/config/config.json?ref=${REGISTRY_BRANCH}`,
+      { headers: regH(env) }
+    );
+    if (res.ok) {
+      const d   = await res.json();
+      const cfg = JSON.parse(DEC.decode(b64urlDec(d.content.replace(/\s/g, ''))));
+      if (kv) await kv.put(CONFIG_KV_KEY, JSON.stringify(cfg), { expirationTtl: CONFIG_KV_TTL }).catch(() => {});
+      return cfg;
+    }
+  } catch {}
+  return {};
+}
+// Read a numeric config value, falling back to `fallback` if absent/invalid.
+function cn(cfg, key, fallback) {
+  const v = cfg[key];
+  return (typeof v === 'number' && isFinite(v) && v > 0) ? v : fallback;
+}
+// Build a session object pointed at a specific repo index (no session mutation).
+function getRepoSess(fullSess, repoIdx) {
+  const repos = fullSess.repos || [];
+  const idx   = (Number.isInteger(repoIdx) && repoIdx >= 0 && repoIdx < repos.length) ? repoIdx : 0;
+  const repo  = repos[idx] || repos[0] || {};
+  return {
+    ...fullSess,
+    ghOwner:  repo.ghOwner  || fullSess.ghOwner,
+    ghRepo:   repo.ghRepo   || fullSess.ghRepo,
+    ghBranch: repo.ghBranch || fullSess.ghBranch || 'main',
+    folder:   repo.folder   || fullSess.folder   || 'uploads',
+    activeRepoIdx: idx,
+  };
+}
 async function readReg(path, env) {
   const res = await fetch(`${regBase(env)}/contents/${path}?ref=${REGISTRY_BRANCH}`, { headers: regH(env) });
   if (res.status === 404) return null;
@@ -566,6 +613,7 @@ function isDistributed(totalSize, repos) {
 function chunkRepoIdx(chunkIndex, repos) {
   return chunkIndex % repos.length;
 }
+async function writeIndex(sess, data, existingSha) {
   const { ghToken, ghOwner, ghRepo, ghBranch, folder } = sess;
   const url = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/contents/${encodeURIComponent(indexP(folder))}`;
   const res = await fetch(url, {
@@ -823,6 +871,7 @@ async function _handleRequest({ request, env, params }) {
   }
   const secret = env.TOKEN_SECRET;
   if (!secret) return fail(request, 500);
+  const cfg = await loadConfig(env).catch(() => ({}));
   if (route === 'status' && method === 'GET') {
     const ready = !!(env.REGISTRY_GITHUB_TOKEN && env.REGISTRY_GITHUB_OWNER && env.REGISTRY_GITHUB_REPO);
     return jsonRes(request, {
@@ -1068,7 +1117,7 @@ async function _handleRequest({ request, env, params }) {
     // API keys can access storage routes only (not account management)
     const AK_ALLOWED = new Set(['files','upload','upload-chunk','finalize-upload','download','delete','share-link','me','repos','storage']);
     if (!AK_ALLOWED.has(route)) return fail(request, 403);
-    return _dispatchRoute(route, method, request, env, akResult.fullSess, null, secret, akResult.allowedOrigins);
+    return _dispatchRoute(route, method, request, env, akResult.fullSess, null, secret, akResult.allowedOrigins, cfg);
   }
 
   // ── Session cookie auth ───────────────────────────────────────────────────
@@ -1087,7 +1136,7 @@ async function _handleRequest({ request, env, params }) {
     const newTok = await createToken({ username: sess.username, display: sess.display, repoIdx: sess.repoIdx ?? 0 }, secret);
     refreshCookie = buildSetCookie(request, newTok, SESSION_TTL / 1000);
   }
-  const response = await _dispatchRoute(route, method, request, env, fullSess, sess, secret, null);
+  const response = await _dispatchRoute(route, method, request, env, fullSess, sess, secret, null, cfg);
   if (refreshCookie) {
     const headers = new Headers(response.headers);
     headers.append('Set-Cookie', refreshCookie);
@@ -1095,8 +1144,17 @@ async function _handleRequest({ request, env, params }) {
   }
   return response;
 }
-async function _dispatchRoute(route, method, request, env, fullSess, sess, secret, apiKeyOrigins = null) {
+async function _dispatchRoute(route, method, request, env, fullSess, sess, secret, apiKeyOrigins = null, cfg = {}) {
   const cors = corsHeaders(request, apiKeyOrigins);
+  // Config-derived limits (fall back to compiled-in defaults)
+  const C_SESSION_TTL        = cn(cfg, 'session_ttl_ms',            SESSION_TTL);
+  const C_SHARE_TTL_MAX      = cn(cfg, 'share_ttl_max_seconds',      SHARE_TTL_MAX);
+  const C_CHUNK_B64_MAX      = cn(cfg, 'chunk_b64_max',              CHUNK_B64_MAX);
+  const C_SMALL_MAX_BYTES    = cn(cfg, 'small_max_bytes',            SMALL_MAX_BYTES);
+  const C_DIST_THRESHOLD     = cn(cfg, 'dist_threshold_bytes',       DIST_THRESHOLD);
+  const C_MAX_TOTAL_CHUNKS   = cn(cfg, 'max_total_chunks',           MAX_TOTAL_CHUNKS);
+  const C_MAX_REPOS          = cn(cfg, 'max_repos_per_user',         20);
+  const C_MAX_APIKEYS        = cn(cfg, 'max_apikeys_per_user',       10);
   function jRes(data, status=200, extra={}) {
     return new Response(JSON.stringify(data), { status, headers: { ...SEC, ...cors, 'Content-Type':'application/json', ...extra } });
   }
@@ -1106,9 +1164,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const storage = await getStorageFromIndex(fullSess);
     return jRes({
       username: fullSess.username, display: fullSess.display,
-      repo: `${fullSess.ghOwner}/${fullSess.ghRepo}`,
-      repoLabel: fullSess.repoLabel, folder: fullSess.folder,
-      repos: fullSess.repos, activeRepoIdx: fullSess.activeRepoIdx,
+      repos: fullSess.repos,
       storage,
     });
   }
@@ -1152,12 +1208,9 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     });
   }
   if (route === 'switch-repo' && method === 'POST') {
-    if (!sess) return jRes({ error: 'Session required' }, 403);
-    let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
-    const { repoIdx } = body||{};
-    if (typeof repoIdx !== 'number' || repoIdx < 0 || repoIdx >= fullSess.repos.length) return jRes({ error: ERRS[400] }, 400);
-    const newToken = await createToken({ username: sess.username, display: sess.display, repoIdx }, secret);
-    return jRes({ ok:true, repoIdx }, 200, { 'Set-Cookie': buildSetCookie(request, newToken, SESSION_TTL / 1000) });
+    // Active-repo concept removed. All repos are a shared pool — no switching needed.
+    // Clients should pass repoIdx directly in upload/download/delete requests.
+    return jRes({ ok: true, deprecated: 'switch-repo is no longer needed. Pass repoIdx per-request instead.' });
   }
   if (route === 'add-repo' && method === 'POST') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
@@ -1180,6 +1233,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     if (!rec) return jRes({ error: ERRS[404] }, 404);
     const { content: user, sha: userSha } = rec;
     const repos = getUserRepos(user);
+    if (repos.length >= C_MAX_REPOS) return jRes({ error: `Maximum of ${C_MAX_REPOS} repositories allowed` }, 400);
     repos.push({ label: String(label).slice(0,40), ghOwner, ghRepo, ghBranch, folder });
     const updated = { ...user, repos };
     try { await writeReg(userPath(sess.username), updated, `Add repo ${ghOwner}/${ghRepo}`, env, userSha); }
@@ -1199,21 +1253,11 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     if (repos.length <= 1) return jRes({ error: 'Cannot remove your only repository' }, 400);
     if (repoIdx >= repos.length) return jRes({ error: ERRS[400] }, 400);
     repos.splice(repoIdx, 1);
-    // Adjust activeRepoIdx in the new token:
-    // • Removed the active repo  → fall back to 0
-    // • Removed a repo before the active one → shift down by 1
-    // • Removed a repo after the active one  → unchanged
-    const currentActive = sess.repoIdx ?? 0;
-    let newActive = currentActive;
-    if (repoIdx === currentActive)  newActive = 0;
-    else if (repoIdx < currentActive) newActive = currentActive - 1;
     const updated = { ...user, repos };
     try { await writeReg(userPath(sess.username), updated, `Remove repo ${repoIdx}`, env, userSha); }
     catch { return jRes({ error: ERRS[502] }, 502); }
     if (kv) await env.RATE_LIMIT_KV.delete(`sess_cache:${sess.jti}`).catch(() => {});
-    // Issue a refreshed token so the client's session reflects the corrected index immediately
-    const newToken = await createToken({ username: sess.username, display: sess.display, repoIdx: newActive }, secret);
-    return jRes({ ok: true, token: newToken, activeRepoIdx: newActive });
+    return jRes({ ok: true, repos: repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo })) });
   }
 
   // ── API Key management (session only) ─────────────────────────────────────
@@ -1243,7 +1287,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     if (!rec) return jRes({ error: ERRS[404] }, 404);
     const { content: user, sha: userSha } = rec;
     const existingKeys = user.apiKeys || [];
-    if (existingKeys.length >= 10) return jRes({ error: 'Maximum of 10 API keys allowed' }, 400);
+    if (existingKeys.length >= C_MAX_APIKEYS) return jRes({ error: `Maximum of ${C_MAX_APIKEYS} API keys allowed` }, 400);
     const rawKey = generateRawApiKey();
     const keyId  = base64urlFromBytes(crypto.getRandomValues(new Uint8Array(9))); // 9 bytes → 12 B64URL chars, URL-safe unique ID
     const preview = rawKey.slice(0, 12) + '…';
@@ -1296,28 +1340,27 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const sp    = new URL(request.url).searchParams;
     const nameP = sp.get('name') || '';
     const ttlP  = parseInt(sp.get('ttl') || '3600', 10);
+    const rIdx  = parseInt(sp.get('repoIdx') || '0', 10);
     const never = ttlP === 0;
     const safe  = sanitize(nameP);
     if (!safe) return fail(request, 400);
-    const ttl = never ? 0 : Math.max(60, Math.min(ttlP, SHARE_TTL_MAX));
+    const ttl = never ? 0 : Math.max(60, Math.min(ttlP, C_SHARE_TTL_MAX));
+    const targetSess = getRepoSess(fullSess, rIdx);
     let size = 0, displayName = unwrapName(safe);
     try {
-      const { data: idx } = await readIndex(fullSess);
+      const { data: idx } = await readIndex(targetSess);
       if (idx[safe]) { displayName = idx[safe].originalName || unwrapName(safe); size = idx[safe].totalSize || idx[safe].size || 0; }
     } catch {}
     const exp = never ? null : new Date(Date.now() + ttl * 1000).toISOString();
     const tok = await createShareToken(
       sess ? sess.username : fullSess.username,
-      safe, fullSess.activeRepoIdx, ttl, size, displayName, secret
+      safe, rIdx, ttl, size, displayName, secret
     );
     const kv2 = env.RATE_LIMIT_KV || null;
     let url = `/api/dl?tok=${encodeURIComponent(tok)}`;
     if (kv2) {
-      // Use bias-free randomAlphabetString with the shared B64URL_CHARS (64-char alphabet;
-      // 256 % 64 === 0 so there is zero modulo bias, but randomAlphabetString is
-      // still used here for consistency and future-proofing if the alphabet changes.)
       let shortId = null;
-      outer: for (let len = 4; len <= 6; len++) {   // start at 4: 64^4 = 16M slots
+      outer: for (let len = 4; len <= 6; len++) {
         for (let attempt = 0; attempt < 6; attempt++) {
           const id = randomAlphabetString(B64URL_CHARS, len);
           const existing = await kv2.get('sl:' + id).catch(() => null);
@@ -1333,24 +1376,16 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     return jRes({ url, exp });
   }
   if (route === 'files' && method === 'GET') {
-    // Optional ?repoIdx= param lets callers fetch a specific repo without switching session
+    // ?repoIdx= fetches a specific repo without session mutation
     const qRepoIdx = parseInt(new URL(request.url).searchParams.get('repoIdx') ?? '', 10);
-    if (!isNaN(qRepoIdx) && qRepoIdx >= 0 && qRepoIdx < fullSess.repos.length && qRepoIdx !== fullSess.activeRepoIdx) {
-      // Build a one-off session for this repo index without mutating the session
-      const targetRepo = fullSess.repos[qRepoIdx];
-      fullSess = {
-        ...fullSess,
-        ghOwner: targetRepo.ghOwner, ghRepo: targetRepo.ghRepo,
-        ghBranch: targetRepo.ghBranch || 'main',
-        folder: targetRepo.folder || 'uploads',
-        repoLabel: (targetRepo.label && targetRepo.label !== 'Default') ? targetRepo.label : '',
-        activeRepoIdx: qRepoIdx,
-      };
+    let targetSess = fullSess;
+    if (!isNaN(qRepoIdx) && qRepoIdx >= 0 && qRepoIdx < fullSess.repos.length) {
+      targetSess = getRepoSess(fullSess, qRepoIdx);
     }
     try {
       const [regular, { data: idx }] = await Promise.all([
-        listFiles(fullSess),
-        readIndex(fullSess).catch(() => ({ data: {} })),
+        listFiles(targetSess),
+        readIndex(targetSess).catch(() => ({ data: {} })),
       ]);
       const chunked = Object.entries(idx)
         .filter(([, info]) => info.totalChunks)
@@ -1371,17 +1406,19 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
   if (route === 'upload' && method === 'POST') {
     if (!(request.headers.get('Content-Type')||'').includes('application/json')) return jRes({ error: ERRS[400] },400);
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] },400); }
-    const { name: rawName, content: b64 } = body||{};
+    const { name: rawName, content: b64, targetRepoIdx } = body||{};
     if (!rawName || !b64 || typeof b64 !== 'string') return jRes({ error: ERRS[400] },400);
-    if (b64.length > CHUNK_B64_MAX) return jRes({ error: ERRS[413] },413);
+    if (b64.length > C_CHUNK_B64_MAX) return jRes({ error: ERRS[413] },413);
     const safe = sanitize(String(rawName));
     if (!safe) return jRes({ error: ERRS[415] },415);
     if (!checkMagicBase64(b64)) return jRes({ error: ERRS[415] },415);
     const decodedSize = Math.floor(b64.length * 3 / 4);
+    // Route to specified repo (or repo 0 if not specified)
+    const uploadSess = getRepoSess(fullSess, typeof targetRepoIdx === 'number' ? targetRepoIdx : 0);
     try {
-      if (decodedSize > SMALL_MAX_BYTES) {
-        const blobSha = await createBlob(fullSess, b64);
-        const { ghToken, ghOwner, ghRepo, ghBranch, folder } = fullSess;
+      if (decodedSize > C_SMALL_MAX_BYTES) {
+        const blobSha = await createBlob(uploadSess, b64);
+        const { ghToken, ghOwner, ghRepo, ghBranch, folder } = uploadSess;
         const gh   = ghH(ghToken);
         const base = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}`;
         const refRes = await fetch(`${base}/git/ref/heads/${encodeURIComponent(ghBranch)}`, { headers:gh });
@@ -1395,12 +1432,12 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
         const { sha:newCommit } = await newCommitRes.json();
         await fetch(`${base}/git/refs/heads/${ghBranch}`, { method:'PATCH', headers:gh, body: JSON.stringify({ sha:newCommit, force:false }) });
       } else {
-        await uploadSmall(fullSess, safe, b64);
+        await uploadSmall(uploadSess, safe, b64);
       }
       try {
-        const { data: idx, sha: idxSha } = await readIndex(fullSess);
+        const { data: idx, sha: idxSha } = await readIndex(uploadSess);
         idx[safe] = { originalName: getOriginalName(rawName, safe), uploadedAt: new Date().toISOString(), size: decodedSize };
-        await writeIndex(fullSess, idx, idxSha);
+        await writeIndex(uploadSess, idx, idxSha);
       } catch {}
       return jRes({ ok:true, name:safe, size:decodedSize });
     } catch { return jRes({ error: ERRS[502] }, 502); }
@@ -1408,53 +1445,56 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
   if (route === 'upload-chunk' && method === 'POST') {
     if (!(request.headers.get('Content-Type')||'').includes('application/json')) return jRes({ error: ERRS[400] },400);
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] },400); }
-    const { name: rawName, chunkIndex, totalChunks, totalSize, content: b64 } = body||{};
+    const { name: rawName, chunkIndex, totalChunks, totalSize, content: b64, targetRepoIdx } = body||{};
     if (!rawName || !b64 || typeof b64 !== 'string') return jRes({ error: ERRS[400] },400);
-    if (b64.length > CHUNK_B64_MAX) return jRes({ error: ERRS[413] },413);
+    if (b64.length > C_CHUNK_B64_MAX) return jRes({ error: ERRS[413] },413);
     const chunkIdx = parseInt(chunkIndex, 10);
     const tot = parseInt(totalChunks, 10);
     if (isNaN(chunkIdx)||chunkIdx<0) return jRes({ error: ERRS[400] },400);
-    if (isNaN(tot)||tot<1||tot>MAX_TOTAL_CHUNKS) return jRes({ error: ERRS[400] },400);
+    if (isNaN(tot)||tot<1||tot>C_MAX_TOTAL_CHUNKS) return jRes({ error: ERRS[400] },400);
     const safe = sanitize(String(rawName));
     if (!safe) return jRes({ error: ERRS[415] },415);
     if (chunkIdx === 0 && !checkMagicBase64(b64)) return jRes({ error: ERRS[415] },415);
     const decodedSize = Math.floor(b64.length * 3 / 4);
-    // Route chunk to its target repo. For distributed files (>500 MB with multiple
-    // repos) we spread round-robin. Single-repo or small files always use active repo.
+    // Route chunk to its target repo.
+    // Client specifies targetRepoIdx for smart routing; server validates.
+    // For distributed files (>threshold with multiple repos) we spread round-robin.
     const dist = isDistributed(totalSize, fullSess.repos);
-    const targetRepoIdx = dist ? chunkRepoIdx(chunkIdx, fullSess.repos) : (fullSess.activeRepoIdx ?? 0);
-    const targetSess = dist ? repoSessFor(fullSess, targetRepoIdx) : fullSess;
+    const resolvedRepoIdx = dist
+      ? chunkRepoIdx(chunkIdx, fullSess.repos)
+      : (Number.isInteger(targetRepoIdx) && targetRepoIdx >= 0 && targetRepoIdx < fullSess.repos.length ? targetRepoIdx : 0);
+    const targetSess = getRepoSess(fullSess, resolvedRepoIdx);
     const jti = sess ? sess.jti : `ak:${fullSess.username}`;
     try {
       const blobSha   = await createBlob(targetSess, b64);
       const blobToken = await blobTokenSign(jti, safe, chunkIdx, blobSha, secret);
-      return jRes({ ok: true, blobSha, blobToken, index: chunkIdx, size: decodedSize, repoIdx: targetRepoIdx, distributed: dist });
+      return jRes({ ok: true, blobSha, blobToken, index: chunkIdx, size: decodedSize, repoIdx: resolvedRepoIdx, distributed: dist });
     } catch { return jRes({ error: ERRS[502] }, 502); }
   }
   if (route === 'finalize-upload' && method === 'POST') {
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] },400); }
-    const { name, totalSize, totalChunks, chunkSize, blobs } = body||{};
+    const { name, totalSize, totalChunks, chunkSize, blobs, targetRepoIdx } = body||{};
     if (!name||!totalSize||!totalChunks||!Array.isArray(blobs)) return jRes({ error: ERRS[400] },400);
     if (blobs.length !== totalChunks) return jRes({ error: ERRS[400] },400);
-    if (totalChunks > MAX_TOTAL_CHUNKS) return jRes({ error: ERRS[413] },413);
-    const MAX_FILE_BYTES = MAX_TOTAL_CHUNKS * CHUNK_B64_MAX;
+    if (totalChunks > C_MAX_TOTAL_CHUNKS) return jRes({ error: ERRS[413] },413);
+    const MAX_FILE_BYTES = C_MAX_TOTAL_CHUNKS * C_CHUNK_B64_MAX;
     if (!Number.isInteger(totalSize) || totalSize < 1 || totalSize > MAX_FILE_BYTES) return jRes({ error: ERRS[400] }, 400);
-    if (chunkSize !== undefined && (!Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > CHUNK_B64_MAX)) return jRes({ error: ERRS[400] }, 400);
+    if (chunkSize !== undefined && (!Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > C_CHUNK_B64_MAX)) return jRes({ error: ERRS[400] }, 400);
     const safe = sanitize(String(name));
     if (!safe) return jRes({ error: ERRS[415] }, 415);
     const dist = isDistributed(totalSize, fullSess.repos);
+    // Use specified repo for non-distributed uploads
+    const finalSess = dist ? fullSess : getRepoSess(fullSess, Number.isInteger(targetRepoIdx) ? targetRepoIdx : 0);
     const jti = sess ? sess.jti : `ak:${fullSess.username}`;
     for (const b of blobs) {
       if (typeof b.blobSha   !== 'string' || !SHA_RE.test(b.blobSha)) return jRes({ error: ERRS[400] },400);
       if (typeof b.blobToken !== 'string')                             return jRes({ error: ERRS[400] },400);
       if (typeof b.index     !== 'number' || b.index < 0)             return jRes({ error: ERRS[400] },400);
       if (typeof b.size      !== 'number' || b.size  < 1)             return jRes({ error: ERRS[400] },400);
-      // For distributed uploads verify that the client routed each chunk to the
-      // repo the server would have chosen deterministically. Reject mismatches.
       if (dist) {
         const expected = chunkRepoIdx(b.index, fullSess.repos);
         if ((b.repoIdx ?? expected) !== expected) return jRes({ error: 'chunk_repo_mismatch' }, 400);
-        b.repoIdx = expected; // normalise so finalize has clean data
+        b.repoIdx = expected;
       }
       const expected = await blobTokenSign(jti, safe, b.index, b.blobSha, secret);
       if (!(await timingSafeEq(b.blobToken, expected))) return jRes({ error: ERRS[403] }, 403);
@@ -1463,22 +1503,25 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       if (dist) {
         await finalizeDistributedUpload(fullSess, safe, blobs, totalSize, chunkSize);
       } else {
-        await finalizeChunkedUpload(fullSess, safe, blobs, totalSize, chunkSize);
+        await finalizeChunkedUpload(finalSess, safe, blobs, totalSize, chunkSize);
       }
-      const { data: idx, sha: idxSha } = await readIndex(fullSess);
+      const { data: idx, sha: idxSha } = await readIndex(finalSess);
       idx[safe] = { originalName: getOriginalName(name, safe), totalSize, totalChunks, uploadedAt: new Date().toISOString(), ...(dist && { distributed: true, repoCount: fullSess.repos.length }) };
-      await writeIndex(fullSess, idx, idxSha);
+      await writeIndex(finalSess, idx, idxSha);
       return jRes({ ok: true, name: safe, distributed: dist, ...(dist && { repoCount: fullSess.repos.length }) });
     } catch { return jRes({ error: ERRS[502] }, 502); }
   }
   if (route === 'download' && method === 'GET') {
-    const nameParam = new URL(request.url).searchParams.get('name') || '';
+    const sp = new URL(request.url).searchParams;
+    const nameParam = sp.get('name') || '';
+    const rIdx = parseInt(sp.get('repoIdx') || '0', 10);
     const safe = sanitize(nameParam);
     if (!safe) return jRes({ error: ERRS[400] },400);
-    const { ghToken, ghOwner, ghRepo, ghBranch, folder } = fullSess;
+    const dlSess = getRepoSess(fullSess, rIdx);
+    const { ghToken, ghOwner, ghRepo, ghBranch, folder } = dlSess;
     let manifest = null, serveAs = safe;
     try {
-      const { data: idx } = await readIndex(fullSess);
+      const { data: idx } = await readIndex(dlSess);
       if (idx[safe]) serveAs = idx[safe].originalName || unwrapName(safe);
       else serveAs = unwrapName(safe);
       if (idx[safe]?.totalChunks) {
@@ -1521,30 +1564,31 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
   }
   if (route === 'delete' && method === 'DELETE') {
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] },400); }
-    const { name, sha, chunked } = body||{};
+    const { name, sha, chunked, repoIdx: delRepoIdx } = body||{};
     if (typeof name !== 'string') return jRes({ error: ERRS[400] },400);
     const safe = sanitize(name);
     if (!safe) return jRes({ error: ERRS[400] },400);
+    const delSess = getRepoSess(fullSess, Number.isInteger(delRepoIdx) ? delRepoIdx : 0);
     if (chunked) {
       try {
-        const { data: idx, sha: idxSha } = await readIndex(fullSess);
+        const { data: idx, sha: idxSha } = await readIndex(delSess);
         const isDistFile = idx[safe]?.distributed;
         if (isDistFile) {
-          await deleteDistributed(fullSess, safe);
+          await deleteDistributed(delSess, safe);
         } else {
-          await deleteChunked(fullSess, safe);
+          await deleteChunked(delSess, safe);
         }
         delete idx[safe];
-        await writeIndex(fullSess, idx, idxSha);
+        await writeIndex(delSess, idx, idxSha);
         return jRes({ ok:true });
       } catch { return jRes({ error: ERRS[502] },502); }
     } else {
       if (typeof sha !== 'string' || !SHA_RE.test(sha)) return jRes({ error: ERRS[400] },400);
       try {
-        await deleteRegular(fullSess, safe, sha);
+        await deleteRegular(delSess, safe, sha);
         try {
-          const { data: idx, sha: idxSha } = await readIndex(fullSess);
-          if (idx[safe]) { delete idx[safe]; await writeIndex(fullSess, idx, idxSha); }
+          const { data: idx, sha: idxSha } = await readIndex(delSess);
+          if (idx[safe]) { delete idx[safe]; await writeIndex(delSess, idx, idxSha); }
         } catch {}
         return jRes({ ok:true });
       } catch { return jRes({ error: ERRS[502] },502); }
