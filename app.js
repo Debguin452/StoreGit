@@ -10,9 +10,13 @@ let _uploadPaused    = false;
 let _uploadAbortFn   = null;
 let _shareFile       = null;
 let _allRepos        = [];
-let _activeRepoIdx   = 0;
 let _repoFiles       = [];   // [{repo, repoIdx, files}] for all repos
 let _currentFileRepoIdx = 0; // repo index of currently open file
+// Text-editable types: any text-readable format
+const FD_EDITABLE = new Set(['txt','md','markdown','json','js','mjs','cjs','ts','tsx','jsx',
+  'c','cpp','h','hpp','cs','java','go','rs','py','rb','php','sh','bash','zsh','lua','r','swift','kt',
+  'css','html','htm','xml','yaml','yml','toml','ini','cfg','conf','log','csv','sql','diff','patch',
+  'nfo','env','gitignore','dockerignore','makefile','dockerfile']);
 const _sliceCache = new WeakMap();
 function precacheSlices(file) {
   if (file.size <= CHUNK_THRESHOLD) return;
@@ -170,9 +174,8 @@ async function bootApp(me) {
   await loadMeta();
   loadFiles();
 }
-function updateRepoChip(repos, activeIdx) {
+function updateRepoChip(repos) {
   _allRepos = repos || [];
-  _activeRepoIdx = activeIdx || 0;
   renderDrawerRepoList();
 }
 
@@ -393,20 +396,11 @@ async function submitApiKey() {
   } catch { errEl.textContent = 'Connection error. Please try again.'; }
   btn.disabled = false; btn.textContent = 'Generate Key';
 }
-async function ensureRepoActive(repoIdx) {
-  if (repoIdx === undefined || repoIdx === _activeRepoIdx || _allRepos.length <= 1) return;
-  try {
-    const r = await fetch('/api/switch-repo', {
-      method: 'POST', credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ repoIdx })
-    });
-    if (r.ok) _activeRepoIdx = repoIdx;
-  } catch { /* best effort */ }
-}
-async function getSmartRepoIdx() {
-  if (_allRepos.length <= 1 || _repoFiles.length === 0) return _activeRepoIdx;
-  let minSize = Infinity, minIdx = _activeRepoIdx;
+// Returns the index of the repo with the least total used space.
+// Pure — no session switching, no API calls. Reads from cached _repoFiles.
+function getSmartRepoIdx() {
+  if (_allRepos.length <= 1 || _repoFiles.length === 0) return 0;
+  let minSize = Infinity, minIdx = 0;
   for (const group of _repoFiles) {
     const total = (group.files || [])
       .filter(f => f.name !== '.storegit')
@@ -478,8 +472,7 @@ async function loadMeta() {
     const r = await fetch('/api/me', { credentials:'same-origin' });
     if (r.ok) {
       const d = await r.json();
-
-      updateRepoChip(d.repos || [], d.activeRepoIdx ?? 0);
+      updateRepoChip(d.repos || []);
     }
   } catch {}
 }
@@ -745,20 +738,8 @@ function togglePause() {
 async function startUpload() {
   if (_uploadActive) return;
   if (!uploadPending.length) return;
-  // Smart routing: auto-select the repo with the least total file size
-  if (_allRepos.length > 1) {
-    const smartIdx = await getSmartRepoIdx();
-    if (smartIdx !== _activeRepoIdx) {
-      try {
-        const r = await fetch('/api/switch-repo', {
-          method: 'POST', credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ repoIdx: smartIdx })
-        });
-        if (r.ok) _activeRepoIdx = smartIdx;
-      } catch { /* continue with current */ }
-    }
-  }
+  // Pick least-loaded repo — pure function, no switch-repo API call needed
+  const targetRepoIdx = getSmartRepoIdx();
   _uploadActive = true;
   _uploadPaused = false;
   renderQueue();
@@ -769,9 +750,9 @@ async function startUpload() {
     setQ(i, 'go', 0);
     try {
       if (it.file.size > CHUNK_THRESHOLD) {
-        await chunkedUpload(it.file, i);
+        await chunkedUpload(it.file, i, targetRepoIdx);
       } else {
-        await xhrUpload(it.file, i);
+        await xhrUpload(it.file, i, targetRepoIdx);
       }
       if (it.status !== 'paused') setQ(i, 'ok', 100);
     } catch(e) {
