@@ -52,14 +52,14 @@ File content never touches Cloudflare KV. KV stores only:
 ## Features
 
 - **Upload / download / delete** — GitHub Contents API for files up to ~50 MB; Git Data API (chunked) for files up to ~5 GB
-- **Multiple repositories** per account — connect as many GitHub repos as you like; all files appear in a single unified list
-- **Shareable links** — signed tokens with configurable expiry (1 hr / 24 hr / 7 days / never), shortened to 3–5 character IDs stored in KV
-- **Inline previews** on share pages — images, video, audio, and code/text files all render before the download button
-- **API keys** — generate in-app, optionally restrict to specific origins, revoke instantly; keys are SHA-256 hashed in KV (raw key never stored)
-- **Hamburger drawer** — repository management and API key management in a slide-in panel; main canvas stays clean
-- **Security middleware** — CSP, HSTS, CORS, bot-blocking, and rate-limiting on every edge request, before any route handler runs
-- **Dark mode** — follows `prefers-color-scheme` with no JavaScript
-- **Resilient upload queue** — survives page refresh; pauses and resumes mid-batch
+- **Multiple repositories** per account — all repos loaded in parallel; files unified into one list with per-repo section headers
+- **Chunked upload** — files above the single-call limit are split into ~14 MB base64 blobs, each committed as a separate blob ref, reassembled on download with SHA verification
+- **Shareable links** — HMAC-SHA-256 signed tokens with configurable expiry (1 hr / 24 hr / 7 days / `ttl=0` = never); shortened to 3–5 char IDs via KV
+- **Share-page previews** — images rendered via `<img>`, video/audio via `<video>`/`<audio>`, text/code fetched and displayed in a `<pre>` block (first 10 KB)
+- **API key system** — 256-bit CSPRNG keys (`sgk_<43 Base64URL chars>`), SHA-256 hashed before KV storage, raw key never persisted, per-origin CORS restriction, 120 req/min rate limit per key
+- **Security middleware** — CSP, HSTS, CORS, bot-blocking, path-traversal rejection, and per-IP rate limiting enforced on every request before any route handler runs
+- **Session JWTs** — HMAC-SHA-256, 192-bit JTI, `HttpOnly; Secure; SameSite=Strict` cookie, auto-refresh within 1 hr of expiry, KV-backed revocation
+- **Upload queue** — concurrent multi-file upload with per-file retry, pause/resume, survives page refresh
 
 ---
 
@@ -727,18 +727,16 @@ Building something with StoreGit? Open a PR to add it to this list.
 
 ### v2.0.0
 
-- **Hamburger drawer** — repository management and API key management moved to a slide-in panel; main canvas stays focused on files
-- **All repos visible in files list** — files from all connected repositories are shown together in one unified list with a per-repo section header
-- **All repos removable** — any repository can be removed (previously only secondary repos); the only guard is you must keep at least one
-- **API key system** — generate, label, restrict to origins, and revoke keys in-app; 256-bit Base64URL format (`sgk_<43 chars>`), bias-free CSPRNG, SHA-256 hashed in KV (raw key never stored)
-- **Global security middleware** — `functions/_middleware.js` enforces security headers, HTTPS redirect, bot-blocking, rate limiting, and path-traversal protection before any route handler runs
-- **Short share links** — IDs are 3–5 chars from a 64-char alphabet using rejection sampling (no modulo bias); variable length tries shorter IDs first, falls back if collision found
-- **Never-expire share links** — pass `ttl=0`; KV entry persists indefinitely, token payload carries `exp: 0`
-- **Inline share-page previews** — images, video, audio, and code/text files render inline above the download button; code preview fetches up to 10 KB
-- **Session JTI upgrade** — 24-byte Base64URL (192 bits) instead of 16-byte hex (128 bits)
-- **`GET /api/files?repoIdx=n`** — fetch any repo's files without mutating session state; client loads all repos in parallel after login
-- **Forms closed on load** — boot sequence explicitly closes all drawer forms; no flash of open state on hard refresh
-- **"Default" label removed** — repos with no custom label display `owner/repo` directly throughout the UI
+- **API key system** — `sgk_<43 Base64URL chars>` (256-bit CSPRNG, bias-free rejection sampling); SHA-256 hashed in KV under `apikey:sha256:<hex>`; raw key encrypted with AES-GCM in user record for revocation; per-origin CORS restriction; 120 req/min per-key rate limit; max 10 keys per account
+- **Global security middleware** (`functions/_middleware.js`) — enforces security headers, HTTPS redirect, bad user-agent blocking, 600 req/min per-IP rate limit, method allowlist, path-traversal rejection, scanner probe blocking on every request before any route handler
+- **Session JTI upgrade** — 24-byte Base64URL (192 bits of entropy) replacing 16-byte hex (128 bits)
+- **`GET /api/files?repoIdx=n`** — fetch any repo's files without mutating session state; enables parallel loading of all repos in a single round-trip batch
+- **`POST /api/remove-repo`** — remove any connected repository; guard is `repos.length > 1` only (no primary-repo restriction)
+- **Short share links** — 3–5 char IDs from a 64-char alphabet using rejection sampling (no modulo bias); stored as `sl:<id>` in KV with `{ tok, displayName, size, exp }`
+- **Never-expire share links** — `ttl=0` stores KV entry without `expirationTtl`; token payload carries `exp: 0`; server skips expiry check when `exp === 0`
+- **Share-page previews** — `<img>`, `<video>`, `<audio>` elements; text/code fetched via `fetch()` with 10 KB truncation, rendered in `<pre>`; all served with strict CSP
+- **API key reverse index** — `apikeyid:<username>:<keyId>` → raw KV key stored on create; O(1) lookup on revoke (no KV list scan)
+- **Unicode-safe registry writes** — `btoa()` replaced with `b64urlEnc(ENC.encode())` in `writeReg`, `readReg`, and `readIndex`; eliminates 502 errors when AES-GCM ciphertext contains non-Latin-1 bytes
 
 ### v1.x
 
