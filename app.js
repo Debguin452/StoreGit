@@ -396,6 +396,9 @@ async function submitApiKey() {
   } catch { errEl.textContent = 'Connection error. Please try again.'; }
   btn.disabled = false; btn.textContent = 'Generate Key';
 }
+// No-op: active-repo switching was removed. repoIdx is now passed per-request.
+async function ensureRepoActive(repoIdx) { return repoIdx; }
+
 // Returns the index of the repo with the least total used space.
 // Pure — no session switching, no API calls. Reads from cached _repoFiles.
 function getSmartRepoIdx() {
@@ -593,11 +596,11 @@ function renderFiles(files) {
     el.appendChild(row);
   }
 }
-async function deleteFile(name, sha, chunked, displayName) {
+async function deleteFile(name, sha, chunked, displayName, repoIdx = 0) {
   const label = displayName || name;
   showModal('Delete file', `“${label}” will be permanently deleted and cannot be recovered.`, 'Delete', 'btn-danger', async () => {
     try {
-      const body = chunked ? { name, chunked: true } : { name, sha };
+      const body = chunked ? { name, chunked: true, repoIdx } : { name, sha, repoIdx };
       const r = await fetch('/api/delete', {
         method: 'DELETE', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
@@ -608,11 +611,11 @@ async function deleteFile(name, sha, chunked, displayName) {
     } catch { toast('Delete failed.', 'error'); }
   });
 }
-async function downloadFile(name, size, originalName) {
+async function downloadFile(name, size, originalName, repoIdx = 0) {
   const saveAs = originalName || name;
   const bar=document.getElementById('dl-bar'), fill=document.getElementById('dl-fill'),
         lbl=document.getElementById('dl-label'), fnEl=document.getElementById('dl-filename');
-  const url=`/api/download?name=${encodeURIComponent(name)}`;
+  const url=`/api/download?name=${encodeURIComponent(name)}&repoIdx=${repoIdx}`;
   try {
     const r=await fetch(url,{credentials:'same-origin'});
     if(r.status===401){doLogout();return;}
@@ -780,7 +783,7 @@ function blobToBase64(blob) {
     r.readAsDataURL(blob);
   });
 }
-async function xhrUpload(file, idx) {
+async function xhrUpload(file, idx, targetRepoIdx = 0) {
   setQ(idx, 'go', 5);
   const b64 = await blobToBase64(file);
   if (_uploadPaused) { setQ(idx, 'paused', 30); throw new Error('__paused__'); }
@@ -804,11 +807,11 @@ async function xhrUpload(file, idx) {
     xhr.onerror   = () => { _uploadAbortFn = null; reject(new Error('Network error.')); };
     xhr.ontimeout = () => { _uploadAbortFn = null; reject(new Error('Upload timed out.')); };
     xhr.timeout   = 10 * 60 * 1000;
-    xhr.send(JSON.stringify({ name: file.name, content: b64 }));
+    xhr.send(JSON.stringify({ name: file.name, content: b64, targetRepoIdx }));
   });
 }
 const UPLOAD_CONCURRENCY = 5;
-async function chunkedUpload(file, idx) {
+async function chunkedUpload(file, idx, targetRepoIdx = 0) {
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
   setQ(idx, 'go', 2);
   const slices = _sliceCache.get(file) || Array.from({ length: totalChunks }, (_, i) => {
@@ -831,9 +834,9 @@ async function chunkedUpload(file, idx) {
       }
       const i = indexQueue.shift();
       const result = await xhrChunkWithRetry(
-        encoded[i], slices[i].size, file.name, i, totalChunks, idx
+        encoded[i], slices[i].size, file.name, i, totalChunks, file.size, targetRepoIdx, idx
       );
-      blobs[i] = { index: i, blobSha: result.blobSha, blobToken: result.blobToken, size: slices[i].size };
+      blobs[i] = { index: i, blobSha: result.blobSha, blobToken: result.blobToken, size: slices[i].size, repoIdx: result.repoIdx ?? targetRepoIdx };
       doneCount++;
       setQ(idx, 'go', 18 + Math.round((doneCount / totalChunks) * 74));
     }
@@ -847,7 +850,7 @@ async function chunkedUpload(file, idx) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       name: file.name, totalSize: file.size,
-      totalChunks, chunkSize: CHUNK_SIZE, blobs,
+      totalChunks, chunkSize: CHUNK_SIZE, blobs, targetRepoIdx,
     }),
   });
   if (fr.status === 401) { doLogout(); throw new Error('Session expired.'); }
@@ -860,14 +863,14 @@ async function chunkedUpload(file, idx) {
 const CHUNK_MAX_RETRIES = 2;
 const CHUNK_BACKOFF_MS  = 800;
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-async function xhrChunkWithRetry(b64, rawSize, name, chunkIndex, totalChunks, queueIdx) {
+async function xhrChunkWithRetry(b64, rawSize, name, chunkIndex, totalChunks, totalSize, targetRepoIdx, queueIdx) {
   let lastErr;
   for (let attempt = 0; attempt <= CHUNK_MAX_RETRIES; attempt++) {
     if (attempt > 0) {
       await sleep(CHUNK_BACKOFF_MS * Math.pow(2, attempt - 1));
     }
     try {
-      return await xhrChunkEncoded(b64, rawSize, name, chunkIndex, totalChunks, queueIdx);
+      return await xhrChunkEncoded(b64, rawSize, name, chunkIndex, totalChunks, totalSize, targetRepoIdx, queueIdx);
     } catch (err) {
       if (err.message === 'Session expired.') throw err;
       lastErr = err;
@@ -875,7 +878,7 @@ async function xhrChunkWithRetry(b64, rawSize, name, chunkIndex, totalChunks, qu
   }
   throw lastErr;
 }
-async function xhrChunkEncoded(b64, rawSize, name, chunkIndex, totalChunks, queueIdx) {
+async function xhrChunkEncoded(b64, rawSize, name, chunkIndex, totalChunks, totalSize, targetRepoIdx, queueIdx) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     _uploadAbortFn = () => { xhr.abort(); reject(new Error('__paused__')); };
@@ -893,7 +896,7 @@ async function xhrChunkEncoded(b64, rawSize, name, chunkIndex, totalChunks, queu
     };
     xhr.onerror   = () => { _uploadAbortFn = null; reject(new Error('Network error.')); };
     xhr.ontimeout = () => { _uploadAbortFn = null; reject(new Error('Upload segment timed out.')); };
-    xhr.send(JSON.stringify({ name, chunkIndex, totalChunks, content: b64 }));
+    xhr.send(JSON.stringify({ name, chunkIndex, totalChunks, totalSize, targetRepoIdx, content: b64 }));
   });
 }
 function setQ(i, status, pct) {
@@ -938,7 +941,7 @@ const FD_VIDEO = new Set(['mp4','webm','mov','m4v']);
 const FD_TEXT  = new Set(['txt','md','markdown','csv','json','log','ini','cfg','conf','yaml','yml','toml','nfo','diff','patch']);
 function openFileDetail(f) {
   _shareFile = f;
-  _currentFileRepoIdx = f._repoIdx !== undefined ? f._repoIdx : _activeRepoIdx;
+  _currentFileRepoIdx = f._repoIdx !== undefined ? f._repoIdx : 0;
   const displayName = f.originalName || f.name;
   const iconEl = document.getElementById('fd-icon');
   iconEl.textContent = fileExt(displayName);
@@ -948,12 +951,12 @@ function openFileDetail(f) {
   document.getElementById('fd-meta').textContent = fmtSize(f.size);
   document.getElementById('fd-dl-btn').onclick = async () => {
     await ensureRepoActive(_currentFileRepoIdx);
-    downloadFile(f.name, f.size, displayName);
+    downloadFile(f.name, f.size, displayName, _currentFileRepoIdx);
   };
   document.getElementById('fd-del-btn').onclick = async () => {
     await ensureRepoActive(_currentFileRepoIdx);
     closeFileDetail();
-    setTimeout(() => deleteFile(f.name, f.sha, f.chunked || false, displayName), 250);
+    setTimeout(() => deleteFile(f.name, f.sha, f.chunked || false, displayName, _currentFileRepoIdx), 250);
   };
   document.getElementById('fd-preview').innerHTML =
     '<div class="fd-preview-loading"><span class="spinner"></span> Loading preview…</div>';
@@ -983,7 +986,7 @@ async function loadFilePreview(f) {
     el.replaceChildren(wrap);
   }
   async function fetchAsDataURL() {
-    const r = await fetch(`/api/download?name=${encodeURIComponent(f.name)}`, {
+    const r = await fetch(`/api/download?name=${encodeURIComponent(f.name)}&repoIdx=${_currentFileRepoIdx}`, {
       credentials: 'same-origin'
     });
     if (!r.ok) throw new Error('fetch_failed');
@@ -1022,7 +1025,7 @@ async function loadFilePreview(f) {
   if (FD_TEXT.has(ext) || f.size <= 200 * 1024) {
     if (f.size > 500 * 1024) { noPreview('File too large to preview as text.<br>Download to open.'); return; }
     try {
-      const r = await fetch(`/api/download?name=${encodeURIComponent(f.name)}`, {
+      const r = await fetch(`/api/download?name=${encodeURIComponent(f.name)}&repoIdx=${_currentFileRepoIdx}`, {
         credentials: 'same-origin'
       });
       if (!r.ok) throw new Error();
@@ -1064,7 +1067,7 @@ async function createShareLink() {
   spinner.style.display = 'flex';
   const ttl = parseInt(document.querySelector('.ttl-opt.active')?.dataset.ttl || '3600', 10);
   try {
-    const r = await fetch(`/api/share-link?name=${encodeURIComponent(_shareFile.name)}&ttl=${ttl}`, { credentials: 'same-origin' });
+    const r = await fetch(`/api/share-link?name=${encodeURIComponent(_shareFile.name)}&ttl=${ttl}&repoIdx=${_currentFileRepoIdx}`, { credentials: 'same-origin' });
     if (r.status === 401) { doLogout(); return; }
     if (!r.ok) { toast('Could not generate share link.', 'error'); closeShareModal(); return; }
     const d = await r.json();
