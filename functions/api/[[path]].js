@@ -1515,6 +1515,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const sp = new URL(request.url).searchParams;
     const nameParam = sp.get('name') || '';
     const rIdx = parseInt(sp.get('repoIdx') || '0', 10);
+    const forDownload = sp.get('inline') !== '1'; // ?inline=1 → inline preview, no attachment
     const safe = sanitize(nameParam);
     if (!safe) return jRes({ error: ERRS[400] },400);
     const dlSess = getRepoSess(fullSess, rIdx);
@@ -1551,7 +1552,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
           } catch (e) { controller.error(e); }
         },
       });
-      return new Response(stream, { status:200, headers: { ...SEC, ...cors, 'Content-Type': safeMime(serveAs), 'Content-Disposition': contentDisposition(serveAs), 'Content-Length': String(manifest.totalSize), 'Accept-Ranges':'none' } });
+      return new Response(stream, { status:200, headers: { ...SEC, ...cors, 'Content-Type': safeMime(serveAs), 'Content-Disposition': contentDisposition(serveAs, forDownload), 'Content-Length': String(manifest.totalSize), 'Accept-Ranges':'none' } });
     }
     const rawUrl = `https://raw.githubusercontent.com/${ghOwner}/${ghRepo}/${ghBranch}/${folder}/${encodeURIComponent(safe)}`;
     let ghRes;
@@ -1560,7 +1561,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     if (ghRes.status===404) return jRes({ error: ERRS[404] },404);
     if (!ghRes.ok) return jRes({ error: ERRS[502] },502);
     const len = ghRes.headers.get('Content-Length')||'';
-    return new Response(ghRes.body, { status:200, headers: { ...SEC, ...cors, 'Content-Type': safeMime(serveAs), 'Content-Disposition': contentDisposition(serveAs), ...(len?{'Content-Length':len}:{}), 'Accept-Ranges':'bytes' } });
+    return new Response(ghRes.body, { status:200, headers: { ...SEC, ...cors, 'Content-Type': safeMime(serveAs), 'Content-Disposition': contentDisposition(serveAs, forDownload), ...(len?{'Content-Length':len}:{}), 'Accept-Ranges':'bytes' } });
   }
   if (route === 'delete' && method === 'DELETE') {
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] },400); }
