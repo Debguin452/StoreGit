@@ -9,6 +9,7 @@ const RATE_MAX_SIGNUP           = 3;
 const RATE_MAX_RESET            = 3;
 const CHUNK_B64_MAX             = 14 * 1024 * 1024;
 const SMALL_MAX_BYTES           =  5 * 1024 * 1024;
+const DIST_THRESHOLD            = 500 * 1024 * 1024; // files > 500 MB spread chunks evenly across all repos
 const MAX_TOTAL_CHUNKS          = 512;
 const SHA_RE                    = /^[0-9a-f]{40}$/i;
 const USERNAME_RE               = /^[a-zA-Z0-9_\-]{3,32}$/;
@@ -382,7 +383,7 @@ async function getFullSession(sess, env, secret) {
       await kv.put(cacheKey, JSON.stringify({ username: user.username, encGhToken: user.encGhToken, repos }), { expirationTtl: ttl }).catch(() => {});
     }
   }
-  return { ...sess, ghToken, ghOwner: repo.ghOwner, ghRepo: repo.ghRepo, ghBranch: repo.ghBranch, folder: repo.folder, repoLabel: (repo.label && repo.label !== 'Default') ? repo.label : '', repos: repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo })), activeRepoIdx: repoIdx };
+  return { ...sess, ghToken, ghOwner: repo.ghOwner, ghRepo: repo.ghRepo, ghBranch: repo.ghBranch, folder: repo.folder, repoLabel: (repo.label && repo.label !== 'Default') ? repo.label : '', repos: repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo, ghBranch: r.ghBranch || 'main', folder: r.folder || 'uploads' })), activeRepoIdx: repoIdx };
 }
 function isHttps(req) {
   try { return new URL(req.url).protocol === 'https:'; } catch { return false; }
@@ -544,7 +545,27 @@ async function readIndex(sess) {
   const d = await res.json();
   return { data: JSON.parse(DEC.decode(b64urlDec(d.content.replace(/\s/g,'')))), sha: d.sha };
 }
-async function writeIndex(sess, data, existingSha) {
+// Build a full session pointed at a specific repo index.
+// Requires fullSess.repos to include ghBranch + folder (fixed in getFullSession above).
+function repoSessFor(fullSess, repoIdx) {
+  const repo = fullSess.repos[repoIdx];
+  if (!repo) throw new Error(`invalid_repo_idx:${repoIdx}`);
+  return {
+    ...fullSess,
+    ghOwner:  repo.ghOwner,
+    ghRepo:   repo.ghRepo,
+    ghBranch: repo.ghBranch || 'main',
+    folder:   repo.folder   || 'uploads',
+  };
+}
+// True when a file qualifies for cross-repo distribution.
+function isDistributed(totalSize, repos) {
+  return Number.isInteger(totalSize) && totalSize > DIST_THRESHOLD && Array.isArray(repos) && repos.length > 1;
+}
+// Deterministic repo assignment: round-robin by chunk index.
+function chunkRepoIdx(chunkIndex, repos) {
+  return chunkIndex % repos.length;
+}
   const { ghToken, ghOwner, ghRepo, ghBranch, folder } = sess;
   const url = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/contents/${encodeURIComponent(indexP(folder))}`;
   const res = await fetch(url, {
@@ -614,6 +635,71 @@ async function finalizeChunkedUpload(sess, safeName, blobs, totalSize, chunkSize
   const updateRes = await fetch(`${base}/git/refs/heads/${ghBranch}`, { method: 'PATCH', headers: gh, body: JSON.stringify({ sha: newCommit, force: false }) });
   if (!updateRes.ok) throw new Error('ref_update_fail');
 }
+// Distributed upload finalization: commits chunks to each repo in parallel, then
+// writes a master manifest (with per-chunk routing data) to the active repo.
+async function finalizeDistributedUpload(fullSess, safeName, blobs, totalSize, chunkSize) {
+  const repos = fullSess.repos;
+  // ── Phase 1: commit each repo's subset of chunks in parallel ──────────────
+  const byRepo = new Map();
+  for (const blob of blobs) {
+    const ri = blob.repoIdx ?? 0;
+    if (!byRepo.has(ri)) byRepo.set(ri, []);
+    byRepo.get(ri).push(blob);
+  }
+  await Promise.all([...byRepo.entries()].map(async ([repoIdx, repoBlobs]) => {
+    const rs = repoSessFor(fullSess, repoIdx);
+    const { ghToken, ghOwner, ghRepo, ghBranch, folder } = rs;
+    const gh   = ghH(ghToken);
+    const base = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}`;
+    const refRes = await fetch(`${base}/git/ref/heads/${ghBranch}`, { headers: gh });
+    if (!refRes.ok) throw new Error(`ref_fail_repo_${repoIdx}`);
+    const { object: { sha: headSha } } = await refRes.json();
+    const commitRes = await fetch(`${base}/git/commits/${headSha}`, { headers: gh });
+    if (!commitRes.ok) throw new Error(`commit_read_fail_repo_${repoIdx}`);
+    const { tree: { sha: treeSha } } = await commitRes.json();
+    const treeItems = repoBlobs.map(b => ({ path: chunkPath(folder, safeName, b.index), mode: '100644', type: 'blob', sha: b.blobSha }));
+    const newTreeRes = await fetch(`${base}/git/trees`, { method: 'POST', headers: gh, body: JSON.stringify({ base_tree: treeSha, tree: treeItems }) });
+    if (!newTreeRes.ok) throw new Error(`tree_fail_repo_${repoIdx}`);
+    const { sha: newTreeSha } = await newTreeRes.json();
+    const newCommitRes = await fetch(`${base}/git/commits`, { method: 'POST', headers: gh, body: JSON.stringify({ message: `StoreGit dist-chunk: ${safeName} [repo ${repoIdx}/${repos.length - 1}]`, tree: newTreeSha, parents: [headSha] }) });
+    if (!newCommitRes.ok) throw new Error(`commit_fail_repo_${repoIdx}`);
+    const { sha: newCommit } = await newCommitRes.json();
+    const updateRes = await fetch(`${base}/git/refs/heads/${ghBranch}`, { method: 'PATCH', headers: gh, body: JSON.stringify({ sha: newCommit, force: false }) });
+    if (!updateRes.ok) throw new Error(`ref_update_fail_repo_${repoIdx}`);
+  }));
+  // ── Phase 2: write master manifest to active repo ─────────────────────────
+  // The manifest embeds full routing data per chunk so download/delete can
+  // reconstruct without knowing the repo topology at that moment.
+  const manifest = {
+    name: safeName, totalSize, totalChunks: blobs.length, chunkSize,
+    distributed: true, repoCount: repos.length,
+    uploadedAt: new Date().toISOString(),
+    chunks: blobs.slice().sort((a, b) => a.index - b.index).map(b => {
+      const repo = repos[b.repoIdx ?? 0] || repos[0];
+      return { index: b.index, size: b.size, blobSha: b.blobSha, repoIdx: b.repoIdx ?? 0,
+               ghOwner: repo.ghOwner, ghRepo: repo.ghRepo,
+               ghBranch: repo.ghBranch || 'main', folder: repo.folder || 'uploads' };
+    }),
+  };
+  const { ghToken, ghOwner, ghRepo, ghBranch, folder } = fullSess;
+  const gh   = ghH(ghToken);
+  const base = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}`;
+  const manifestBlobSha = await createBlob(fullSess, utf8b64(JSON.stringify(manifest, null, 2)));
+  const refRes2 = await fetch(`${base}/git/ref/heads/${ghBranch}`, { headers: gh });
+  if (!refRes2.ok) throw new Error('manifest_ref_fail');
+  const { object: { sha: headSha2 } } = await refRes2.json();
+  const commitRes2 = await fetch(`${base}/git/commits/${headSha2}`, { headers: gh });
+  if (!commitRes2.ok) throw new Error('manifest_commit_read_fail');
+  const { tree: { sha: treeSha2 } } = await commitRes2.json();
+  const newTreeRes2 = await fetch(`${base}/git/trees`, { method: 'POST', headers: gh, body: JSON.stringify({ base_tree: treeSha2, tree: [{ path: manifestP(folder, safeName), mode: '100644', type: 'blob', sha: manifestBlobSha }] }) });
+  if (!newTreeRes2.ok) throw new Error('manifest_tree_fail');
+  const { sha: newTreeSha2 } = await newTreeRes2.json();
+  const newCommitRes2 = await fetch(`${base}/git/commits`, { method: 'POST', headers: gh, body: JSON.stringify({ message: `StoreGit dist-manifest: ${safeName} (${blobs.length} chunks, ${repos.length} repos)`, tree: newTreeSha2, parents: [headSha2] }) });
+  if (!newCommitRes2.ok) throw new Error('manifest_commit_fail');
+  const { sha: newCommit2 } = await newCommitRes2.json();
+  const updateRes2 = await fetch(`${base}/git/refs/heads/${ghBranch}`, { method: 'PATCH', headers: gh, body: JSON.stringify({ sha: newCommit2, force: false }) });
+  if (!updateRes2.ok) throw new Error('manifest_ref_update_fail');
+}
 async function deleteChunked(sess, safeName) {
   const { ghToken, ghOwner, ghRepo, ghBranch, folder } = sess;
   const gh   = ghH(ghToken);
@@ -639,6 +725,60 @@ async function deleteChunked(sess, safeName) {
   const { sha: newCommit } = await newCommitRes.json();
   const updateRes = await fetch(`${base}/git/refs/heads/${ghBranch}`, { method: 'PATCH', headers: gh, body: JSON.stringify({ sha: newCommit, force: false }) });
   if (!updateRes.ok) throw new Error('ref_update_fail');
+}
+// Deletes a distributed file: reads the manifest to find which chunks live in
+// which repos, removes them in parallel, then removes the manifest itself.
+async function deleteDistributed(fullSess, safeName) {
+  const { ghToken, ghOwner, ghRepo, ghBranch, folder } = fullSess;
+  const gh   = ghH(ghToken);
+  // Load master manifest from active repo
+  const mRes = await fetch(`https://api.github.com/repos/${ghOwner}/${ghRepo}/contents/${manifestP(folder, safeName)}?ref=${ghBranch}`, { headers: gh });
+  if (!mRes.ok) throw new Error('manifest_missing');
+  const mData = await mRes.json();
+  const manifest = JSON.parse(atob(mData.content.replace(/\s/g, '')));
+  // Group chunks by repo using the routing data baked into the manifest
+  const byRepo = new Map();
+  for (const chunk of (manifest.chunks || [])) {
+    const key = `${chunk.ghOwner}/${chunk.ghRepo}/${chunk.ghBranch}/${chunk.folder}`;
+    if (!byRepo.has(key)) byRepo.set(key, { chunk, indices: [] });
+    byRepo.get(key).indices.push(chunk.index);
+  }
+  // Delete chunks from each repo in parallel
+  await Promise.all([...byRepo.values()].map(async ({ chunk: rep, indices }) => {
+    const base = `https://api.github.com/repos/${encodeURIComponent(rep.ghOwner)}/${encodeURIComponent(rep.ghRepo)}`;
+    const repGh = ghH(ghToken);
+    const refRes = await fetch(`${base}/git/ref/heads/${rep.ghBranch}`, { headers: repGh });
+    if (!refRes.ok) throw new Error(`ref_fail:${rep.ghRepo}`);
+    const { object: { sha: headSha } } = await refRes.json();
+    const commitRes = await fetch(`${base}/git/commits/${headSha}`, { headers: repGh });
+    if (!commitRes.ok) throw new Error(`commit_read_fail:${rep.ghRepo}`);
+    const { tree: { sha: treeSha } } = await commitRes.json();
+    const treeItems = indices.map(idx => ({ path: chunkPath(rep.folder, safeName, idx), mode: '100644', type: 'blob', sha: null }));
+    const newTreeRes = await fetch(`${base}/git/trees`, { method: 'POST', headers: repGh, body: JSON.stringify({ base_tree: treeSha, tree: treeItems }) });
+    if (!newTreeRes.ok) throw new Error(`tree_fail:${rep.ghRepo}`);
+    const { sha: newTreeSha } = await newTreeRes.json();
+    const newCommitRes = await fetch(`${base}/git/commits`, { method: 'POST', headers: repGh, body: JSON.stringify({ message: `StoreGit dist-delete: ${safeName}`, tree: newTreeSha, parents: [headSha] }) });
+    if (!newCommitRes.ok) throw new Error(`commit_fail:${rep.ghRepo}`);
+    const { sha: newCommit } = await newCommitRes.json();
+    const upRes = await fetch(`${base}/git/refs/heads/${rep.ghBranch}`, { method: 'PATCH', headers: repGh, body: JSON.stringify({ sha: newCommit, force: false }) });
+    if (!upRes.ok) throw new Error(`ref_update_fail:${rep.ghRepo}`);
+  }));
+  // Remove manifest from active repo
+  const base = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}`;
+  const refRes = await fetch(`${base}/git/ref/heads/${ghBranch}`, { headers: gh });
+  if (!refRes.ok) throw new Error('manifest_ref_fail');
+  const { object: { sha: headSha } } = await refRes.json();
+  const commitRes = await fetch(`${base}/git/commits/${headSha}`, { headers: gh });
+  if (!commitRes.ok) throw new Error('manifest_commit_read_fail');
+  const { tree: { sha: treeSha } } = await commitRes.json();
+  const newTreeRes = await fetch(`${base}/git/trees`, { method: 'POST', headers: gh, body: JSON.stringify({ base_tree: treeSha, tree: [{ path: manifestP(folder, safeName), mode: '100644', type: 'blob', sha: null }] }) });
+  if (!newTreeRes.ok) throw new Error('manifest_tree_fail');
+  const { sha: newTreeSha } = await newTreeRes.json();
+  const newCommitRes = await fetch(`${base}/git/commits`, { method: 'POST', headers: gh, body: JSON.stringify({ message: `StoreGit dist-delete-manifest: ${safeName}`, tree: newTreeSha, parents: [headSha] }) });
+  if (!newCommitRes.ok) throw new Error('manifest_commit_fail');
+  const { sha: newCommit } = await newCommitRes.json();
+  const upRes = await fetch(`${base}/git/refs/heads/${ghBranch}`, { method: 'PATCH', headers: gh, body: JSON.stringify({ sha: newCommit, force: false }) });
+  if (!upRes.ok) throw new Error('manifest_ref_update_fail');
 }
 async function deleteRegular(sess, filename, sha) {
   const { ghToken, ghOwner, ghRepo, ghBranch, folder } = sess;
@@ -854,17 +994,23 @@ async function _handleRequest({ request, env, params }) {
       }
     } catch {}
     if (manifest) {
-      const rawBase    = `https://raw.githubusercontent.com/${ghOwner}/${ghRepo}/${ghBranch}`;
       const authHeader = { Authorization:`token ${ghToken}`, 'User-Agent':'StoreGit/1' };
       const stream = new ReadableStream({
         async start(controller) {
           try {
             for (let i = 0; i < manifest.totalChunks; i++) {
-              const res = await fetch(`${rawBase}/${chunkPath(folder, safe, i)}`, { headers: authHeader });
+              // For distributed files each chunk records its own repo location.
+              // Fall back to the active repo for regular (non-distributed) manifests.
+              const chunkMeta = manifest.chunks?.[i];
+              const chunkOwner  = chunkMeta?.ghOwner  || ghOwner;
+              const chunkRepo   = chunkMeta?.ghRepo   || ghRepo;
+              const chunkBranch = chunkMeta?.ghBranch || ghBranch;
+              const chunkFolder = chunkMeta?.folder   || folder;
+              const chunkUrl = `https://raw.githubusercontent.com/${chunkOwner}/${chunkRepo}/${chunkBranch}/${chunkPath(chunkFolder, safe, i)}`;
+              const res = await fetch(chunkUrl, { headers: authHeader });
               if (!res.ok) { controller.error(new Error(`chunk_${i}_missing`)); return; }
               const buf = await res.arrayBuffer();
-              const expected = manifest.chunks?.[i]?.blobSha;
-              if (expected) { const actual = await gitBlobSha(buf); if (actual !== expected) { controller.error(new Error(`chunk_${i}_corrupt`)); return; } }
+              if (chunkMeta?.blobSha) { const actual = await gitBlobSha(buf); if (actual !== chunkMeta.blobSha) { controller.error(new Error(`chunk_${i}_corrupt`)); return; } }
               controller.enqueue(new Uint8Array(buf));
             }
             controller.close();
@@ -1050,14 +1196,24 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     if (!rec) return jRes({ error: ERRS[404] }, 404);
     const { content: user, sha: userSha } = rec;
     const repos = getUserRepos(user);
-    if (repoIdx === 0) return jRes({ error: 'Cannot remove the primary repository' }, 400);
+    if (repos.length <= 1) return jRes({ error: 'Cannot remove your only repository' }, 400);
     if (repoIdx >= repos.length) return jRes({ error: ERRS[400] }, 400);
     repos.splice(repoIdx, 1);
+    // Adjust activeRepoIdx in the new token:
+    // • Removed the active repo  → fall back to 0
+    // • Removed a repo before the active one → shift down by 1
+    // • Removed a repo after the active one  → unchanged
+    const currentActive = sess.repoIdx ?? 0;
+    let newActive = currentActive;
+    if (repoIdx === currentActive)  newActive = 0;
+    else if (repoIdx < currentActive) newActive = currentActive - 1;
     const updated = { ...user, repos };
     try { await writeReg(userPath(sess.username), updated, `Remove repo ${repoIdx}`, env, userSha); }
     catch { return jRes({ error: ERRS[502] }, 502); }
     if (kv) await env.RATE_LIMIT_KV.delete(`sess_cache:${sess.jti}`).catch(() => {});
-    return jRes({ ok:true });
+    // Issue a refreshed token so the client's session reflects the corrected index immediately
+    const newToken = await createToken({ username: sess.username, display: sess.display, repoIdx: newActive }, secret);
+    return jRes({ ok: true, token: newToken, activeRepoIdx: newActive });
   }
 
   // ── API Key management (session only) ─────────────────────────────────────
@@ -1091,18 +1247,25 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const rawKey = generateRawApiKey();
     const keyId  = base64urlFromBytes(crypto.getRandomValues(new Uint8Array(9))); // 9 bytes → 12 B64URL chars, URL-safe unique ID
     const preview = rawKey.slice(0, 12) + '…';
-    // Store in KV for fast lookup
+    // KV must be available — it's the lookup path for every API request
     if (!kv) return jRes({ error: 'KV binding required for API keys' }, 500);
-    const kvKey  = await apiKeyKvKey(rawKey);
-    await kv.put(kvKey, JSON.stringify({
-      username: sess.username, label, allowedOrigins, keyId,
-    })).catch(() => {});
+    const kvKey = await apiKeyKvKey(rawKey);
+    // Write to KV first. If this fails the key is unusable, so abort clearly.
+    try {
+      await kv.put(kvKey, JSON.stringify({ username: sess.username, label, allowedOrigins, keyId }));
+    } catch (e) {
+      return jRes({ error: 'KV write failed — API key could not be stored. Check your KV binding.' }, 500);
+    }
     // Store metadata (not raw key) in user record
     const encKey = await aesEncrypt(rawKey, secret, `apikey:${sess.username}:${keyId}`);
     const keyMeta = { keyId, preview, label, allowedOrigins, createdAt: new Date().toISOString(), encKey };
     const updated = { ...user, apiKeys: [...existingKeys, keyMeta] };
     try { await writeReg(userPath(sess.username), updated, `Create API key: ${label}`, env, userSha); }
-    catch { const _k = await apiKeyKvKey(rawKey); await kv.delete(_k).catch(() => {}); return jRes({ error: ERRS[502] }, 502); }
+    catch {
+      // GitHub write failed — roll back the KV entry so no orphaned key exists
+      await kv.delete(kvKey).catch(() => {});
+      return jRes({ error: ERRS[502] }, 502);
+    }
     return jRes({ ok: true, rawKey, keyId, preview, label, allowedOrigins });
   }
   if (route === 'apikeys/revoke' && method === 'DELETE') {
@@ -1191,7 +1354,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       ]);
       const chunked = Object.entries(idx)
         .filter(([, info]) => info.totalChunks)
-        .map(([name, info]) => ({ name, originalName: info.originalName || unwrapName(name), size: info.totalSize, sha: '', chunked: true, parts: info.totalChunks, uploadedAt: info.uploadedAt || null }));
+        .map(([name, info]) => ({ name, originalName: info.originalName || unwrapName(name), size: info.totalSize, sha: '', chunked: true, distributed: info.distributed || false, repoCount: info.repoCount || 1, parts: info.totalChunks, uploadedAt: info.uploadedAt || null }));
       const chunkedNames = new Set(chunked.map(f => f.name));
       const cleanRegular = regular
         .filter(f => !chunkedNames.has(f.name))
@@ -1245,7 +1408,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
   if (route === 'upload-chunk' && method === 'POST') {
     if (!(request.headers.get('Content-Type')||'').includes('application/json')) return jRes({ error: ERRS[400] },400);
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] },400); }
-    const { name: rawName, chunkIndex, totalChunks, content: b64 } = body||{};
+    const { name: rawName, chunkIndex, totalChunks, totalSize, content: b64 } = body||{};
     if (!rawName || !b64 || typeof b64 !== 'string') return jRes({ error: ERRS[400] },400);
     if (b64.length > CHUNK_B64_MAX) return jRes({ error: ERRS[413] },413);
     const chunkIdx = parseInt(chunkIndex, 10);
@@ -1256,12 +1419,16 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     if (!safe) return jRes({ error: ERRS[415] },415);
     if (chunkIdx === 0 && !checkMagicBase64(b64)) return jRes({ error: ERRS[415] },415);
     const decodedSize = Math.floor(b64.length * 3 / 4);
-    // For API key sessions, use a synthetic jti
+    // Route chunk to its target repo. For distributed files (>500 MB with multiple
+    // repos) we spread round-robin. Single-repo or small files always use active repo.
+    const dist = isDistributed(totalSize, fullSess.repos);
+    const targetRepoIdx = dist ? chunkRepoIdx(chunkIdx, fullSess.repos) : (fullSess.activeRepoIdx ?? 0);
+    const targetSess = dist ? repoSessFor(fullSess, targetRepoIdx) : fullSess;
     const jti = sess ? sess.jti : `ak:${fullSess.username}`;
     try {
-      const blobSha   = await createBlob(fullSess, b64);
+      const blobSha   = await createBlob(targetSess, b64);
       const blobToken = await blobTokenSign(jti, safe, chunkIdx, blobSha, secret);
-      return jRes({ ok:true, blobSha, blobToken, index: chunkIdx, size: decodedSize });
+      return jRes({ ok: true, blobSha, blobToken, index: chunkIdx, size: decodedSize, repoIdx: targetRepoIdx, distributed: dist });
     } catch { return jRes({ error: ERRS[502] }, 502); }
   }
   if (route === 'finalize-upload' && method === 'POST') {
@@ -1275,21 +1442,33 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     if (chunkSize !== undefined && (!Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > CHUNK_B64_MAX)) return jRes({ error: ERRS[400] }, 400);
     const safe = sanitize(String(name));
     if (!safe) return jRes({ error: ERRS[415] }, 415);
+    const dist = isDistributed(totalSize, fullSess.repos);
     const jti = sess ? sess.jti : `ak:${fullSess.username}`;
     for (const b of blobs) {
       if (typeof b.blobSha   !== 'string' || !SHA_RE.test(b.blobSha)) return jRes({ error: ERRS[400] },400);
       if (typeof b.blobToken !== 'string')                             return jRes({ error: ERRS[400] },400);
       if (typeof b.index     !== 'number' || b.index < 0)             return jRes({ error: ERRS[400] },400);
       if (typeof b.size      !== 'number' || b.size  < 1)             return jRes({ error: ERRS[400] },400);
+      // For distributed uploads verify that the client routed each chunk to the
+      // repo the server would have chosen deterministically. Reject mismatches.
+      if (dist) {
+        const expected = chunkRepoIdx(b.index, fullSess.repos);
+        if ((b.repoIdx ?? expected) !== expected) return jRes({ error: 'chunk_repo_mismatch' }, 400);
+        b.repoIdx = expected; // normalise so finalize has clean data
+      }
       const expected = await blobTokenSign(jti, safe, b.index, b.blobSha, secret);
       if (!(await timingSafeEq(b.blobToken, expected))) return jRes({ error: ERRS[403] }, 403);
     }
     try {
-      await finalizeChunkedUpload(fullSess, safe, blobs, totalSize, chunkSize);
+      if (dist) {
+        await finalizeDistributedUpload(fullSess, safe, blobs, totalSize, chunkSize);
+      } else {
+        await finalizeChunkedUpload(fullSess, safe, blobs, totalSize, chunkSize);
+      }
       const { data: idx, sha: idxSha } = await readIndex(fullSess);
-      idx[safe] = { originalName: getOriginalName(name, safe), totalSize, totalChunks, uploadedAt: new Date().toISOString() };
+      idx[safe] = { originalName: getOriginalName(name, safe), totalSize, totalChunks, uploadedAt: new Date().toISOString(), ...(dist && { distributed: true, repoCount: fullSess.repos.length }) };
       await writeIndex(fullSess, idx, idxSha);
-      return jRes({ ok:true, name:safe });
+      return jRes({ ok: true, name: safe, distributed: dist, ...(dist && { repoCount: fullSess.repos.length }) });
     } catch { return jRes({ error: ERRS[502] }, 502); }
   }
   if (route === 'download' && method === 'GET') {
@@ -1308,17 +1487,21 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       }
     } catch {}
     if (manifest) {
-      const rawBase    = `https://raw.githubusercontent.com/${ghOwner}/${ghRepo}/${ghBranch}`;
       const authHeader = { Authorization:`token ${ghToken}`, 'User-Agent':'StoreGit/1' };
       const stream = new ReadableStream({
         async start(controller) {
           try {
             for (let i = 0; i < manifest.totalChunks; i++) {
-              const res = await fetch(`${rawBase}/${chunkPath(folder, safe, i)}`, { headers: authHeader });
+              const chunkMeta = manifest.chunks?.[i];
+              const chunkOwner  = chunkMeta?.ghOwner  || ghOwner;
+              const chunkRepo   = chunkMeta?.ghRepo   || ghRepo;
+              const chunkBranch = chunkMeta?.ghBranch || ghBranch;
+              const chunkFolder = chunkMeta?.folder   || folder;
+              const chunkUrl = `https://raw.githubusercontent.com/${chunkOwner}/${chunkRepo}/${chunkBranch}/${chunkPath(chunkFolder, safe, i)}`;
+              const res = await fetch(chunkUrl, { headers: authHeader });
               if (!res.ok) { controller.error(new Error(`chunk_${i}_missing`)); return; }
               const buf = await res.arrayBuffer();
-              const expected = manifest.chunks?.[i]?.blobSha;
-              if (expected) { const actual = await gitBlobSha(buf); if (actual !== expected) { controller.error(new Error(`chunk_${i}_corrupt`)); return; } }
+              if (chunkMeta?.blobSha) { const actual = await gitBlobSha(buf); if (actual !== chunkMeta.blobSha) { controller.error(new Error(`chunk_${i}_corrupt`)); return; } }
               controller.enqueue(new Uint8Array(buf));
             }
             controller.close();
@@ -1344,8 +1527,13 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     if (!safe) return jRes({ error: ERRS[400] },400);
     if (chunked) {
       try {
-        await deleteChunked(fullSess, safe);
         const { data: idx, sha: idxSha } = await readIndex(fullSess);
+        const isDistFile = idx[safe]?.distributed;
+        if (isDistFile) {
+          await deleteDistributed(fullSess, safe);
+        } else {
+          await deleteChunked(fullSess, safe);
+        }
         delete idx[safe];
         await writeIndex(fullSess, idx, idxSha);
         return jRes({ ok:true });
