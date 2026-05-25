@@ -1,6 +1,6 @@
 # StoreGit
 
-A serverless file-storage platform built on **Cloudflare Pages Functions** and the **GitHub Contents / Git Data APIs**. Each user connects their own GitHub repository as storage. You deploy one Cloudflare Pages project; users bring their own GitHub repo and personal access token.
+> A serverless file-storage platform built on **Cloudflare Pages Functions** and the **GitHub Contents / Git Data APIs**. Each user connects their own GitHub repository as storage. You deploy one Cloudflare Pages project; users bring their own GitHub repo and personal access token.
 
 ---
 
@@ -368,7 +368,7 @@ One KV namespace (`RATE_LIMIT_KV`) covers all runtime storage:
 
 StoreGit exposes a plain HTTP API secured with API keys. Any website, web app, or script can read and write files to a user's GitHub-backed storage using a single `X-API-Key` header — no OAuth flow, no server of your own.
 
-**Live example:** [vaultxt.pages.dev](https://vaultxt.pages.dev) — a note-taking app built entirely on the StoreGit API ([source on GitHub](https://github.com/debguin/vaultxt)).
+**Live example:** [vaultxt.pages.dev](https://vaultxt.pages.dev/) — a note-taking app built entirely on the StoreGit API ([source on GitHub](https://github.com/Debguin452/vaultxt)).
 
 ---
 
@@ -719,7 +719,7 @@ When creating a key for production, always set `allowedOrigins` to your exact do
 
 ### Built with StoreGit
 
-- [VaulTxt](https://vaultxt.pages.dev) — mobile-first note vault ([source](https://github.com/debguin/vaultxt))
+- [VaulTxt](https://vaultxt.pages.dev) — mobile-first note vault ([source](https://github.com/Debguin452/vaultxt))
 
 Building something with StoreGit? Open a PR to add it to this list.
 
