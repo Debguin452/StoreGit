@@ -575,10 +575,64 @@ async function readIndex(sess) {
 }
 function isDistributed(totalSize, repos) {
   // b64 size is ~4/3 of raw — compare encoded size against Cloudflare body limit
+  // Distribute only when the file is too large for one repo AND multiple repos exist.
   return Number.isInteger(totalSize) && Math.ceil(totalSize * 4 / 3) > DIST_THRESHOLD && Array.isArray(repos) && repos.length > 1;
 }
+// Legacy fallback round-robin — used only when space data is unavailable.
 function chunkRepoIdx(chunkIndex, repos) {
   return chunkIndex % repos.length;
+}
+// ── Space-aware routing helpers ──────────────────────────────────────────────
+// Fetch current byte totals for every repo in parallel.
+// Returns 0 for any repo whose index cannot be read (empty / network error),
+// so that repo is treated as having the most available space and gets priority.
+async function fetchRepoBytes(fullSess) {
+  if (!Array.isArray(fullSess.repos) || fullSess.repos.length === 0) return [];
+  return Promise.all(
+    fullSess.repos.map(async (repo) => {
+      try {
+        const s = {
+          ...fullSess,
+          ghOwner:  repo.ghOwner,
+          ghRepo:   repo.ghRepo,
+          ghBranch: repo.ghBranch || 'main',
+          folder:   repo.folder   || 'uploads',
+        };
+        const { data: idx } = await readIndex(s);
+        return Object.values(idx).reduce((sum, f) => sum + (Number(f.totalSize ?? f.size) || 0), 0);
+      } catch { return 0; }
+    })
+  );
+}
+// Return the index of the repo with the fewest stored bytes (= most free space).
+// All repos are treated equally — none is special or preferred.
+async function pickLeastUsedRepo(fullSess) {
+  if (!Array.isArray(fullSess.repos) || fullSess.repos.length <= 1) return 0;
+  const bytes = await fetchRepoBytes(fullSess).catch(() => []);
+  if (!bytes.length) return 0;
+  let min = 0;
+  for (let i = 1; i < bytes.length; i++) if (bytes[i] < bytes[min]) min = i;
+  return min;
+}
+// Greedy balanced assignment: assign each chunk to whichever repo currently has
+// the fewest projected bytes, minimising the size divergence (max–min spread)
+// across all repos after the upload completes.
+// With equal starting sizes this degenerates to clean round-robin.
+// repoCurrentBytes: live byte total per repo, fetched once before upload starts.
+function computeBalancedAssignment(totalChunks, approxChunkBytes, repoCurrentBytes) {
+  const n = Array.isArray(repoCurrentBytes) ? repoCurrentBytes.length : 0;
+  if (n <= 1) return Array.from({ length: totalChunks }, () => 0);
+  const proj = repoCurrentBytes.map(b => (Number.isFinite(b) && b >= 0 ? b : 0));
+  const assignment = [];
+  const step = approxChunkBytes > 0 ? approxChunkBytes : 1;
+  for (let c = 0; c < totalChunks; c++) {
+    // Pick repo with minimum projected bytes; ties broken by lower index
+    let min = 0;
+    for (let r = 1; r < n; r++) if (proj[r] < proj[min]) min = r;
+    assignment.push(min);
+    proj[min] += step;
+  }
+  return assignment;
 }
 async function writeIndex(sess, data, existingSha) {
   const { ghToken, ghOwner, ghRepo, ghBranch, folder } = sess;
@@ -1369,14 +1423,18 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
   if (route === 'upload' && method === 'POST') {
     if (!(request.headers.get('Content-Type')||'').includes('application/json')) return jRes({ error: ERRS[400] },400);
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] },400); }
-    const { name: rawName, content: b64, targetRepoIdx } = body||{};
+    const { name: rawName, content: b64 } = body||{};
     if (!rawName || !b64 || typeof b64 !== 'string') return jRes({ error: ERRS[400] },400);
     if (b64.length > C_CHUNK_B64_MAX) return jRes({ error: ERRS[413] },413);
     const safe = sanitize(String(rawName));
     if (!safe) return jRes({ error: ERRS[415] },415);
     if (!checkMagicBase64(b64)) return jRes({ error: ERRS[415] },415);
     const decodedSize = Math.floor(b64.length * 3 / 4);
-    const uploadSess = getRepoSess(fullSess, typeof targetRepoIdx === 'number' ? targetRepoIdx : 0);
+    // Route to the repo with the most available space — no repo is special or preferred.
+    const uploadRepoIdx = fullSess.repos.length > 1
+      ? await pickLeastUsedRepo(fullSess).catch(() => 0)
+      : 0;
+    const uploadSess = getRepoSess(fullSess, uploadRepoIdx);
     try {
       if (decodedSize > C_SMALL_MAX_BYTES) {
         const blobSha = await createBlob(uploadSess, b64);
@@ -1407,7 +1465,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
   if (route === 'upload-chunk' && method === 'POST') {
     if (!(request.headers.get('Content-Type')||'').includes('application/json')) return jRes({ error: ERRS[400] },400);
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] },400); }
-    const { name: rawName, chunkIndex, totalChunks, totalSize, content: b64, targetRepoIdx } = body||{};
+    const { name: rawName, chunkIndex, totalChunks, totalSize, content: b64 } = body||{};
     if (!rawName || !b64 || typeof b64 !== 'string') return jRes({ error: ERRS[400] },400);
     if (b64.length > C_CHUNK_B64_MAX) return jRes({ error: ERRS[413] },413);
     const chunkIdx = parseInt(chunkIndex, 10);
@@ -1418,11 +1476,48 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     if (!safe) return jRes({ error: ERRS[415] },415);
     if (chunkIdx === 0 && !checkMagicBase64(b64)) return jRes({ error: ERRS[415] },415);
     const decodedSize = Math.floor(b64.length * 3 / 4);
-    // Assign chunk to repo: round-robin for distributed, else targetRepoIdx (default 0)
+    // ── Space-aware repo routing ─────────────────────────────────────────────
+    // All repos are equal — no "target" or "primary" repo.
+    // A chunk→repo assignment is computed once (using live repo sizes) and cached
+    // in KV for the duration of this upload so every chunk routes consistently,
+    // even when chunks arrive out of order or are retried.
     const dist = isDistributed(totalSize, fullSess.repos);
-    const resolvedRepoIdx = dist
-      ? chunkRepoIdx(chunkIdx, fullSess.repos)
-      : (Number.isInteger(targetRepoIdx) && targetRepoIdx >= 0 && targetRepoIdx < fullSess.repos.length ? targetRepoIdx : 0);
+    let resolvedRepoIdx = 0;
+    if (fullSess.repos.length > 1) {
+      const assignKey = `chunk_assign:${fullSess.username}:${safe}:${tot}`;
+      let assignment = null;
+      if (kv) {
+        const cached = await kv.get(assignKey, 'json').catch(() => null);
+        // Accept cached assignment only if it is complete and all indices are still valid
+        if (Array.isArray(cached) && cached.length === tot &&
+            cached.every(r => Number.isInteger(r) && r >= 0 && r < fullSess.repos.length)) {
+          assignment = cached;
+        }
+      }
+      if (!assignment) {
+        // Fetch live storage for all repos in parallel, then build the routing plan
+        const repoBytes = await fetchRepoBytes(fullSess).catch(() => fullSess.repos.map(() => 0));
+        const approxChunkBytes = (Number.isFinite(totalSize) && totalSize > 0 && tot > 0)
+          ? Math.ceil(totalSize / tot) : 0;
+        if (dist) {
+          // Large file: spread chunks across repos, equalising their sizes
+          assignment = computeBalancedAssignment(tot, approxChunkBytes, repoBytes);
+        } else {
+          // Normal file: all chunks go to whichever single repo has the most free space
+          let min = 0;
+          for (let r = 1; r < repoBytes.length; r++) if (repoBytes[r] < repoBytes[min]) min = r;
+          assignment = Array.from({ length: tot }, () => min);
+        }
+        if (kv) {
+          // 24-hour TTL — generous enough for any real upload session
+          await kv.put(assignKey, JSON.stringify(assignment), { expirationTtl: 86400 }).catch(() => {});
+        }
+      }
+      // Safe fallback if chunkIdx somehow exceeds the assignment array
+      resolvedRepoIdx = assignment[chunkIdx] ?? (dist ? chunkIdx % fullSess.repos.length : 0);
+      // Clamp — guards against repos being added/removed between chunk calls
+      resolvedRepoIdx = Math.max(0, Math.min(resolvedRepoIdx, fullSess.repos.length - 1));
+    }
     const targetSess = getRepoSess(fullSess, resolvedRepoIdx);
     const jti = sess ? sess.jti : `ak:${fullSess.username}`;
     try {
@@ -1439,7 +1534,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
   }
   if (route === 'finalize-upload' && method === 'POST') {
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] },400); }
-    const { name, totalSize, totalChunks, chunkSize, blobs, targetRepoIdx } = body||{};
+    const { name, totalSize, totalChunks, chunkSize, blobs } = body||{};
     if (!name||!totalSize||!totalChunks||!Array.isArray(blobs)) return jRes({ error: ERRS[400] },400);
     if (blobs.length !== totalChunks) return jRes({ error: ERRS[400] },400);
     if (totalChunks > C_MAX_TOTAL_CHUNKS) return jRes({ error: ERRS[413] },413);
@@ -1449,7 +1544,20 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const safe = sanitize(String(name));
     if (!safe) return jRes({ error: ERRS[415] }, 415);
     const dist = isDistributed(totalSize, fullSess.repos);
-    const finalSess = dist ? fullSess : getRepoSess(fullSess, Number.isInteger(targetRepoIdx) ? targetRepoIdx : 0);
+    // Recover the repo that was chosen at upload-chunk time from the KV assignment cache.
+    // For non-distributed uploads all chunks went to one repo — read it from cached[0].
+    // For distributed uploads finalSess is only used for the manifest commit, which lands
+    // on the session's context repo (same as before).
+    const assignKey = `chunk_assign:${fullSess.username}:${safe}:${totalChunks}`;
+    let finalRepoIdx = 0;
+    if (!dist && fullSess.repos.length > 1 && kv) {
+      const cached = await kv.get(assignKey, 'json').catch(() => null);
+      if (Array.isArray(cached) && cached.length > 0 &&
+          Number.isInteger(cached[0]) && cached[0] >= 0 && cached[0] < fullSess.repos.length) {
+        finalRepoIdx = cached[0];
+      }
+    }
+    const finalSess = dist ? fullSess : getRepoSess(fullSess, finalRepoIdx);
     const jti = sess ? sess.jti : `ak:${fullSess.username}`;
     for (const b of blobs) {
       if (typeof b.blobSha   !== 'string' || !SHA_RE.test(b.blobSha)) return jRes({ error: ERRS[400] },400);
@@ -1457,9 +1565,14 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       if (typeof b.index     !== 'number' || b.index < 0)             return jRes({ error: ERRS[400] },400);
       if (typeof b.size      !== 'number' || b.size  < 1)             return jRes({ error: ERRS[400] },400);
       if (dist) {
-        const expected = chunkRepoIdx(b.index, fullSess.repos);
-        if ((b.repoIdx ?? expected) !== expected) return jRes({ error: 'chunk_repo_mismatch' }, 400);
-        b.repoIdx = expected;
+        // Repo routing was decided at upload-chunk time via balanced assignment.
+        // The blobToken already cryptographically binds (jti, name, chunkIndex, blobSha),
+        // so we only verify the reported repoIdx is a valid slot — not a specific value.
+        const ri = b.repoIdx ?? 0;
+        if (!Number.isInteger(ri) || ri < 0 || ri >= fullSess.repos.length) {
+          return jRes({ error: 'chunk_repo_mismatch' }, 400);
+        }
+        b.repoIdx = ri;
       }
       const expected = await blobTokenSign(jti, safe, b.index, b.blobSha, secret);
       if (!(await timingSafeEq(b.blobToken, expected))) return jRes({ error: ERRS[403] }, 403);
@@ -1470,6 +1583,8 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       } else {
         await finalizeChunkedUpload(finalSess, safe, blobs, totalSize, chunkSize);
       }
+      // Clean up the upload assignment cache — no longer needed after successful finalize
+      if (kv) await kv.delete(assignKey).catch(() => {});
       const { data: idx, sha: idxSha } = await readIndex(finalSess);
       idx[safe] = { originalName: getOriginalName(name, safe), totalSize, totalChunks, uploadedAt: new Date().toISOString(), ...(dist && { distributed: true, repoCount: fullSess.repos.length }) };
       await writeIndex(finalSess, idx, idxSha);
