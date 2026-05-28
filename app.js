@@ -1,7 +1,8 @@
 'use strict';
-const CHUNK_THRESHOLD = 5  * 1024 * 1024;
-const CHUNK_SIZE      = 10 * 1024 * 1024;
-const MAX_FILE_SIZE   = 5  * 1024 * 1024 * 1024;
+let CHUNK_THRESHOLD = 5  * 1024 * 1024;  // switch to chunked upload above this raw size
+let CHUNK_SIZE      = 10 * 1024 * 1024;  // raw bytes per chunk (~13.3 MB b64, under 14 MB limit)
+let MAX_FILE_SIZE   = 5  * 1024 * 1024 * 1024;
+let UPLOAD_CONCURRENCY = 4;              // parallel chunk uploads; overridden by server config
 let loginLocked      = false;
 let uploadPending    = [];
 let _signupData      = {};
@@ -40,6 +41,9 @@ function precacheSlices(file) {
         '</div>';
       showScreen('login'); return;
     }
+    // Apply server-side speed config to client constants
+    if (d.uploadConcurrency > 0)   UPLOAD_CONCURRENCY = d.uploadConcurrency;
+    if (d.distThresholdBytes > 0)  CHUNK_THRESHOLD    = Math.round(d.distThresholdBytes * 3 / 4);
   } catch {}
   try {
     const r = await fetch('/api/me', { credentials:'same-origin' });
@@ -179,7 +183,6 @@ function updateRepoChip(repos) {
   renderDrawerRepoList();
 }
 
-// ── Drawer open / close ───────────────────────────────────────────────────────
 function openDrawer() {
   document.getElementById('drawer').classList.add('is-open');
   document.getElementById('drawer-overlay').classList.add('is-open');
@@ -197,7 +200,6 @@ function closeDrawer() {
   hideApiKeyReveal();
 }
 
-// ── Drawer repo list ──────────────────────────────────────────────────────────
 function renderDrawerRepoList() {
   const list = document.getElementById('drawer-repo-list');
   if (!list) return;
@@ -241,7 +243,6 @@ function renderDrawerRepoList() {
   });
 }
 
-// ── Drawer add-repo form ──────────────────────────────────────────────────────
 function toggleDrawerAddRepoForm() {
   const form = document.getElementById('drawer-add-repo-form');
   const btn  = document.getElementById('drawer-add-repo-btn');
@@ -289,7 +290,6 @@ async function submitDrawerAddRepo() {
   btn.disabled = false; btn.textContent = 'Add Repository';
 }
 
-// ── API Key management ────────────────────────────────────────────────────────
 async function loadApiKeys() {
   const list = document.getElementById('apikey-list');
   if (!list) return;
@@ -781,7 +781,8 @@ async function xhrUpload(file, idx, targetRepoIdx = 0) {
     xhr.send(JSON.stringify({ name: file.name, content: b64, targetRepoIdx }));
   });
 }
-const UPLOAD_CONCURRENCY = 5;
+const CHUNK_MAX_RETRIES = 2;
+const CHUNK_BACKOFF_MS  = 800;
 async function chunkedUpload(file, idx, targetRepoIdx = 0) {
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
   setQ(idx, 'go', 2);
@@ -831,8 +832,6 @@ async function chunkedUpload(file, idx, targetRepoIdx = 0) {
   }
   setQ(idx, 'go', 99);
 }
-const CHUNK_MAX_RETRIES = 2;
-const CHUNK_BACKOFF_MS  = 800;
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 async function xhrChunkWithRetry(b64, rawSize, name, chunkIndex, totalChunks, totalSize, targetRepoIdx, queueIdx) {
   let lastErr;
