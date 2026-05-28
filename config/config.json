@@ -13,7 +13,7 @@
   "small_max_bytes":               5242880,
   "dist_threshold_bytes":         89128960,
   "max_total_chunks":                  512,
-  "upload_concurrency":                  4,
+  "upload_concurrency":                  8,
   "parallel_dl_chunks":                  4,
   "commit_retry_max":                    6,
   "middleware_rate_max":               600,
