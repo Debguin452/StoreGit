@@ -9,8 +9,11 @@ const RATE_MAX_SIGNUP           = 3;
 const RATE_MAX_RESET            = 3;
 const CHUNK_B64_MAX             = 14 * 1024 * 1024;
 const SMALL_MAX_BYTES           =  5 * 1024 * 1024;
-const DIST_THRESHOLD            = 500 * 1024 * 1024; // files > 500 MB spread chunks evenly across all repos
+const DIST_THRESHOLD            = 85 * 1024 * 1024;  // files > 85 MB spread chunks across repos (Cloudflare body limit)
 const MAX_TOTAL_CHUNKS          = 512;
+const COMMIT_RETRY_MAX          = 6;   // optimistic concurrency retries for branch ref updates
+const PARALLEL_DL_CHUNKS        = 4;   // simultaneous chunk fetches during download (sliding window)
+const UPLOAD_CONCURRENCY        = 4;   // advisory: how many chunk uploads client should run in parallel
 const SHA_RE                    = /^[0-9a-f]{40}$/i;
 const USERNAME_RE               = /^[a-zA-Z0-9_\-]{3,32}$/;
 const CLEAN_NAME_RE             = /^[a-zA-Z0-9][a-zA-Z0-9._\-()\s]{0,253}$/;
@@ -68,7 +71,7 @@ const SEC = {
     "connect-src 'self'; frame-ancestors 'none'; form-action 'none'; base-uri 'none';",
   'Cache-Control': 'no-store',
 };
-// allowedOrigins: null = same-origin only, [] = any origin, [...] = whitelist
+// allowedOrigins: null=same-origin, []=any, [...]=whitelist
 function corsHeaders(req, allowedOrigins = null) {
   const o = req.headers.get('Origin') || '';
   const h = req.headers.get('Host')   || '';
@@ -93,27 +96,15 @@ function corsHeaders(req, allowedOrigins = null) {
   };
 }
 
-// ── API key — production-grade entropy design ────────────────────────────────
-//
-//  Format : sgk_<43 Base64URL chars>
-//  Entropy: 32 bytes = 256 bits  (6 bits per char, no modulo bias)
-//  Storage: KV key = "apikey:sha256:<SHA-256 hex of raw key>"
-//           Raw key NEVER persisted — only its SHA-256 digest used as KV key.
-//           If KV is fully dumped, raw keys remain safe.
-//
-//  Why Base64URL over hex:
-//    hex   : 16 bytes → 32 chars → 4.0 bits/char  (128-bit key)
-//    B64URL: 32 bytes → 43 chars → 5.95 bits/char (256-bit key, smaller footprint)
-//
+// API key: sgk_<43 B64URL chars>, 256-bit (SHA-256 stored in KV, raw key never persisted)
 const APIKEY_RE          = /^sgk_[A-Za-z0-9_-]{43}$/; // 43 chars × 6 bits = 258 bits ≥ 256
 const APIKEY_RATE_MAX    = 120;   // requests per minute per key
 const APIKEY_RATE_WINDOW = 60_000;
 
-// Standard RFC 4648 §5 Base64URL alphabet (URL-safe, no padding)
+// RFC 4648 §5 Base64URL alphabet — no padding, URL-safe
 const B64URL_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 
-// Bias-free Base64URL encoder — no modulo of 256 by a non-power-of-two.
-// Processes bytes in groups of 3 → 4 chars (exactly 6 bits per output char).
+// Base64URL encode — 3 raw bytes → 4 chars, no padding
 function base64urlFromBytes(bytes) {
   let out = '';
   for (let i = 0; i < bytes.length; i += 3) {
@@ -127,8 +118,7 @@ function base64urlFromBytes(bytes) {
   return out.slice(0, Math.ceil(bytes.length * 4 / 3));
 }
 
-// Bias-free random string for any alphabet using rejection sampling.
-// Ensures uniform distribution even when alphabetSize doesn't divide 256.
+// Uniform random string from alphabet using rejection sampling (no modulo bias)
 function randomAlphabetString(alphabet, length) {
   const sz     = alphabet.length;
   const cutoff = 256 - (256 % sz); // reject bytes ≥ cutoff to eliminate bias
@@ -144,12 +134,10 @@ function randomAlphabetString(alphabet, length) {
 }
 
 function generateRawApiKey() {
-  // 32 bytes (256 bits) of CSPRNG → 43 Base64URL chars
   return `sgk_${base64urlFromBytes(crypto.getRandomValues(new Uint8Array(32)))}`;
 }
 
-// Store metadata under SHA-256(rawKey) so the actual key is never a KV key.
-// Compromise of KV reveals usernames/labels/origins but NOT the signing secret.
+// Key stored as SHA-256(rawKey) so KV exposure never leaks the raw signing secret
 async function apiKeyKvKey(rawKey) {
   const digest = await crypto.subtle.digest('SHA-256', ENC.encode(rawKey));
   return `apikey:sha256:${hexEnc(new Uint8Array(digest))}`;
@@ -177,7 +165,6 @@ async function resolveApiKey(request, env, secret) {
     return { blocked: true, reason: 'API key rate limit exceeded' };
   }
 
-  // Load full session for this user
   const rec = await getUser(keyData.username, env).catch(() => null);
   if (!rec) return null;
   const { content: user } = rec;
@@ -224,7 +211,6 @@ function b64urlDec(s) {
   const p = s.replace(/-/g,'+').replace(/_/g,'/');
   return b64Dec(p + '='.repeat((4 - p.length%4)%4));
 }
-function ab2b64(buf) { return b64Enc(new Uint8Array(buf)); }
 function hexEnc(u8) { return Array.from(u8).map(b=>b.toString(16).padStart(2,'0')).join(''); }
 async function gitBlobSha(buffer) {
   const prefix = ENC.encode(`blob ${buffer.byteLength}\0`);
@@ -279,8 +265,8 @@ async function timingSafeEq(a, b) {
   let d = 0; for (let i = 0; i < ua.length; i++) d |= ua[i] ^ ub[i];
   return d === 0;
 }
-const PBKDF2_ITERS_CURRENT = 100_000;
-const PBKDF2_ITERS_LEGACY  =  50_000;
+const PBKDF2_ITERS_CURRENT = 100_000; // active hash iterations
+const PBKDF2_ITERS_LEGACY  =  50_000;  // accepted for existing accounts, re-hashed on next login
 async function pbkdf2Hash(password, salt, iterations = PBKDF2_ITERS_CURRENT) {
   const km = await crypto.subtle.importKey('raw', ENC.encode(password), 'PBKDF2', false, ['deriveBits']);
   return new Uint8Array(await crypto.subtle.deriveBits(
@@ -498,10 +484,6 @@ const regH = env => ({
 const regBase = env =>
   `https://api.github.com/repos/${encodeURIComponent(env.REGISTRY_GITHUB_OWNER)}/${encodeURIComponent(env.REGISTRY_GITHUB_REPO)}`;
 
-// ── Runtime config — stored in config/config.json in the registry repo ──────
-// Never exposed via any API. Change via GitHub file edit; takes effect within
-// CONFIG_KV_TTL seconds (KV cache). Falls back to compiled-in defaults if the
-// file is absent or unreadable.
 const CONFIG_KV_KEY = 'storegit:config:v1';
 const CONFIG_KV_TTL = 300; // 5 min
 
@@ -525,12 +507,11 @@ async function loadConfig(env) {
   } catch {}
   return {};
 }
-// Read a numeric config value, falling back to `fallback` if absent/invalid.
+// Safe numeric config read with fallback
 function cn(cfg, key, fallback) {
   const v = cfg[key];
   return (typeof v === 'number' && isFinite(v) && v > 0) ? v : fallback;
 }
-// Build a session object pointed at a specific repo index (no session mutation).
 function getRepoSess(fullSess, repoIdx) {
   const repos = fullSess.repos || [];
   const idx   = (Number.isInteger(repoIdx) && repoIdx >= 0 && repoIdx < repos.length) ? repoIdx : 0;
@@ -592,24 +573,10 @@ async function readIndex(sess) {
   const d = await res.json();
   return { data: JSON.parse(DEC.decode(b64urlDec(d.content.replace(/\s/g,'')))), sha: d.sha };
 }
-// Build a full session pointed at a specific repo index.
-// Requires fullSess.repos to include ghBranch + folder (fixed in getFullSession above).
-function repoSessFor(fullSess, repoIdx) {
-  const repo = fullSess.repos[repoIdx];
-  if (!repo) throw new Error(`invalid_repo_idx:${repoIdx}`);
-  return {
-    ...fullSess,
-    ghOwner:  repo.ghOwner,
-    ghRepo:   repo.ghRepo,
-    ghBranch: repo.ghBranch || 'main',
-    folder:   repo.folder   || 'uploads',
-  };
-}
-// True when a file qualifies for cross-repo distribution.
 function isDistributed(totalSize, repos) {
-  return Number.isInteger(totalSize) && totalSize > DIST_THRESHOLD && Array.isArray(repos) && repos.length > 1;
+  // b64 size is ~4/3 of raw — compare encoded size against Cloudflare body limit
+  return Number.isInteger(totalSize) && Math.ceil(totalSize * 4 / 3) > DIST_THRESHOLD && Array.isArray(repos) && repos.length > 1;
 }
-// Deterministic repo assignment: round-robin by chunk index.
 function chunkRepoIdx(chunkIndex, repos) {
   return chunkIndex % repos.length;
 }
@@ -622,13 +589,6 @@ async function writeIndex(sess, data, existingSha) {
   });
   if (!res.ok) throw new Error('index_write_fail');
 }
-// Compute storage stats from a pre-fetched file list (used by /api/files).
-function computeStorageStats(files) {
-  const totalBytes = files.reduce((sum, f) => sum + (Number(f.size) || 0), 0);
-  return { fileCount: files.length, totalBytes, humanSize: formatBytes(totalBytes) };
-}
-// Cheap single-call storage probe: reads only the index JSON (no directory listing).
-// Used by /api/me and /api/storage where we want per-repo stats without a full listing.
 async function getStorageFromIndex(sess) {
   try {
     const { data: idx } = await readIndex(sess);
@@ -648,6 +608,49 @@ async function createBlob(sess, b64Content) {
   if (!res.ok) throw new Error('blob_fail');
   return (await res.json()).sha;
 }
+// Commit one blob as its own commit; retries on 422 (parallel chunk race on same repo)
+async function commitFileToRepo(sess, filePath, blobSha, message, maxRetries = COMMIT_RETRY_MAX) {
+  const { ghToken, ghOwner, ghRepo, ghBranch } = sess;
+  const gh   = ghH(ghToken);
+  const base = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}`;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    // 1. Read current HEAD
+    const refRes = await fetch(`${base}/git/ref/heads/${encodeURIComponent(ghBranch)}`, { headers: gh });
+    if (!refRes.ok) throw new Error(`ref_fail:${filePath}`);
+    const { object: { sha: headSha } } = await refRes.json();
+    // 2. Read parent tree sha
+    const commitRes = await fetch(`${base}/git/commits/${headSha}`, { headers: gh });
+    if (!commitRes.ok) throw new Error(`commit_read_fail:${filePath}`);
+    const { tree: { sha: treeSha } } = await commitRes.json();
+    // 3. Create a tree containing only this file (base_tree preserves everything else)
+    const treeRes = await fetch(`${base}/git/trees`, {
+      method: 'POST', headers: gh,
+      body: JSON.stringify({ base_tree: treeSha, tree: [{ path: filePath, mode: '100644', type: 'blob', sha: blobSha }] }),
+    });
+    if (!treeRes.ok) throw new Error(`tree_fail:${filePath}`);
+    const { sha: newTreeSha } = await treeRes.json();
+    // 4. Create a commit with a single parent
+    const newCommitRes = await fetch(`${base}/git/commits`, {
+      method: 'POST', headers: gh,
+      body: JSON.stringify({ message, tree: newTreeSha, parents: [headSha] }),
+    });
+    if (!newCommitRes.ok) throw new Error(`commit_fail:${filePath}`);
+    const { sha: newCommit } = await newCommitRes.json();
+    // 5. Advance the branch ref (non-force — safe, append-only)
+    const updateRes = await fetch(`${base}/git/refs/heads/${encodeURIComponent(ghBranch)}`, {
+      method: 'PATCH', headers: gh,
+      body: JSON.stringify({ sha: newCommit, force: false }),
+    });
+    if (updateRes.ok) return newCommit;
+    // 422 = another chunk won the race; re-read HEAD and retry
+    if (updateRes.status === 422 && attempt < maxRetries - 1) {
+      await new Promise(r => setTimeout(r, 120 + attempt * 160 + Math.random() * 80));
+      continue;
+    }
+    throw new Error(`ref_update_fail:${filePath}`);
+  }
+  throw new Error(`ref_update_exhausted:${filePath}`);
+}
 async function uploadSmall(sess, filename, b64) {
   const { ghToken, ghOwner, ghRepo, ghBranch, folder } = sess;
   const url = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/contents/${encodeURIComponent(folder)}/${encodeURIComponent(filename)}`;
@@ -660,93 +663,46 @@ async function uploadSmall(sess, filename, b64) {
   });
   if (!res.ok) throw new Error('upload_fail');
 }
+// Chunks already committed; just commit the manifest file
 async function finalizeChunkedUpload(sess, safeName, blobs, totalSize, chunkSize) {
-  const { ghToken, ghOwner, ghRepo, ghBranch, folder } = sess;
-  const gh   = ghH(ghToken);
-  const base = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}`;
-  const manifest = { name: safeName, totalSize, totalChunks: blobs.length, chunkSize, uploadedAt: new Date().toISOString(), chunks: blobs.map(b => ({ index: b.index, size: b.size, blobSha: b.blobSha })) };
+  const manifest = {
+    name: safeName, totalSize, totalChunks: blobs.length, chunkSize,
+    uploadedAt: new Date().toISOString(),
+    chunks: blobs.slice().sort((a, b) => a.index - b.index)
+                 .map(b => ({ index: b.index, size: b.size, blobSha: b.blobSha })),
+  };
   const manifestBlobSha = await createBlob(sess, utf8b64(JSON.stringify(manifest, null, 2)));
-  const refRes = await fetch(`${base}/git/ref/heads/${ghBranch}`, { headers: gh });
-  if (!refRes.ok) throw new Error('ref_fail');
-  const { object: { sha: headSha } } = await refRes.json();
-  const commitRes = await fetch(`${base}/git/commits/${headSha}`, { headers: gh });
-  if (!commitRes.ok) throw new Error('commit_read_fail');
-  const { tree: { sha: treeSha } } = await commitRes.json();
-  const treeItems = blobs.map(b => ({ path: chunkPath(folder, safeName, b.index), mode: '100644', type: 'blob', sha: b.blobSha }));
-  treeItems.push({ path: manifestP(folder, safeName), mode: '100644', type: 'blob', sha: manifestBlobSha });
-  const newTreeRes = await fetch(`${base}/git/trees`, { method: 'POST', headers: gh, body: JSON.stringify({ base_tree: treeSha, tree: treeItems }) });
-  if (!newTreeRes.ok) throw new Error('tree_fail');
-  const { sha: newTreeSha } = await newTreeRes.json();
-  const newCommitRes = await fetch(`${base}/git/commits`, { method: 'POST', headers: gh, body: JSON.stringify({ message: `Upload ${safeName} (${blobs.length} parts)`, tree: newTreeSha, parents: [headSha] }) });
-  if (!newCommitRes.ok) throw new Error('commit_fail');
-  const { sha: newCommit } = await newCommitRes.json();
-  const updateRes = await fetch(`${base}/git/refs/heads/${ghBranch}`, { method: 'PATCH', headers: gh, body: JSON.stringify({ sha: newCommit, force: false }) });
-  if (!updateRes.ok) throw new Error('ref_update_fail');
+  await commitFileToRepo(
+    sess,
+    manifestP(sess.folder, safeName),
+    manifestBlobSha,
+    `StoreGit manifest: ${safeName} (${blobs.length} parts)`,
+  );
 }
-// Distributed upload finalization: commits chunks to each repo in parallel, then
-// writes a master manifest (with per-chunk routing data) to the active repo.
+// Chunks already committed; write master manifest with per-chunk routing to primary repo
 async function finalizeDistributedUpload(fullSess, safeName, blobs, totalSize, chunkSize) {
   const repos = fullSess.repos;
-  // ── Phase 1: commit each repo's subset of chunks in parallel ──────────────
-  const byRepo = new Map();
-  for (const blob of blobs) {
-    const ri = blob.repoIdx ?? 0;
-    if (!byRepo.has(ri)) byRepo.set(ri, []);
-    byRepo.get(ri).push(blob);
-  }
-  await Promise.all([...byRepo.entries()].map(async ([repoIdx, repoBlobs]) => {
-    const rs = repoSessFor(fullSess, repoIdx);
-    const { ghToken, ghOwner, ghRepo, ghBranch, folder } = rs;
-    const gh   = ghH(ghToken);
-    const base = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}`;
-    const refRes = await fetch(`${base}/git/ref/heads/${ghBranch}`, { headers: gh });
-    if (!refRes.ok) throw new Error(`ref_fail_repo_${repoIdx}`);
-    const { object: { sha: headSha } } = await refRes.json();
-    const commitRes = await fetch(`${base}/git/commits/${headSha}`, { headers: gh });
-    if (!commitRes.ok) throw new Error(`commit_read_fail_repo_${repoIdx}`);
-    const { tree: { sha: treeSha } } = await commitRes.json();
-    const treeItems = repoBlobs.map(b => ({ path: chunkPath(folder, safeName, b.index), mode: '100644', type: 'blob', sha: b.blobSha }));
-    const newTreeRes = await fetch(`${base}/git/trees`, { method: 'POST', headers: gh, body: JSON.stringify({ base_tree: treeSha, tree: treeItems }) });
-    if (!newTreeRes.ok) throw new Error(`tree_fail_repo_${repoIdx}`);
-    const { sha: newTreeSha } = await newTreeRes.json();
-    const newCommitRes = await fetch(`${base}/git/commits`, { method: 'POST', headers: gh, body: JSON.stringify({ message: `StoreGit dist-chunk: ${safeName} [repo ${repoIdx}/${repos.length - 1}]`, tree: newTreeSha, parents: [headSha] }) });
-    if (!newCommitRes.ok) throw new Error(`commit_fail_repo_${repoIdx}`);
-    const { sha: newCommit } = await newCommitRes.json();
-    const updateRes = await fetch(`${base}/git/refs/heads/${ghBranch}`, { method: 'PATCH', headers: gh, body: JSON.stringify({ sha: newCommit, force: false }) });
-    if (!updateRes.ok) throw new Error(`ref_update_fail_repo_${repoIdx}`);
-  }));
-  // ── Phase 2: write master manifest to active repo ─────────────────────────
-  // The manifest embeds full routing data per chunk so download/delete can
-  // reconstruct without knowing the repo topology at that moment.
   const manifest = {
     name: safeName, totalSize, totalChunks: blobs.length, chunkSize,
     distributed: true, repoCount: repos.length,
     uploadedAt: new Date().toISOString(),
     chunks: blobs.slice().sort((a, b) => a.index - b.index).map(b => {
       const repo = repos[b.repoIdx ?? 0] || repos[0];
-      return { index: b.index, size: b.size, blobSha: b.blobSha, repoIdx: b.repoIdx ?? 0,
-               ghOwner: repo.ghOwner, ghRepo: repo.ghRepo,
-               ghBranch: repo.ghBranch || 'main', folder: repo.folder || 'uploads' };
+      return {
+        index:    b.index,    size:     b.size,     blobSha:  b.blobSha,
+        repoIdx:  b.repoIdx ?? 0,
+        ghOwner:  repo.ghOwner,  ghRepo:   repo.ghRepo,
+        ghBranch: repo.ghBranch || 'main',  folder: repo.folder || 'uploads',
+      };
     }),
   };
-  const { ghToken, ghOwner, ghRepo, ghBranch, folder } = fullSess;
-  const gh   = ghH(ghToken);
-  const base = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}`;
   const manifestBlobSha = await createBlob(fullSess, utf8b64(JSON.stringify(manifest, null, 2)));
-  const refRes2 = await fetch(`${base}/git/ref/heads/${ghBranch}`, { headers: gh });
-  if (!refRes2.ok) throw new Error('manifest_ref_fail');
-  const { object: { sha: headSha2 } } = await refRes2.json();
-  const commitRes2 = await fetch(`${base}/git/commits/${headSha2}`, { headers: gh });
-  if (!commitRes2.ok) throw new Error('manifest_commit_read_fail');
-  const { tree: { sha: treeSha2 } } = await commitRes2.json();
-  const newTreeRes2 = await fetch(`${base}/git/trees`, { method: 'POST', headers: gh, body: JSON.stringify({ base_tree: treeSha2, tree: [{ path: manifestP(folder, safeName), mode: '100644', type: 'blob', sha: manifestBlobSha }] }) });
-  if (!newTreeRes2.ok) throw new Error('manifest_tree_fail');
-  const { sha: newTreeSha2 } = await newTreeRes2.json();
-  const newCommitRes2 = await fetch(`${base}/git/commits`, { method: 'POST', headers: gh, body: JSON.stringify({ message: `StoreGit dist-manifest: ${safeName} (${blobs.length} chunks, ${repos.length} repos)`, tree: newTreeSha2, parents: [headSha2] }) });
-  if (!newCommitRes2.ok) throw new Error('manifest_commit_fail');
-  const { sha: newCommit2 } = await newCommitRes2.json();
-  const updateRes2 = await fetch(`${base}/git/refs/heads/${ghBranch}`, { method: 'PATCH', headers: gh, body: JSON.stringify({ sha: newCommit2, force: false }) });
-  if (!updateRes2.ok) throw new Error('manifest_ref_update_fail');
+  await commitFileToRepo(
+    fullSess,
+    manifestP(fullSess.folder, safeName),
+    manifestBlobSha,
+    `StoreGit dist-manifest: ${safeName} (${blobs.length} chunks, ${repos.length} repos)`,
+  );
 }
 async function deleteChunked(sess, safeName) {
   const { ghToken, ghOwner, ghRepo, ghBranch, folder } = sess;
@@ -774,8 +730,7 @@ async function deleteChunked(sess, safeName) {
   const updateRes = await fetch(`${base}/git/refs/heads/${ghBranch}`, { method: 'PATCH', headers: gh, body: JSON.stringify({ sha: newCommit, force: false }) });
   if (!updateRes.ok) throw new Error('ref_update_fail');
 }
-// Deletes a distributed file: reads the manifest to find which chunks live in
-// which repos, removes them in parallel, then removes the manifest itself.
+// Read manifest → delete chunks in parallel across repos → remove manifest
 async function deleteDistributed(fullSess, safeName) {
   const { ghToken, ghOwner, ghRepo, ghBranch, folder } = fullSess;
   const gh   = ghH(ghToken);
@@ -864,8 +819,7 @@ export async function onRequest({ request, env, params }) {
 async function _handleRequest({ request, env, params }) {
   const method = request.method.toUpperCase();
   const route  = (params.path || []).join('/');
-  // Browsers never send X-API-Key values in preflight — only the header *name*
-  // appears in Access-Control-Request-Headers. Enforce auth on the real request.
+  // API key auth only on real requests, not OPTIONS preflights
   if (method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: { ...SEC, ...corsHeaders(request, []) } });
   }
@@ -878,6 +832,8 @@ async function _handleRequest({ request, env, params }) {
       ready,
       version: '1',
       kvAvailable: !!(env.RATE_LIMIT_KV),
+      uploadConcurrency: cn(cfg, 'upload_concurrency', UPLOAD_CONCURRENCY),
+      distThresholdBytes: cn(cfg, 'dist_threshold_bytes', DIST_THRESHOLD),
       ...(!ready && { hint: 'Missing one or more required env vars: REGISTRY_GITHUB_TOKEN, REGISTRY_GITHUB_OWNER, REGISTRY_GITHUB_REPO' }),
       endpoints: {
         public: [
@@ -1044,23 +1000,36 @@ async function _handleRequest({ request, env, params }) {
     } catch {}
     if (manifest) {
       const authHeader = { Authorization:`token ${ghToken}`, 'User-Agent':'StoreGit/1' };
+      const cfg2 = await loadConfig(env).catch(() => ({}));
+      const dlWindow = Math.max(1, cn(cfg2, 'parallel_dl_chunks', PARALLEL_DL_CHUNKS));
+      const fetchChunkDl = async (i) => {
+        const chunkMeta   = manifest.chunks?.[i];
+        const chunkOwner  = chunkMeta?.ghOwner  || ghOwner;
+        const chunkRepo   = chunkMeta?.ghRepo   || ghRepo;
+        const chunkBranch = chunkMeta?.ghBranch || ghBranch;
+        const chunkFolder = chunkMeta?.folder   || folder;
+        const chunkUrl    = `https://raw.githubusercontent.com/${chunkOwner}/${chunkRepo}/${chunkBranch}/${chunkPath(chunkFolder, safe, i)}`;
+        const res = await fetch(chunkUrl, { headers: authHeader });
+        if (!res.ok) throw new Error(`chunk_${i}_missing`);
+        const buf = await res.arrayBuffer();
+        if (chunkMeta?.blobSha) {
+          const actual = await gitBlobSha(buf);
+          if (actual !== chunkMeta.blobSha) throw new Error(`chunk_${i}_corrupt`);
+        }
+        return new Uint8Array(buf);
+      };
       const stream = new ReadableStream({
         async start(controller) {
           try {
-            for (let i = 0; i < manifest.totalChunks; i++) {
-              // For distributed files each chunk records its own repo location.
-              // Fall back to the active repo for regular (non-distributed) manifests.
-              const chunkMeta = manifest.chunks?.[i];
-              const chunkOwner  = chunkMeta?.ghOwner  || ghOwner;
-              const chunkRepo   = chunkMeta?.ghRepo   || ghRepo;
-              const chunkBranch = chunkMeta?.ghBranch || ghBranch;
-              const chunkFolder = chunkMeta?.folder   || folder;
-              const chunkUrl = `https://raw.githubusercontent.com/${chunkOwner}/${chunkRepo}/${chunkBranch}/${chunkPath(chunkFolder, safe, i)}`;
-              const res = await fetch(chunkUrl, { headers: authHeader });
-              if (!res.ok) { controller.error(new Error(`chunk_${i}_missing`)); return; }
-              const buf = await res.arrayBuffer();
-              if (chunkMeta?.blobSha) { const actual = await gitBlobSha(buf); if (actual !== chunkMeta.blobSha) { controller.error(new Error(`chunk_${i}_corrupt`)); return; } }
-              controller.enqueue(new Uint8Array(buf));
+            const total   = manifest.totalChunks;
+            const pending = new Map();
+            for (let i = 0; i < Math.min(dlWindow, total); i++) pending.set(i, fetchChunkDl(i));
+            for (let i = 0; i < total; i++) {
+              const data = await pending.get(i);
+              pending.delete(i);
+              const next = i + dlWindow;
+              if (next < total) pending.set(next, fetchChunkDl(next));
+              controller.enqueue(data);
             }
             controller.close();
           } catch (e) { controller.error(e); }
@@ -1108,7 +1077,6 @@ async function _handleRequest({ request, env, params }) {
     catch { return fail(request, 502); }
     return jsonRes(request, { ok:true });
   }
-  // ── Try API key auth first ────────────────────────────────────────────────
   const apiKeyHeader = request.headers.get('X-API-Key') || '';
   if (apiKeyHeader) {
     const akResult = await resolveApiKey(request, env, secret);
@@ -1120,7 +1088,6 @@ async function _handleRequest({ request, env, params }) {
     return _dispatchRoute(route, method, request, env, akResult.fullSess, null, secret, akResult.allowedOrigins, cfg);
   }
 
-  // ── Session cookie auth ───────────────────────────────────────────────────
   const rawToken = readSessionCookie(request);
   const sess     = await verifyToken(rawToken, secret);
   if (!sess) return fail(request, 401);
@@ -1146,8 +1113,6 @@ async function _handleRequest({ request, env, params }) {
 }
 async function _dispatchRoute(route, method, request, env, fullSess, sess, secret, apiKeyOrigins = null, cfg = {}) {
   const cors = corsHeaders(request, apiKeyOrigins);
-  // Config-derived limits (fall back to compiled-in defaults)
-  const C_SESSION_TTL        = cn(cfg, 'session_ttl_ms',            SESSION_TTL);
   const C_SHARE_TTL_MAX      = cn(cfg, 'share_ttl_max_seconds',      SHARE_TTL_MAX);
   const C_CHUNK_B64_MAX      = cn(cfg, 'chunk_b64_max',              CHUNK_B64_MAX);
   const C_SMALL_MAX_BYTES    = cn(cfg, 'small_max_bytes',            SMALL_MAX_BYTES);
@@ -1155,6 +1120,8 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
   const C_MAX_TOTAL_CHUNKS   = cn(cfg, 'max_total_chunks',           MAX_TOTAL_CHUNKS);
   const C_MAX_REPOS          = cn(cfg, 'max_repos_per_user',         20);
   const C_MAX_APIKEYS        = cn(cfg, 'max_apikeys_per_user',       10);
+  const C_PARALLEL_DL        = cn(cfg, 'parallel_dl_chunks',        PARALLEL_DL_CHUNKS);
+  const C_COMMIT_RETRIES     = cn(cfg, 'commit_retry_max',          COMMIT_RETRY_MAX);
   function jRes(data, status=200, extra={}) {
     return new Response(JSON.stringify(data), { status, headers: { ...SEC, ...cors, 'Content-Type':'application/json', ...extra } });
   }
@@ -1171,7 +1138,6 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
   if (route === 'repos' && method === 'GET') {
     return jRes({ repos: fullSess.repos, activeRepoIdx: fullSess.activeRepoIdx });
   }
-  // ── Storage breakdown — all repos in parallel ──────────────────────────────
   // Returns per-repo stats derived from each repo's index file.
   // One GitHub API call per repo, all fired concurrently.
   if (route === 'storage' && method === 'GET') {
@@ -1208,8 +1174,6 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     });
   }
   if (route === 'switch-repo' && method === 'POST') {
-    // Active-repo concept removed. All repos are a shared pool — no switching needed.
-    // Clients should pass repoIdx directly in upload/download/delete requests.
     return jRes({ ok: true, deprecated: 'switch-repo is no longer needed. Pass repoIdx per-request instead.' });
   }
   if (route === 'add-repo' && method === 'POST') {
@@ -1260,7 +1224,6 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     return jRes({ ok: true, repos: repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo })) });
   }
 
-  // ── API Key management (session only) ─────────────────────────────────────
   if (route === 'apikeys/list' && method === 'GET') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
     const rec = await getUser(sess.username, env);
@@ -1413,7 +1376,6 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     if (!safe) return jRes({ error: ERRS[415] },415);
     if (!checkMagicBase64(b64)) return jRes({ error: ERRS[415] },415);
     const decodedSize = Math.floor(b64.length * 3 / 4);
-    // Route to specified repo (or repo 0 if not specified)
     const uploadSess = getRepoSess(fullSess, typeof targetRepoIdx === 'number' ? targetRepoIdx : 0);
     try {
       if (decodedSize > C_SMALL_MAX_BYTES) {
@@ -1456,9 +1418,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     if (!safe) return jRes({ error: ERRS[415] },415);
     if (chunkIdx === 0 && !checkMagicBase64(b64)) return jRes({ error: ERRS[415] },415);
     const decodedSize = Math.floor(b64.length * 3 / 4);
-    // Route chunk to its target repo.
-    // Client specifies targetRepoIdx for smart routing; server validates.
-    // For distributed files (>threshold with multiple repos) we spread round-robin.
+    // Assign chunk to repo: round-robin for distributed, else targetRepoIdx (default 0)
     const dist = isDistributed(totalSize, fullSess.repos);
     const resolvedRepoIdx = dist
       ? chunkRepoIdx(chunkIdx, fullSess.repos)
@@ -1466,7 +1426,13 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const targetSess = getRepoSess(fullSess, resolvedRepoIdx);
     const jti = sess ? sess.jti : `ak:${fullSess.username}`;
     try {
-      const blobSha   = await createBlob(targetSess, b64);
+      // 1. Store the chunk content as a Git blob (fast — no tree/commit yet)
+      const blobSha = await createBlob(targetSess, b64);
+      // 2. Immediately commit this chunk as its own standalone commit.
+      const commitMsg = dist
+        ? `StoreGit dist-chunk: ${safe} [${chunkIdx}/${tot - 1}] repo ${resolvedRepoIdx}`
+        : `StoreGit chunk: ${safe} [${chunkIdx}/${tot - 1}]`;
+      await commitFileToRepo(targetSess, chunkPath(targetSess.folder, safe, chunkIdx), blobSha, commitMsg);
       const blobToken = await blobTokenSign(jti, safe, chunkIdx, blobSha, secret);
       return jRes({ ok: true, blobSha, blobToken, index: chunkIdx, size: decodedSize, repoIdx: resolvedRepoIdx, distributed: dist });
     } catch { return jRes({ error: ERRS[502] }, 502); }
@@ -1483,7 +1449,6 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const safe = sanitize(String(name));
     if (!safe) return jRes({ error: ERRS[415] }, 415);
     const dist = isDistributed(totalSize, fullSess.repos);
-    // Use specified repo for non-distributed uploads
     const finalSess = dist ? fullSess : getRepoSess(fullSess, Number.isInteger(targetRepoIdx) ? targetRepoIdx : 0);
     const jti = sess ? sess.jti : `ak:${fullSess.username}`;
     for (const b of blobs) {
@@ -1532,21 +1497,41 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     } catch {}
     if (manifest) {
       const authHeader = { Authorization:`token ${ghToken}`, 'User-Agent':'StoreGit/1' };
+      // Keep C_PARALLEL_DL fetches in-flight simultaneously.
+      const fetchChunk = async (i) => {
+        const chunkMeta   = manifest.chunks?.[i];
+        const chunkOwner  = chunkMeta?.ghOwner  || ghOwner;
+        const chunkRepo   = chunkMeta?.ghRepo   || ghRepo;
+        const chunkBranch = chunkMeta?.ghBranch || ghBranch;
+        const chunkFolder = chunkMeta?.folder   || folder;
+        const chunkUrl    = `https://raw.githubusercontent.com/${chunkOwner}/${chunkRepo}/${chunkBranch}/${chunkPath(chunkFolder, safe, i)}`;
+        const res = await fetch(chunkUrl, { headers: authHeader });
+        if (!res.ok) throw new Error(`chunk_${i}_missing`);
+        const buf = await res.arrayBuffer();
+        if (chunkMeta?.blobSha) {
+          const actual = await gitBlobSha(buf);
+          if (actual !== chunkMeta.blobSha) throw new Error(`chunk_${i}_corrupt`);
+        }
+        return new Uint8Array(buf);
+      };
       const stream = new ReadableStream({
         async start(controller) {
           try {
-            for (let i = 0; i < manifest.totalChunks; i++) {
-              const chunkMeta = manifest.chunks?.[i];
-              const chunkOwner  = chunkMeta?.ghOwner  || ghOwner;
-              const chunkRepo   = chunkMeta?.ghRepo   || ghRepo;
-              const chunkBranch = chunkMeta?.ghBranch || ghBranch;
-              const chunkFolder = chunkMeta?.folder   || folder;
-              const chunkUrl = `https://raw.githubusercontent.com/${chunkOwner}/${chunkRepo}/${chunkBranch}/${chunkPath(chunkFolder, safe, i)}`;
-              const res = await fetch(chunkUrl, { headers: authHeader });
-              if (!res.ok) { controller.error(new Error(`chunk_${i}_missing`)); return; }
-              const buf = await res.arrayBuffer();
-              if (chunkMeta?.blobSha) { const actual = await gitBlobSha(buf); if (actual !== chunkMeta.blobSha) { controller.error(new Error(`chunk_${i}_corrupt`)); return; } }
-              controller.enqueue(new Uint8Array(buf));
+            const total  = manifest.totalChunks;
+            const window = Math.max(1, C_PARALLEL_DL);
+            // Pre-launch first window of fetches
+            const pending = new Map();
+            for (let i = 0; i < Math.min(window, total); i++) {
+              pending.set(i, fetchChunk(i));
+            }
+            for (let i = 0; i < total; i++) {
+              // Await the chunk whose turn it is (may already be resolved)
+              const data = await pending.get(i);
+              pending.delete(i);
+              // Immediately launch the next chunk to keep the window full
+              const next = i + window;
+              if (next < total) pending.set(next, fetchChunk(next));
+              controller.enqueue(data);
             }
             controller.close();
           } catch (e) { controller.error(e); }
