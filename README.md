@@ -2,6 +2,12 @@
 
 > A serverless file-storage platform built on **Cloudflare Pages Functions** and the **GitHub Contents / Git Data APIs**. Each user connects their own GitHub repository as storage. You deploy one Cloudflare Pages project; users bring their own GitHub repo and personal access token.
 
+[![Live Site](https://img.shields.io/badge/Live%20Site-storegit.pages.dev-F38020?style=flat-square&logo=cloudflare&logoColor=white)](https://storegit.pages.dev/)
+
+[![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
+
+[![Cloudflare Pages](https://img.shields.io/badge/Deployed%20on-Cloudflare%20Pages-F38020?style=flat-square&logo=cloudflare&logoColor=white)](https://pages.cloudflare.com/)
+
 ---
 
 ## Table of Contents
