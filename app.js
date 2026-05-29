@@ -1,25 +1,14 @@
 'use strict';
-// ── Per-request size limits ───────────────────────────────────────────────────
-// CHUNK_THRESHOLD: switch from single-POST upload to chunked upload above this.
-// Must stay well below the server's per-chunk b64 limit (~10.5 MB raw = 14 MB b64).
-// Never derived from distThresholdBytes — that is a server-side repo-routing concept.
-let CHUNK_THRESHOLD  = 8 * 1024 * 1024;   // 8 MB raw → ~10.7 MB b64, under 14 MB server cap
-let MAX_FILE_SIZE    = 10 * 1024 * 1024 * 1024; // 10 GB (1024 chunks × 10 MB; needs 2+ repos beyond 5 GB)
-// Dynamic concurrency: hw threads × 2, capped at 16 to avoid GitHub rate-limit
-let UPLOAD_CONCURRENCY = Math.min(16, ((typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4) * 2);
-// Dynamic chunk size based on file size.
-// All sizes produce b64 well under the server's 14 MB CHUNK_B64_MAX.
-function getChunkSize(fileSize) {
-  if (fileSize >= 1024 * 1024 * 1024) return 10 * 1024 * 1024; // ≥1 GB  → 10 MB raw (~13.3 MB b64)
-  if (fileSize >= 100  * 1024 * 1024) return  8 * 1024 * 1024; // ≥100 MB →  8 MB raw (~10.7 MB b64)
-  return 6 * 1024 * 1024;                                        // <100 MB →  6 MB raw (~8 MB b64)
-}
+let CHUNK_THRESHOLD = 5  * 1024 * 1024;  // switch to chunked upload above this raw size
+let CHUNK_SIZE      = 10 * 1024 * 1024;  // raw bytes per chunk (~13.3 MB b64, under 14 MB limit)
+let MAX_FILE_SIZE   = 5  * 1024 * 1024 * 1024;
+let UPLOAD_CONCURRENCY = 4;              // parallel chunk uploads; overridden by server config
 let loginLocked      = false;
 let uploadPending    = [];
 let _signupData      = {};
 let _uploadActive    = false;
 let _uploadPaused    = false;
-const _uploadAbortFns = new Set(); // abort callbacks for all active XHRs (parallel workers)
+let _uploadAbortFn   = null;
 let _shareFile       = null;
 let _allRepos        = [];
 let _repoFiles       = [];   // [{repo, repoIdx, files}] for all repos
@@ -33,11 +22,10 @@ const _sliceCache = new WeakMap();
 function precacheSlices(file) {
   if (file.size <= CHUNK_THRESHOLD) return;
   if (_sliceCache.has(file)) return;
-  const chunkSize = getChunkSize(file.size);
-  const totalChunks = Math.ceil(file.size / chunkSize);
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
   const slices = Array.from({ length: totalChunks }, (_, i) => {
-    const start = i * chunkSize;
-    return file.slice(start, Math.min(start + chunkSize, file.size));
+    const start = i * CHUNK_SIZE;
+    return file.slice(start, Math.min(start + CHUNK_SIZE, file.size));
   });
   _sliceCache.set(file, slices);
 }
@@ -53,11 +41,9 @@ function precacheSlices(file) {
         '</div>';
       showScreen('login'); return;
     }
-    // chunkMaxRawBytes: server-advertised safe per-chunk raw size (derived from its b64 cap).
-    // Use 85% of it so we stay safely under after base64 encoding overhead.
-    // NEVER use distThresholdBytes for CHUNK_THRESHOLD — that controls repo distribution, not chunk size.
-    if (d.chunkMaxRawBytes > 0) CHUNK_THRESHOLD = Math.floor(d.chunkMaxRawBytes * 0.85);
-    if (d.uploadConcurrency > 0) UPLOAD_CONCURRENCY = Math.min(16, d.uploadConcurrency);
+    // Apply server-side speed config to client constants
+    if (d.uploadConcurrency > 0)   UPLOAD_CONCURRENCY = d.uploadConcurrency;
+    if (d.distThresholdBytes > 0)  CHUNK_THRESHOLD    = Math.round(d.distThresholdBytes * 3 / 4);
   } catch {}
   try {
     const r = await fetch('/api/me', { credentials:'same-origin' });
@@ -666,11 +652,11 @@ function renderQueue() {
     const badge=elem('div','queue-file-icon'); badge.textContent=fileExt(it.file.name); badge.style.background=fileColor(fileExtRaw(it.file.name)); badge.style.color='#fff';
     const info=elem('div','queue-info');
     const nm=elem('div','queue-name'); nm.textContent=it.file.name;
-    const prog=elem('div','queue-size');
-    prog.id=`qprog-${i}`; prog.textContent=fmtSize(it.file.size);
+    const sz=elem('div','queue-size');
+    sz.textContent=fmtSize(it.file.size);
     const bar=elem('div','queue-bar'), fill=elem('div','queue-fill');
     fill.id=`qfill-${i}`; bar.appendChild(fill);
-    info.append(nm,prog,bar);
+    info.append(nm,sz,bar);
     const st=elem('span',`queue-status ${it.status}`); st.id=`qstat-${i}`; st.textContent=statusLabel(it.status);
     if (it.status === 'fail' || it.status === 'paused') {
       const retry = elem('button', 'queue-retry-btn');
@@ -686,16 +672,17 @@ function renderQueue() {
 async function retryItem(idx) {
   const st = uploadPending[idx]?.status;
   if (st !== 'fail' && st !== 'paused') return;
+  const targetRepoIdx = getSmartRepoIdx();
   const btn = document.getElementById('upload-btn');
   btn.disabled = true; btn.textContent = 'Uploading…';
   setQ(idx, 'go', 0);
   try {
     if (uploadPending[idx].file.size > CHUNK_THRESHOLD) {
-      await chunkedUpload(uploadPending[idx].file, idx);
+      await chunkedUpload(uploadPending[idx].file, idx, targetRepoIdx);
     } else {
-      await xhrUpload(uploadPending[idx].file, idx);
+      await xhrUpload(uploadPending[idx].file, idx, targetRepoIdx);
     }
-    setQ(idx, 'ok', 100, uploadPending[idx].file.size);
+    setQ(idx, 'ok', 100);
     toast('File uploaded.', 'ok');
     loadFiles();
   } catch (e) {
@@ -714,14 +701,10 @@ function togglePause() {
   if (_uploadPaused) {
     _uploadPaused = false;
     renderQueue();
-    // Resume: fire all pending abort-to-pause callbacks so workers re-check the flag
-    const fns = [..._uploadAbortFns]; _uploadAbortFns.clear();
-    fns.forEach(fn => { try { fn(); } catch {} });
+    if (_uploadAbortFn) { const fn = _uploadAbortFn; _uploadAbortFn = null; fn(); }
   } else {
     _uploadPaused = true;
-    // Abort every in-flight XHR — each worker registers its own abort fn
-    const fns = [..._uploadAbortFns]; _uploadAbortFns.clear();
-    fns.forEach(fn => { try { fn(); } catch {} });
+    if (_uploadAbortFn) { _uploadAbortFn(); _uploadAbortFn = null; }
     renderQueue();
     toast('Upload paused.', '');
   }
@@ -729,6 +712,8 @@ function togglePause() {
 async function startUpload() {
   if (_uploadActive) return;
   if (!uploadPending.length) return;
+  // Pick least-loaded repo — pure function, no switch-repo API call needed
+  const targetRepoIdx = getSmartRepoIdx();
   _uploadActive = true;
   _uploadPaused = false;
   renderQueue();
@@ -739,17 +724,17 @@ async function startUpload() {
     setQ(i, 'go', 0);
     try {
       if (it.file.size > CHUNK_THRESHOLD) {
-        await chunkedUpload(it.file, i);
+        await chunkedUpload(it.file, i, targetRepoIdx);
       } else {
-        await xhrUpload(it.file, i);
+        await xhrUpload(it.file, i, targetRepoIdx);
       }
-      if (it.status !== 'paused') setQ(i, 'ok', 100, it.file.size);
+      if (it.status !== 'paused') setQ(i, 'ok', 100);
     } catch(e) {
       if (e.message !== '__paused__') { setQ(i, 'fail', 0); toast(e.message, 'error'); }
     }
   }
   _uploadActive = false;
-  _uploadAbortFns.clear();
+  _uploadAbortFn = null;
   renderQueue();
   const failed = uploadPending.filter(p => p.status === 'fail').length;
   const paused = uploadPending.filter(p => p.status === 'paused' || p.status === 'wait').length;
@@ -769,136 +754,129 @@ function blobToBase64(blob) {
     r.readAsDataURL(blob);
   });
 }
-async function xhrUpload(file, idx) {
+async function xhrUpload(file, idx, targetRepoIdx = 0) {
   setQ(idx, 'go', 5);
   const b64 = await blobToBase64(file);
   if (_uploadPaused) { setQ(idx, 'paused', 30); throw new Error('__paused__'); }
   setQ(idx, 'go', 30);
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    const abortFn = () => { xhr.abort(); setQ(idx, 'paused', 30); reject(new Error('__paused__')); };
-    _uploadAbortFns.add(abortFn);
+    _uploadAbortFn = () => { xhr.abort(); setQ(idx, 'paused', 30); reject(new Error('__paused__')); };
     xhr.open('POST', '/api/upload');
     xhr.withCredentials = true;
     xhr.setRequestHeader('Content-Type', 'application/json');
     xhr.upload.onprogress = e => {
-      if (e.lengthComputable) setQ(idx, 'go', 30 + Math.round(e.loaded / e.total * 65), Math.round(e.loaded * 3 / 4));
+      if (e.lengthComputable) setQ(idx, 'go', 30 + Math.round(e.loaded / e.total * 65));
     };
     xhr.onload = () => {
-      _uploadAbortFns.delete(abortFn);
+      _uploadAbortFn = null;
       if (xhr.status === 200) { resolve(); return; }
       if (xhr.status === 401) { doLogout(); reject(new Error('Session expired.')); return; }
       let msg = 'Upload failed.'; try { msg = JSON.parse(xhr.responseText).error || msg; } catch {}
       reject(new Error(msg));
     };
-    xhr.onerror   = () => { _uploadAbortFns.delete(abortFn); reject(new Error('Network error.')); };
-    xhr.ontimeout = () => { _uploadAbortFns.delete(abortFn); reject(new Error('Upload timed out.')); };
+    xhr.onerror   = () => { _uploadAbortFn = null; reject(new Error('Network error.')); };
+    xhr.ontimeout = () => { _uploadAbortFn = null; reject(new Error('Upload timed out.')); };
     xhr.timeout   = 10 * 60 * 1000;
-    xhr.send(JSON.stringify({ name: file.name, content: b64 }));
+    xhr.send(JSON.stringify({ name: file.name, content: b64, targetRepoIdx }));
   });
 }
-const CHUNK_MAX_RETRIES = 3;
-const CHUNK_BACKOFF_MS  = 1000;
-async function chunkedUpload(file, idx) {
-  const chunkSize   = getChunkSize(file.size);
-  const totalChunks = Math.ceil(file.size / chunkSize);
-  setQ(idx, 'go', 2, 0);
-  // Use pre-cached slices if available (set by precacheSlices on file pick)
+const CHUNK_MAX_RETRIES = 2;
+const CHUNK_BACKOFF_MS  = 800;
+async function chunkedUpload(file, idx, targetRepoIdx = 0) {
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+  setQ(idx, 'go', 2);
   const slices = _sliceCache.get(file) || Array.from({ length: totalChunks }, (_, i) => {
-    const start = i * chunkSize;
-    return file.slice(start, Math.min(start + chunkSize, file.size));
+    const start = i * CHUNK_SIZE;
+    return file.slice(start, Math.min(start + CHUNK_SIZE, file.size));
   });
   if (!_sliceCache.has(file)) _sliceCache.set(file, slices);
+  const encoded = await Promise.all(slices.map(s => blobToBase64(s)));
+  setQ(idx, 'go', 18);
   const blobs      = new Array(totalChunks);
-  let doneCount    = 0;
-  let uploadedBytes = 0;
+  let  doneCount   = 0;
   const indexQueue = Array.from({ length: totalChunks }, (_, i) => i);
   const runWorker = async () => {
     while (indexQueue.length > 0) {
       if (_uploadPaused) {
         const remaining = indexQueue.splice(0);
         indexQueue.push(...remaining);
-        setQ(idx, 'paused', 2 + Math.round((doneCount / totalChunks) * 92), uploadedBytes);
+        setQ(idx, 'paused', 18 + Math.round((doneCount / totalChunks) * 74));
         throw new Error('__paused__');
       }
       const i = indexQueue.shift();
-      // Encode just-in-time — avoids spike from pre-encoding all chunks at once
-      const b64 = await blobToBase64(slices[i]);
-      const result = await xhrChunkWithRetry(b64, slices[i].size, file.name, i, totalChunks, file.size, idx);
-      blobs[i] = { index: i, blobSha: result.blobSha, blobToken: result.blobToken, size: slices[i].size, repoIdx: result.repoIdx ?? 0 };
-      uploadedBytes += slices[i].size;
+      const result = await xhrChunkWithRetry(
+        encoded[i], slices[i].size, file.name, i, totalChunks, file.size, targetRepoIdx, idx
+      );
+      blobs[i] = { index: i, blobSha: result.blobSha, blobToken: result.blobToken, size: slices[i].size, repoIdx: result.repoIdx ?? targetRepoIdx };
       doneCount++;
-      setQ(idx, 'go', 2 + Math.round((doneCount / totalChunks) * 92), uploadedBytes);
+      setQ(idx, 'go', 18 + Math.round((doneCount / totalChunks) * 74));
     }
   };
-  await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, totalChunks) }, runWorker));
-  setQ(idx, 'go', 95, uploadedBytes);
+  await Promise.all(
+    Array.from({ length: Math.min(UPLOAD_CONCURRENCY, totalChunks) }, runWorker)
+  );
+  setQ(idx, 'go', 93);
   const fr = await fetch('/api/finalize-upload', {
     method: 'POST', credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: file.name, totalSize: file.size, totalChunks, chunkSize, blobs }),
+    body: JSON.stringify({
+      name: file.name, totalSize: file.size,
+      totalChunks, chunkSize: CHUNK_SIZE, blobs, targetRepoIdx,
+    }),
   });
   if (fr.status === 401) { doLogout(); throw new Error('Session expired.'); }
   if (!fr.ok) {
     const d = await fr.json().catch(() => ({}));
     throw new Error(d.error || 'Finalize failed.');
   }
-  setQ(idx, 'go', 99, file.size);
+  setQ(idx, 'go', 99);
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-async function xhrChunkWithRetry(b64, rawSize, name, chunkIndex, totalChunks, totalSize, queueIdx) {
+async function xhrChunkWithRetry(b64, rawSize, name, chunkIndex, totalChunks, totalSize, targetRepoIdx, queueIdx) {
   let lastErr;
   for (let attempt = 0; attempt <= CHUNK_MAX_RETRIES; attempt++) {
-    if (attempt > 0) await sleep(CHUNK_BACKOFF_MS * Math.pow(2, attempt - 1));
+    if (attempt > 0) {
+      await sleep(CHUNK_BACKOFF_MS * Math.pow(2, attempt - 1));
+    }
     try {
-      return await xhrChunkEncoded(b64, rawSize, name, chunkIndex, totalChunks, totalSize, queueIdx);
+      return await xhrChunkEncoded(b64, rawSize, name, chunkIndex, totalChunks, totalSize, targetRepoIdx, queueIdx);
     } catch (err) {
-      // Don't retry on pause or auth errors — propagate immediately
-      if (err.message === 'Session expired.' || err.message === '__paused__') throw err;
+      if (err.message === 'Session expired.') throw err;
       lastErr = err;
     }
   }
   throw lastErr;
 }
-async function xhrChunkEncoded(b64, rawSize, name, chunkIndex, totalChunks, totalSize, queueIdx) {
+async function xhrChunkEncoded(b64, rawSize, name, chunkIndex, totalChunks, totalSize, targetRepoIdx, queueIdx) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    const abortFn = () => { xhr.abort(); reject(new Error('__paused__')); };
-    _uploadAbortFns.add(abortFn);
+    _uploadAbortFn = () => { xhr.abort(); reject(new Error('__paused__')); };
     xhr.open('POST', '/api/upload-chunk');
     xhr.withCredentials = true;
     xhr.setRequestHeader('Content-Type', 'application/json');
-    xhr.timeout = 8 * 60 * 1000; // 8 min — generous for slow connections
+    xhr.timeout   = 5 * 60 * 1000;
     xhr.onload = () => {
-      _uploadAbortFns.delete(abortFn);
+      _uploadAbortFn = null;
       if (xhr.status === 200) { resolve(JSON.parse(xhr.responseText)); return; }
       if (xhr.status === 401) { doLogout(); reject(new Error('Session expired.')); return; }
       let msg = `Upload error on segment ${chunkIndex + 1}.`;
       try { msg = JSON.parse(xhr.responseText).error || msg; } catch {}
       reject(new Error(msg));
     };
-    xhr.onerror   = () => { _uploadAbortFns.delete(abortFn); reject(new Error('Network error.')); };
-    xhr.ontimeout = () => { _uploadAbortFns.delete(abortFn); reject(new Error('Upload segment timed out.')); };
-    xhr.send(JSON.stringify({ name, chunkIndex, totalChunks, totalSize, content: b64 }));
+    xhr.onerror   = () => { _uploadAbortFn = null; reject(new Error('Network error.')); };
+    xhr.ontimeout = () => { _uploadAbortFn = null; reject(new Error('Upload segment timed out.')); };
+    xhr.send(JSON.stringify({ name, chunkIndex, totalChunks, totalSize, targetRepoIdx, content: b64 }));
   });
 }
-function setQ(i, status, pct, uploadedBytes) {
+function setQ(i, status, pct) {
   uploadPending[i].status = status;
   const st   = document.getElementById(`qstat-${i}`);
   const fill = document.getElementById(`qfill-${i}`);
-  const prog = document.getElementById(`qprog-${i}`);
   if (st) { st.className = `queue-status ${status}`; st.textContent = statusLabel(status); }
   if (fill) {
     fill.style.width = pct + '%';
-    if (status === 'go') fill.classList.add('wave'); else fill.classList.remove('wave');
-  }
-  if (prog) {
-    const total = uploadPending[i].file.size;
-    if (status === 'go' && uploadedBytes != null && total > 0) {
-      prog.textContent = `${fmtSize(uploadedBytes)} / ${fmtSize(total)}`;
-    } else {
-      prog.textContent = fmtSize(total);
-    }
+    if (status === 'go') { fill.classList.add('wave'); } else { fill.classList.remove('wave'); }
   }
 }
 function statusLabel(s){return{wait:'Ready',go:'Uploading…',ok:'Done',fail:'Failed',paused:'Paused'}[s]||s;}
@@ -981,18 +959,12 @@ async function loadFilePreview(f) {
   const inlineUrl = `/api/download?name=${encodeURIComponent(f.name)}&repoIdx=${_currentFileRepoIdx}&inline=1`;
   if (FD_IMG.has(ext)) {
     if (f.size > 20 * 1024 * 1024) { noPreview('Image too large to preview.<br>Download to view.'); return; }
-    // Show skeleton shimmer immediately — prevents black flash while image loads
-    const skeleton = document.createElement('div');
-    skeleton.className = 'fd-preview-skeleton';
-    el.replaceChildren(skeleton);
     const _img = document.createElement('img');
     _img.className = 'fd-preview-img';
-    _img.style.display = 'none';
     _img.alt = f.name;
-    _img.onload  = () => { skeleton.remove(); _img.style.display = ''; };
-    _img.onerror = () => { skeleton.remove(); noPreview('Could not load image preview.'); };
-    el.appendChild(_img);
-    _img.src = inlineUrl;
+    _img.onerror = () => noPreview('Could not load image preview.');
+    el.replaceChildren(_img);
+    _img.src = inlineUrl; // set src after attaching so onerror fires correctly
     return;
   }
   if (FD_AUDIO.has(ext)) {
