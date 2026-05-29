@@ -193,6 +193,13 @@ body {
 .fd-close svg { width: 14px; height: 14px; stroke: #2563eb; stroke-width: 2; fill: none; stroke-linecap: round; stroke-linejoin: round; }
 .fd-preview { flex: 1; overflow-y: auto; padding: 1rem 1.1rem; min-height: 80px; }
 .fd-preview-img { max-width: 100%; max-height: 300px; object-fit: contain; border-radius: 10px; display: block; margin: 0 auto; border: 1px solid #dbeafe; }
+.fd-preview-skeleton {
+  width: 100%; min-height: 180px; border-radius: 10px;
+  background: linear-gradient(90deg, #e8f0fe 25%, #d1e3ff 50%, #e8f0fe 75%);
+  background-size: 300% 100%;
+  animation: skeletonWave 1.4s ease-in-out infinite;
+  aspect-ratio: 16/9; /* reserves space so panel doesn't jump when image loads */
+}
 .fd-preview-code { background: #f8faff; border-radius: 10px; padding: .85rem; margin: 0; font-family: 'SF Mono','Fira Code',ui-monospace,monospace; font-size: .73rem; line-height: 1.65; color: #2a2a2a; overflow-x: auto; white-space: pre-wrap; word-break: break-all; max-height: 260px; overflow-y: auto; }
 .fd-preview-audio { width: 100%; margin-top: .5rem; }
 .fd-preview-video { width: 100%; border-radius: 10px; background: #000; display: block; }
@@ -322,6 +329,7 @@ body {
   .fd-preview-none { color: #555; }
   .fd-preview-none-icon { color: #555; opacity: .6; }
   .fd-preview-loading   { color: #3b5a8a; }
+  .fd-preview-skeleton  { background: linear-gradient(90deg, #1a2035 25%, #1e2e50 50%, #1a2035 75%); background-size: 300% 100%; }
   .fd-actions      { border-top-color: #1e2e50; }
 }
 @media (max-width: 380px) { .auth-card { padding: 1.6rem 1.1rem; } .app-body { padding: 1rem .75rem 4rem; } .app-topbar { padding: 0 .85rem; } }
