@@ -1064,6 +1064,10 @@ async function _handleRequest({ request, env, params }) {
   if (route === 'signup' && method === 'POST') {
     const ip = getIP(request);
     if (await checkRate(`signup:${ip}`, RATE_MAX_SIGNUP, env)) return fail(request, 429);
+    // Fail fast if the registry is not configured — avoids misleading "Upstream error"
+    // after the user has already filled in valid credentials.
+    if (!env.REGISTRY_GITHUB_TOKEN || !env.REGISTRY_GITHUB_OWNER || !env.REGISTRY_GITHUB_REPO)
+      return jsonRes(request, { error: 'Registration is not available (service misconfigured)' }, 503);
     let body; try { body = await request.json(); } catch { return fail(request, 400); }
     const { username, password, ghToken, ghOwner, ghRepo, ghBranch='main', folder='uploads' } = body||{};
     if (!username||!password||!ghToken||!ghOwner||!ghRepo) return fail(request, 400);
@@ -1098,7 +1102,28 @@ async function _handleRequest({ request, env, params }) {
       createdAt: new Date().toISOString(),
     };
     try { await writeReg(userPath(username), userRecord, `Register ${username.toLowerCase()}`, env); }
-    catch { return fail(request, 502); }
+    catch (regErr) {
+      // Surface a meaningful error instead of the opaque "Upstream error".
+      // Common causes: registry token expired/missing write access, or the
+      // registry repo itself does not exist.
+      const msg = regErr?.message || '';
+      if (msg === 'reg_write_fail') {
+        // Probe the registry repo so we can give a precise reason.
+        let regStatus = 0;
+        try {
+          const probe = await fetch(
+            `${regBase(env)}/contents/`,
+            { headers: regH(env) }
+          );
+          regStatus = probe.status;
+        } catch { /* network failure handled below */ }
+        if (regStatus === 401 || regStatus === 403)
+          return jsonRes(request, { error: 'Registration failed: registry access token is invalid or lacks write permission' }, 502);
+        if (regStatus === 404)
+          return jsonRes(request, { error: 'Registration failed: registry repository not found' }, 502);
+      }
+      return jsonRes(request, { error: 'Registration failed: could not save account. Please try again later.' }, 502);
+    }
     const markerUrl = `https://api.github.com/repos/${ghOwner}/${ghRepo}/contents/${folder}/.storegit`;
     const markerChk = await fetch(`${markerUrl}?ref=${ghBranch}`, { headers: ghH(ghToken) });
     if (markerChk.status === 404) {
