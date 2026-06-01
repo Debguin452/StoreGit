@@ -539,7 +539,7 @@ async function readReg(path, env) {
 async function writeReg(path, content, msg, env, sha = null) {
   const res = await fetch(`${regBase(env)}/contents/${path}`, {
     method: 'PUT', headers: regH(env),
-    body: JSON.stringify({ message: msg, content: b64urlEnc(ENC.encode(JSON.stringify(content,null,2))), branch: REGISTRY_BRANCH, ...(sha?{sha}:{}) }),
+    body: JSON.stringify({ message: msg, content: utf8b64(JSON.stringify(content,null,2)), branch: REGISTRY_BRANCH, ...(sha?{sha}:{}) }),
   });
   if (!res.ok) throw new Error('reg_write_fail');
   return (await res.json()).content?.sha;
