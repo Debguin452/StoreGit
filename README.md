@@ -725,7 +725,10 @@ When creating a key for production, always set `allowedOrigins` to your exact do
 
 ### Built with StoreGit
 
-- [VaulTxt](https://vaultxt.pages.dev) — mobile-first note vault ([source](https://github.com/Debguin452/vaultxt))
+- [VaulTxt](https://vaultxt.pages.dev) — mobile-first note vault. The storage system of VaulTxt is created with Storegit. ([source](https://github.com/Debguin452/vaultxt))
+
+- [HighwayRush](https://highwayrush.pages.dev) — simple car game using html-css-js the leaderboard storage is integrated with StoreGit.
+([source](https://github.com/Debguin452/highwayrush))
 
 Building something with StoreGit? Open a PR to add it to this list.
 
