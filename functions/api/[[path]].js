@@ -1558,13 +1558,33 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
   //   • Revoked keys are removed from BOTH git and KV.
   //   • Existing keys keep working via KV (fast path unchanged).
   //   • Git becomes the recovery source if KV is ever cleared or unavailable.
-  if (route === 'apikeys/migrate' && method === 'POST') {
-    if (!sess) return jRes({ error: 'Session required' }, 403);
+if (route === 'apikeys/migrate' && method === 'POST') {
+    if (!sess) {
+        return jRes({ error: 'Session required' }, 403);
+    }
+    const kv = env.RATE_LIMIT_KV || null;
+
     const rec = await getUser(sess.username, env);
-    if (!rec) return jRes({ error: ERRS[404] }, 404);
+
+    if (!rec) {
+        return jRes({ error: ERRS[404] }, 404);
+    }
+
     const { content: user } = rec;
-    const existingKeys = user.apiKeys || [];
-    if (existingKeys.length === 0) return jRes({ ok: true, migrated: 0, skipped: 0, failed: 0, keys: [] });
+
+    const existingKeys = Array.isArray(user.apiKeys)
+        ? user.apiKeys
+        : [];
+
+    if (!existingKeys.length) {
+        return jRes({
+            ok: true,
+            migrated: 0,
+            skipped: 0,
+            failed: 0,
+            keys: []
+        });
+    }
 
     let ghToken;
     try { ghToken = await aesDecrypt(user.encGhToken, secret, `user-token:${user.username}`); }
