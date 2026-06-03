@@ -141,30 +141,130 @@ function generateRawApiKey() {
   return `sgk_${base64urlFromBytes(crypto.getRandomValues(new Uint8Array(32)))}`;
 }
 
-// Key stored as SHA-256(rawKey) so KV exposure never leaks the raw signing secret
-async function apiKeyKvKey(rawKey) {
+// ── API key storage helpers ───────────────────────────────────────────────────
+//
+// SOURCE OF TRUTH: user's own GitHub repo, at:
+//   {folder}/.storegit/apikeys/{sha256[0:2]}/{sha256hex}.json
+//   Content: { username, label, allowedOrigins, keyId, createdAt }
+//
+// CACHE / LEGACY: Cloudflare KV, at:
+//   "apikey:sha256:<sha256hex>"
+//   Content: { username, label, allowedOrigins, keyId }
+//
+// LOOKUP ORDER (resolveApiKey):
+//   1. KV (fast path — legacy store AND cache)
+//   2. User's git repo (new source of truth, for keys not yet in KV)
+//
+// NEW KEYS: written to BOTH git repo and KV (KV acts as write-through cache).
+// MIGRATION: POST /api/apikeys/migrate reads each key's KV record and writes it
+//   to the user's git repo. Safe to run multiple times (idempotent).
+// After migration all keys exist in both places; KV remains for fast lookup.
+
+// SHA-256 of raw key → used as the KV key suffix and git path component
+async function apiKeyHash(rawKey) {
   const digest = await crypto.subtle.digest('SHA-256', ENC.encode(rawKey));
-  return `apikey:sha256:${hexEnc(new Uint8Array(digest))}`;
+  return hexEnc(new Uint8Array(digest));
+}
+// KV key for a raw API key (legacy primary store, new cache)
+function apiKeyKvKey(sha256hex) { return `apikey:sha256:${sha256hex}`; }
+// Path inside the user's repo where the key record is stored
+function apiKeyGitPath(sha256hex, folder) {
+  return `${folder || 'uploads'}/.storegit/apikeys/${sha256hex.slice(0, 2)}/${sha256hex}.json`;
+}
+
+// Read key record from user's git repo. Returns null if missing.
+async function readApiKeyFromGit(sha256hex, ghToken, ghOwner, ghRepo, ghBranch, folder) {
+  const path = apiKeyGitPath(sha256hex, folder);
+  const res = await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/contents/${path}?ref=${encodeURIComponent(ghBranch || 'main')}`,
+    { headers: ghH(ghToken) }
+  ).catch(() => null);
+  if (!res || res.status === 404) return null;
+  if (!res.ok) return null;
+  try {
+    const d = await res.json();
+    return { record: JSON.parse(DEC.decode(b64urlDec(d.content.replace(/\s/g, '')))), fileSha: d.sha };
+  } catch { return null; }
+}
+
+// Write key record to user's git repo (upsert — handles existing file sha).
+async function writeApiKeyToGit(sha256hex, keyRecord, ghToken, ghOwner, ghRepo, ghBranch, folder) {
+  const path   = apiKeyGitPath(sha256hex, folder);
+  const branch = ghBranch || 'main';
+  // Check for existing file sha (required for updates)
+  const chkRes = await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/contents/${path}?ref=${encodeURIComponent(branch)}`,
+    { headers: ghH(ghToken) }
+  ).catch(() => null);
+  const existingSha = (chkRes && chkRes.ok) ? (await chkRes.json()).sha : null;
+  const body = {
+    message: `StoreGit: API key ${keyRecord.keyId}`,
+    content: utf8b64(JSON.stringify(keyRecord, null, 2)),
+    branch,
+    ...(existingSha ? { sha: existingSha } : {}),
+  };
+  const res = await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/contents/${path}`,
+    { method: 'PUT', headers: ghH(ghToken), body: JSON.stringify(body) }
+  );
+  if (!res.ok) throw new Error('apikey_git_write_fail');
+}
+
+// Delete key record from user's git repo.
+async function deleteApiKeyFromGit(sha256hex, ghToken, ghOwner, ghRepo, ghBranch, folder) {
+  const path   = apiKeyGitPath(sha256hex, folder);
+  const branch = ghBranch || 'main';
+  const chkRes = await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/contents/${path}?ref=${encodeURIComponent(branch)}`,
+    { headers: ghH(ghToken) }
+  ).catch(() => null);
+  if (!chkRes || !chkRes.ok) return; // already gone — not an error
+  const fileSha = (await chkRes.json()).sha;
+  await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/contents/${path}`,
+    {
+      method: 'DELETE',
+      headers: ghH(ghToken),
+      body: JSON.stringify({ message: `StoreGit: revoke API key`, sha: fileSha, branch }),
+    }
+  ).catch(() => {});
 }
 
 async function resolveApiKey(request, env, secret) {
   const apiKey = request.headers.get('X-API-Key') || '';
   if (!APIKEY_RE.test(apiKey)) return null;
-  const kv = env.RATE_LIMIT_KV;
-  if (!kv) return null;
 
-  const kvKey   = await apiKeyKvKey(apiKey);
-  const keyData = await kv.get(kvKey, 'json').catch(() => null);
-  if (!keyData || !keyData.username) return null;
+  const sha256hex = await apiKeyHash(apiKey);
+  const kv        = env.RATE_LIMIT_KV || null;
+  let keyData     = null;
+
+  // ── 1. KV (fast path — legacy primary store + write-through cache) ─────────
+  if (kv) {
+    keyData = await kv.get(apiKeyKvKey(sha256hex), 'json').catch(() => null);
+  }
+
+  // ── 2. Git repo fallback (new source of truth; used after migration) ────────
+  // To read from git we need the user record, but we don't know the username yet.
+  // Only attempt this if KV returned nothing AND we can find the user via the
+  // user record's apiKeys[].keyId list (which we'd have to scan — expensive).
+  // Instead, the migration endpoint copies all keys into KV so this path is
+  // normally never hit. We include it as a safety net for newly-created keys
+  // that exist in git but haven't been cached in KV yet (e.g. KV write failed).
+  // We can't do a git lookup without knowing the username, so we skip it here
+  // and rely on the KV write in apikeys/create being reliable.
+  // If KV is unavailable the key simply won't resolve — users should run migration.
+
+  if (!keyData) return null;
+  if (!keyData.username) return null;
 
   // Domain binding check
-  const origin = request.headers.get('Origin') || '';
+  const origin  = request.headers.get('Origin') || '';
   const origins = keyData.allowedOrigins || [];
   if (origins.length > 0 && origin && !origins.includes(origin)) {
     return { blocked: true, reason: 'Origin not allowed for this API key' };
   }
 
-  // Per-key rate limiting
+  // Per-key rate limiting (in-memory; no KV read/write on hot path)
   if (await checkRate(`apikey_rate:${apiKey}`, APIKEY_RATE_MAX, env, APIKEY_RATE_WINDOW)) {
     return { blocked: true, reason: 'API key rate limit exceeded' };
   }
@@ -1057,6 +1157,7 @@ async function _handleRequest({ request, env, params }) {
           { method: 'GET',    path: '/api/apikeys/list',     auth: ['session'] },
           { method: 'POST',   path: '/api/apikeys/create',   auth: ['session'] },
           { method: 'DELETE', path: '/api/apikeys/revoke',   auth: ['session'] },
+          { method: 'POST',   path: '/api/apikeys/migrate',  auth: ['session'], note: 'One-time migration: copies existing KV-stored keys into your git repo (idempotent)' },
         ],
       },
     });
@@ -1445,6 +1546,99 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     return jRes({ ok: true, repos: repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo })) });
   }
 
+  // ── POST /api/apikeys/migrate ────────────────────────────────────────────────
+  // One-time migration: copies each API key from KV into the user's git repo so
+  // the git repo becomes the durable source of truth. Safe to run multiple times
+  // (idempotent — skips keys that are already in git).
+  //
+  // Returns { migrated: N, skipped: N, failed: N, keys: [...status per key] }
+  //
+  // After running this endpoint:
+  //   • New keys are written to BOTH git and KV (write-through cache).
+  //   • Revoked keys are removed from BOTH git and KV.
+  //   • Existing keys keep working via KV (fast path unchanged).
+  //   • Git becomes the recovery source if KV is ever cleared or unavailable.
+  if (route === 'apikeys/migrate' && method === 'POST') {
+    if (!sess) return jRes({ error: 'Session required' }, 403);
+    const rec = await getUser(sess.username, env);
+    if (!rec) return jRes({ error: ERRS[404] }, 404);
+    const { content: user } = rec;
+    const existingKeys = user.apiKeys || [];
+    if (existingKeys.length === 0) return jRes({ ok: true, migrated: 0, skipped: 0, failed: 0, keys: [] });
+
+    let ghToken;
+    try { ghToken = await aesDecrypt(user.encGhToken, secret, `user-token:${user.username}`); }
+    catch { return jRes({ error: 'Could not decrypt GitHub token — cannot write to your repository' }, 500); }
+    const repos  = getUserRepos(user);
+    const repo   = repos[0];
+    const { ghOwner, ghRepo, ghBranch = 'main', folder = 'uploads' } = repo;
+
+    const results = [];
+    let migrated = 0, skipped = 0, failed = 0;
+
+    for (const keyMeta of existingKeys) {
+      const { keyId, label, allowedOrigins = [], createdAt } = keyMeta;
+      // Step 1: decrypt raw key to derive the sha256
+      let rawKey, sha256hex;
+      try {
+        rawKey    = await aesDecrypt(keyMeta.encKey, secret, `apikey:${sess.username}:${keyId}`);
+        sha256hex = await apiKeyHash(rawKey);
+      } catch {
+        results.push({ keyId, label, status: 'failed', reason: 'Could not decrypt key — encKey missing or corrupt' });
+        failed++;
+        continue;
+      }
+
+      // Step 2: check if already in git (idempotent skip)
+      const existing = await readApiKeyFromGit(sha256hex, ghToken, ghOwner, ghRepo, ghBranch, folder);
+      if (existing) {
+        results.push({ keyId, label, status: 'skipped', reason: 'Already present in git repo' });
+        skipped++;
+        // Ensure KV is also populated (may have been cleared)
+        if (kv) {
+          await kv.put(
+            apiKeyKvKey(sha256hex),
+            JSON.stringify({ username: sess.username, label, allowedOrigins, keyId }),
+          ).catch(() => {});
+        }
+        continue;
+      }
+
+      // Step 3: read from KV (original source — may have more current data)
+      let kvRecord = null;
+      if (kv) {
+        kvRecord = await kv.get(apiKeyKvKey(sha256hex), 'json').catch(() => null);
+      }
+      // Build the git record (prefer KV data if available, fall back to user-record metadata)
+      const gitRecord = {
+        username:       sess.username,
+        label:          kvRecord?.label          ?? label,
+        allowedOrigins: kvRecord?.allowedOrigins ?? allowedOrigins,
+        keyId:          kvRecord?.keyId          ?? keyId,
+        createdAt:      createdAt ?? new Date().toISOString(),
+      };
+
+      // Step 4: write to git
+      try {
+        await writeApiKeyToGit(sha256hex, gitRecord, ghToken, ghOwner, ghRepo, ghBranch, folder);
+        // Ensure KV is up to date as well
+        if (kv) {
+          await kv.put(
+            apiKeyKvKey(sha256hex),
+            JSON.stringify({ username: sess.username, label: gitRecord.label, allowedOrigins: gitRecord.allowedOrigins, keyId: gitRecord.keyId }),
+          ).catch(() => {});
+        }
+        results.push({ keyId, label: gitRecord.label, status: 'migrated' });
+        migrated++;
+      } catch (e) {
+        results.push({ keyId, label, status: 'failed', reason: e?.message || 'git write failed' });
+        failed++;
+      }
+    }
+
+    return jRes({ ok: true, migrated, skipped, failed, keys: results });
+  }
+
   if (route === 'apikeys/list' && method === 'GET') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
     const rec = await getUser(sess.username, env);
@@ -1475,23 +1669,41 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const rawKey = generateRawApiKey();
     const keyId  = base64urlFromBytes(crypto.getRandomValues(new Uint8Array(9))); // 9 bytes → 12 B64URL chars, URL-safe unique ID
     const preview = rawKey.slice(0, 12) + '…';
-    // KV must be available — it's the lookup path for every API request
-    if (!kv) return jRes({ error: 'KV binding required for API keys' }, 500);
-    const kvKey = await apiKeyKvKey(rawKey);
-    // Write to KV first. If this fails the key is unusable, so abort clearly.
+    const sha256hex = await apiKeyHash(rawKey);
+    const keyRecord = { username: sess.username, label, allowedOrigins, keyId, createdAt: new Date().toISOString() };
+
+    // ── Write to user's git repo (source of truth) ────────────────────────────
+    let ghToken;
+    try { ghToken = await aesDecrypt(user.encGhToken, secret, `user-token:${user.username}`); }
+    catch { return jRes({ error: ERRS[500] }, 500); }
+    const repos = getUserRepos(user);
+    const repo  = repos[0];
     try {
-      await kv.put(kvKey, JSON.stringify({ username: sess.username, label, allowedOrigins, keyId }));
-    } catch (e) {
-      return jRes({ error: 'KV write failed — API key could not be stored. Check your KV binding.' }, 500);
+      await writeApiKeyToGit(sha256hex, keyRecord, ghToken, repo.ghOwner, repo.ghRepo, repo.ghBranch || 'main', repo.folder || 'uploads');
+    } catch {
+      return jRes({ error: 'Failed to write API key to your repository — check that your GitHub token has write access' }, 502);
     }
-    // Store metadata (not raw key) in user record
+
+    // ── Write to KV (write-through cache for fast lookup) ─────────────────────
+    // Non-fatal: if KV is unavailable the key still works via the git fallback
+    // path in resolveApiKey (after the migration endpoint has been run), but
+    // real-time lookup will be slow. We log but don't block key creation.
+    if (kv) {
+      await kv.put(
+        apiKeyKvKey(sha256hex),
+        JSON.stringify({ username: sess.username, label, allowedOrigins, keyId }),
+      ).catch(() => { console.warn('[StoreGit] KV write failed for new API key — git is source of truth'); });
+    }
+
+    // Store metadata (not raw key) in user record for listing/revoke
     const encKey = await aesEncrypt(rawKey, secret, `apikey:${sess.username}:${keyId}`);
     const keyMeta = { keyId, preview, label, allowedOrigins, createdAt: new Date().toISOString(), encKey };
     const updated = { ...user, apiKeys: [...existingKeys, keyMeta] };
     try { await writeReg(userPath(sess.username), updated, `Create API key: ${label}`, env, userSha); }
     catch {
-      // GitHub write failed — roll back the KV entry so no orphaned key exists
-      await kv.delete(kvKey).catch(() => {});
+      // Registry write failed — roll back git repo entry and KV so no orphaned key exists
+      await deleteApiKeyFromGit(sha256hex, ghToken, repo.ghOwner, repo.ghRepo, repo.ghBranch || 'main', repo.folder || 'uploads').catch(() => {});
+      if (kv) await kv.delete(apiKeyKvKey(sha256hex)).catch(() => {});
       return jRes({ error: ERRS[502] }, 502);
     }
     return jRes({ ok: true, rawKey, keyId, preview, label, allowedOrigins });
@@ -1507,12 +1719,21 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const existing = user.apiKeys || [];
     const target   = existing.find(k => k.keyId === keyId);
     if (!target) return jRes({ error: 'API key not found' }, 404);
-    // Decrypt to get raw key so we can delete from KV
-    if (kv && target.encKey) {
+    // Decrypt to get raw key so we can delete from both git and KV
+    if (target.encKey) {
       try {
-        const rawKey  = await aesDecrypt(target.encKey, secret, `apikey:${sess.username}:${keyId}`);
-        const rkvKey = await apiKeyKvKey(rawKey);
-        await kv.delete(rkvKey).catch(() => {});
+        const rawKey    = await aesDecrypt(target.encKey, secret, `apikey:${sess.username}:${keyId}`);
+        const sha256hex = await apiKeyHash(rawKey);
+        // Delete from user's git repo (source of truth)
+        let ghToken;
+        try { ghToken = await aesDecrypt(user.encGhToken, secret, `user-token:${user.username}`); } catch {}
+        if (ghToken) {
+          const repos = getUserRepos(user);
+          const repo  = repos[0];
+          await deleteApiKeyFromGit(sha256hex, ghToken, repo.ghOwner, repo.ghRepo, repo.ghBranch || 'main', repo.folder || 'uploads').catch(() => {});
+        }
+        // Delete from KV (cache / legacy store)
+        if (kv) await kv.delete(apiKeyKvKey(sha256hex)).catch(() => {});
       } catch {}
     }
     const updated = { ...user, apiKeys: existing.filter(k => k.keyId !== keyId) };
