@@ -1,4 +1,5 @@
 'use strict';
+// ── Constants — edit here and redeploy to change any limit or threshold ──
 const SESSION_TTL               = 8  * 60 * 60 * 1000;
 const SESSION_REFRESH_THRESHOLD =      60 * 60 * 1000;
 const SHARE_TTL_MAX             = 7 * 24 * 60 * 60;
@@ -9,15 +10,17 @@ const RATE_MAX_SIGNUP           = 3;
 const RATE_MAX_RESET            = 3;
 const CHUNK_B64_MAX             = 14 * 1024 * 1024;
 const SMALL_MAX_BYTES           =  5 * 1024 * 1024;
-// Files larger than this raw size will distribute chunks across repos to equalise storage.
-// Kept well above CHUNK_THRESHOLD (8 MB) so small multi-chunk files stay in one repo.
-const DIST_THRESHOLD            = 50 * 1024 * 1024;  // 50 MB raw — split across repos above this
-const MAX_TOTAL_CHUNKS          = 1024;  // 1024 × 10 MB = ~10 GB max; 2 repos → ~5 GB each
-const COMMIT_RETRY_MAX          = 6;   // optimistic concurrency retries for branch ref updates
-const PARALLEL_DL_CHUNKS        = 24;  // simultaneous chunk fetches during download (sliding window)
-const UPLOAD_CONCURRENCY        = 8;   // advisory: how many chunk uploads client should run in parallel
-const INDEX_CACHE_TTL           = 60;  // seconds to cache readIndex results in KV
-const REPO_BYTES_CACHE_TTL      = 30;  // seconds to cache per-repo byte totals in KV
+const DIST_THRESHOLD            = 50 * 1024 * 1024;
+const MAX_TOTAL_CHUNKS          = 1024;
+const COMMIT_RETRY_MAX          = 6;
+const PARALLEL_DL_CHUNKS        = 24;
+const UPLOAD_CONCURRENCY        = 8;
+const INDEX_CACHE_TTL           = 60;
+const REPO_BYTES_CACHE_TTL      = 30;
+const APIKEY_RATE_MAX           = 120;
+const APIKEY_RATE_WINDOW        = 60_000;
+const MIDDLEWARE_RATE_MAX       = 600;
+const MIDDLEWARE_RATE_WINDOW_MS = 60_000;
 const SHA_RE                    = /^[0-9a-f]{40}$/i;
 const USERNAME_RE               = /^[a-zA-Z0-9_\-]{3,32}$/;
 const CLEAN_NAME_RE             = /^[a-zA-Z0-9][a-zA-Z0-9._\-()\s]{0,253}$/;
@@ -102,9 +105,6 @@ function corsHeaders(req, allowedOrigins = null) {
 
 // API key: sgk_<43 B64URL chars>, 256-bit (SHA-256 stored in KV, raw key never persisted)
 const APIKEY_RE          = /^sgk_[A-Za-z0-9_-]{43}$/; // 43 chars × 6 bits = 258 bits ≥ 256
-const APIKEY_RATE_MAX    = 120;   // requests per minute per key
-const APIKEY_RATE_WINDOW = 60_000;
-
 // RFC 4648 §5 Base64URL alphabet — no padding, URL-safe
 const B64URL_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 
@@ -568,34 +568,7 @@ const regH = env => ({
 const regBase = env =>
   `https://api.github.com/repos/${encodeURIComponent(env.REGISTRY_GITHUB_OWNER)}/${encodeURIComponent(env.REGISTRY_GITHUB_REPO)}`;
 
-const CONFIG_KV_KEY = 'storegit:config:v1';
-const CONFIG_KV_TTL = 300; // 5 min
-
-async function loadConfig(env) {
-  const kv = env.RATE_LIMIT_KV;
-  if (kv) {
-    const cached = await kv.get(CONFIG_KV_KEY, 'json').catch(() => null);
-    if (cached && typeof cached === 'object') return cached;
-  }
-  try {
-    const res = await fetch(
-      `${regBase(env)}/contents/config/config.json?ref=${REGISTRY_BRANCH}`,
-      { headers: regH(env) }
-    );
-    if (res.ok) {
-      const d   = await res.json();
-      const cfg = JSON.parse(DEC.decode(b64urlDec(d.content.replace(/\s/g, ''))));
-      if (kv) await kv.put(CONFIG_KV_KEY, JSON.stringify(cfg), { expirationTtl: CONFIG_KV_TTL }).catch(() => {});
-      return cfg;
-    }
-  } catch {}
-  return {};
-}
-// Safe numeric config read with fallback
-function cn(cfg, key, fallback) {
-  const v = cfg[key];
-  return (typeof v === 'number' && isFinite(v) && v > 0) ? v : fallback;
-}
+const EDITABLE_EXTS = new Set(['txt','md','markdown','csv','json','log','ini','cfg','conf','yaml','yml','toml','diff','patch','nfo','css','sql','r','lua','xml','sh','bash']);
 function getRepoSess(fullSess, repoIdx) {
   const repos = fullSess.repos || [];
   const idx   = (Number.isInteger(repoIdx) && repoIdx >= 0 && repoIdx < repos.length) ? repoIdx : 0;
@@ -1098,18 +1071,15 @@ async function _handleRequest({ request, env, params }) {
   }
   const secret = env.TOKEN_SECRET;
   if (!secret) return fail(request, 500);
-  const cfg = await loadConfig(env).catch(() => ({}));
   if (route === 'status' && method === 'GET') {
     const ready = !!(env.REGISTRY_GITHUB_TOKEN && env.REGISTRY_GITHUB_OWNER && env.REGISTRY_GITHUB_REPO);
     return jsonRes(request, {
       ready,
       version: '1',
       kvAvailable: !!(env.RATE_LIMIT_KV),
-      uploadConcurrency: cn(cfg, 'upload_concurrency', UPLOAD_CONCURRENCY),
-      distThresholdBytes: cn(cfg, 'dist_threshold_bytes', DIST_THRESHOLD),
-      // chunkMaxRawBytes: safe per-chunk raw size the server accepts via upload-chunk.
-      // = floor(CHUNK_B64_MAX × 3/4) — client uses this to set its CHUNK_THRESHOLD.
-      chunkMaxRawBytes: Math.floor(cn(cfg, 'chunk_b64_max', CHUNK_B64_MAX) * 3 / 4),
+      uploadConcurrency: UPLOAD_CONCURRENCY,
+      distThresholdBytes: DIST_THRESHOLD,
+      chunkMaxRawBytes: Math.floor(CHUNK_B64_MAX * 3 / 4),
       ...(!ready && { hint: 'Missing one or more required env vars: REGISTRY_GITHUB_TOKEN, REGISTRY_GITHUB_OWNER, REGISTRY_GITHUB_REPO' }),
       endpoints: {
         public: [
@@ -1304,8 +1274,7 @@ async function _handleRequest({ request, env, params }) {
     } catch {}
     if (manifest) {
       const authHeader = { Authorization:`token ${ghToken}`, 'User-Agent':'StoreGit/1' };
-      const cfg2 = await loadConfig(env).catch(() => ({}));
-      const dlWindow = Math.max(1, cn(cfg2, 'parallel_dl_chunks', PARALLEL_DL_CHUNKS));
+      const dlWindow = Math.max(1, PARALLEL_DL_CHUNKS);
       const fetchChunkDl = async (i) => {
         const chunkMeta   = manifest.chunks?.[i];
         const chunkOwner  = chunkMeta?.ghOwner  || ghOwner;
@@ -1389,7 +1358,7 @@ async function _handleRequest({ request, env, params }) {
     // API keys can access storage routes only (not account management)
     const AK_ALLOWED = new Set(['files','upload','upload-chunk','finalize-upload','download','delete','share-link','me','repos','storage']);
     if (!AK_ALLOWED.has(route)) return fail(request, 403);
-    return _dispatchRoute(route, method, request, env, akResult.fullSess, null, secret, akResult.allowedOrigins, cfg);
+    return _dispatchRoute(route, method, request, env, akResult.fullSess, null, secret, akResult.allowedOrigins);
   }
 
   const rawToken = readSessionCookie(request);
@@ -1407,7 +1376,7 @@ async function _handleRequest({ request, env, params }) {
     const newTok = await createToken({ username: sess.username, display: sess.display, repoIdx: sess.repoIdx ?? 0 }, secret);
     refreshCookie = buildSetCookie(request, newTok, SESSION_TTL / 1000);
   }
-  const response = await _dispatchRoute(route, method, request, env, fullSess, sess, secret, null, cfg);
+  const response = await _dispatchRoute(route, method, request, env, fullSess, sess, secret, null);
   if (refreshCookie) {
     const headers = new Headers(response.headers);
     headers.append('Set-Cookie', refreshCookie);
@@ -1415,17 +1384,17 @@ async function _handleRequest({ request, env, params }) {
   }
   return response;
 }
-async function _dispatchRoute(route, method, request, env, fullSess, sess, secret, apiKeyOrigins = null, cfg = {}) {
+async function _dispatchRoute(route, method, request, env, fullSess, sess, secret, apiKeyOrigins = null) {
   const cors = corsHeaders(request, apiKeyOrigins);
-  const C_SHARE_TTL_MAX      = cn(cfg, 'share_ttl_max_seconds',      SHARE_TTL_MAX);
-  const C_CHUNK_B64_MAX      = cn(cfg, 'chunk_b64_max',              CHUNK_B64_MAX);
-  const C_SMALL_MAX_BYTES    = cn(cfg, 'small_max_bytes',            SMALL_MAX_BYTES);
-  const C_DIST_THRESHOLD     = cn(cfg, 'dist_threshold_bytes',       DIST_THRESHOLD);
-  const C_MAX_TOTAL_CHUNKS   = cn(cfg, 'max_total_chunks',           MAX_TOTAL_CHUNKS);
-  const C_MAX_REPOS          = cn(cfg, 'max_repos_per_user',         20);
-  const C_MAX_APIKEYS        = cn(cfg, 'max_apikeys_per_user',       10);
-  const C_PARALLEL_DL        = cn(cfg, 'parallel_dl_chunks',        PARALLEL_DL_CHUNKS);
-  const C_COMMIT_RETRIES     = cn(cfg, 'commit_retry_max',          COMMIT_RETRY_MAX);
+  const C_SHARE_TTL_MAX    = SHARE_TTL_MAX;
+  const C_CHUNK_B64_MAX    = CHUNK_B64_MAX;
+  const C_SMALL_MAX_BYTES  = SMALL_MAX_BYTES;
+  const C_DIST_THRESHOLD   = DIST_THRESHOLD;
+  const C_MAX_TOTAL_CHUNKS = MAX_TOTAL_CHUNKS;
+  const C_MAX_REPOS        = 20;
+  const C_MAX_APIKEYS      = 10;
+  const C_PARALLEL_DL      = PARALLEL_DL_CHUNKS;
+  const C_COMMIT_RETRIES   = COMMIT_RETRY_MAX;
   function jRes(data, status=200, extra={}) {
     return new Response(JSON.stringify(data), { status, headers: { ...SEC, ...cors, 'Content-Type':'application/json', ...extra } });
   }
@@ -2070,8 +2039,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const safe    = sanitize(nameP);
     if (!safe) return jRes({ error: ERRS[400] }, 400);
     const ext = safe.split('.').pop()?.toLowerCase() || '';
-    const EDITABLE = new Set(['txt','md','markdown','csv','json','log','ini','cfg','conf','yaml','yml','toml','diff','patch','nfo','css','sql','r','lua','xml','sh','bash']);
-    if (!EDITABLE.has(ext)) return jRes({ error: 'Only plain-text files can be read via this endpoint' }, 415);
+    if (!EDITABLE_EXTS.has(ext)) return jRes({ error: 'Only plain-text files can be read via this endpoint' }, 415);
     const targetSess = getRepoSess(fullSess, rIdx);
     const { ghToken, ghOwner, ghRepo, ghBranch, folder } = targetSess;
     const url = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/contents/${encodeURIComponent(folder)}/${encodeURIComponent(safe)}?ref=${encodeURIComponent(ghBranch)}`;
@@ -2097,8 +2065,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const safe = sanitize(String(rawName));
     if (!safe) return jRes({ error: ERRS[415] }, 415);
     const ext = safe.split('.').pop()?.toLowerCase() || '';
-    const EDITABLE = new Set(['txt','md','markdown','csv','json','log','ini','cfg','conf','yaml','yml','toml','diff','patch','nfo','css','sql','r','lua','xml','sh','bash']);
-    if (!EDITABLE.has(ext)) return jRes({ error: 'Only plain-text files can be edited via this endpoint' }, 415);
+    if (!EDITABLE_EXTS.has(ext)) return jRes({ error: 'Only plain-text files can be edited via this endpoint' }, 415);
     if (content.length > 1_000_000) return jRes({ error: ERRS[413] }, 413);
     const targetSess = getRepoSess(fullSess, Number.isInteger(editRepoIdx) ? editRepoIdx : 0);
     const { ghToken, ghOwner, ghRepo, ghBranch, folder } = targetSess;
