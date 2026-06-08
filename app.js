@@ -175,6 +175,9 @@ async function bootApp(me) {
   closeApiKeyForm();
   hideApiKeyReveal();
   showScreen('app');
+  // Auto-migrate API keys from KV → git repo silently in the background.
+  // Non-blocking: user sees the app immediately, migration happens behind the scenes.
+  fetch('/api/apikeys/migrate', { method: 'POST', credentials: 'same-origin' }).catch(() => {});
   await loadMeta();
   loadFiles();
 }
@@ -913,9 +916,10 @@ function openFileDetail(f) {
   _shareFile = f;
   _currentFileRepoIdx = f._repoIdx !== undefined ? f._repoIdx : 0;
   const displayName = f.originalName || f.name;
+  const ext = fileExtRaw(displayName);
   const iconEl = document.getElementById('fd-icon');
   iconEl.textContent = fileExt(displayName);
-  iconEl.style.background = fileColor(fileExtRaw(displayName));
+  iconEl.style.background = fileColor(ext);
   iconEl.style.color = '#fff';
   document.getElementById('fd-name').textContent = displayName;
   document.getElementById('fd-meta').textContent = fmtSize(f.size);
@@ -928,10 +932,90 @@ function openFileDetail(f) {
     closeFileDetail();
     setTimeout(() => deleteFile(f.name, f.sha, f.chunked || false, displayName, _currentFileRepoIdx), 250);
   };
+  // Show edit button only for editable text files under 1 MB
+  const editBtn = document.getElementById('fd-edit-btn');
+  if (editBtn) {
+    const canEdit = FD_EDITABLE.has(ext) && !f.chunked && (f.size || 0) <= 1_000_000;
+    editBtn.style.display = canEdit ? '' : 'none';
+    editBtn.onclick = canEdit ? () => openEditSheet(f) : null;
+  }
   document.getElementById('fd-preview').innerHTML =
     '<div class="fd-preview-loading"><span class="spinner"></span> Loading preview…</div>';
   document.getElementById('fd-overlay').classList.add('open');
   ensureRepoActive(_currentFileRepoIdx).then(() => loadFilePreview(f));
+}
+
+// ── Text file editor ──────────────────────────────────────────────────────────
+let _editFile = null;
+let _editSha  = null;
+
+async function openEditSheet(f) {
+  _editFile = f;
+  _editSha  = null;
+  closeFileDetail();
+  const overlay = document.getElementById('edit-overlay');
+  const textarea = document.getElementById('edit-textarea');
+  const nameEl   = document.getElementById('edit-filename');
+  const statusEl = document.getElementById('edit-status');
+  if (!overlay || !textarea) return;
+  nameEl.textContent  = f.originalName || f.name;
+  statusEl.textContent = 'Loading…';
+  textarea.value = '';
+  textarea.disabled = true;
+  document.getElementById('edit-save-btn').disabled = true;
+  overlay.classList.add('open');
+  try {
+    const r = await fetch(
+      `/api/read-text?name=${encodeURIComponent(f.name)}&repoIdx=${_currentFileRepoIdx}`,
+      { credentials: 'same-origin' }
+    );
+    if (!r.ok) { const d = await r.json().catch(()=>({})); statusEl.textContent = d.error || 'Failed to load.'; return; }
+    const d = await r.json();
+    _editSha = d.sha;
+    textarea.value = d.content;
+    textarea.disabled = false;
+    document.getElementById('edit-save-btn').disabled = false;
+    statusEl.textContent = '';
+    textarea.focus();
+  } catch { statusEl.textContent = 'Connection error.'; }
+}
+
+function closeEditSheet() {
+  document.getElementById('edit-overlay')?.classList.remove('open');
+  _editFile = null;
+  _editSha  = null;
+}
+
+async function saveEditSheet() {
+  if (!_editFile || !_editSha) return;
+  const textarea  = document.getElementById('edit-textarea');
+  const statusEl  = document.getElementById('edit-status');
+  const saveBtn   = document.getElementById('edit-save-btn');
+  const content   = textarea.value;
+  saveBtn.disabled = true;
+  saveBtn.innerHTML = '<span class="spinner"></span>';
+  statusEl.textContent = 'Saving…';
+  try {
+    const r = await fetch('/api/edit-text', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: _editFile.name, content, sha: _editSha, repoIdx: _currentFileRepoIdx }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) {
+      _editSha = d.sha || _editSha; // update sha for subsequent saves
+      statusEl.textContent = 'Saved!';
+      setTimeout(() => { statusEl.textContent = ''; }, 2000);
+      toast('File saved.', 'ok');
+      loadFiles();
+    } else if (r.status === 409) {
+      statusEl.textContent = 'Conflict — file changed externally. Re-open to reload.';
+    } else {
+      statusEl.textContent = d.error || 'Save failed.';
+    }
+  } catch { statusEl.textContent = 'Connection error.'; }
+  saveBtn.disabled = false;
+  saveBtn.textContent = 'Save';
 }
 function closeFileDetail() {
   document.getElementById('fd-overlay').classList.remove('open');
