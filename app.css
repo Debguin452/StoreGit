@@ -715,3 +715,45 @@ body {
   .api-doc-row .ic { color: #94a3b8; }
   .api-doc-desc { color: #334155; }
 }
+
+/* ── Text editor overlay ───────────────────────────────────────────── */
+.edit-overlay {
+  display: none;
+  position: fixed; inset: 0; z-index: 300;
+  background: #fff;
+  flex-direction: column;
+}
+.edit-overlay.open { display: flex; }
+.edit-sheet { display: flex; flex-direction: column; height: 100%; }
+.edit-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; border-bottom: 1px solid #e2e8f0;
+  background: #f8fafc; flex-shrink: 0;
+}
+.edit-filename { font-weight: 600; font-size: .9rem; color: #1e293b; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.edit-header-actions { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.edit-status { font-size: .78rem; color: #64748b; }
+.edit-close-btn {
+  display: flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px; border-radius: 6px; border: none;
+  background: transparent; color: #64748b; cursor: pointer;
+}
+.edit-close-btn:hover { background: #f1f5f9; color: #1e293b; }
+.edit-textarea {
+  flex: 1; resize: none; border: none; outline: none;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: .84rem; line-height: 1.6; padding: 16px;
+  color: #1e293b; background: #fff;
+  overflow-y: auto; -webkit-overflow-scrolling: touch;
+}
+.fd-tap-load { margin: auto; display: block; }
+
+@media (prefers-color-scheme: dark) {
+  .edit-overlay { background: #0f172a; }
+  .edit-header { background: #0d1b2e; border-color: #1e2e50; }
+  .edit-filename { color: #e2e8f0; }
+  .edit-status { color: #475569; }
+  .edit-close-btn { color: #475569; }
+  .edit-close-btn:hover { background: #1e2e50; color: #e2e8f0; }
+  .edit-textarea { background: #0f172a; color: #e2e8f0; }
+}

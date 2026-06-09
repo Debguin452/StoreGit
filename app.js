@@ -112,6 +112,9 @@ document.getElementById('share-ttl-opts')?.addEventListener('click', e => {
   btn.classList.add('active');
 });
 on('fd-close-btn',       'click',  () => closeFileDetail());
+on('fd-edit-btn',        'click',  () => _shareFile && openEditSheet(_shareFile));
+on('edit-close-btn',     'click',  () => closeEditSheet());
+on('edit-save-btn',      'click',  () => saveEditSheet());
 function showModal(title, msg, confirmLabel, confirmClass, onConfirm) {
   document.getElementById('modal-title').textContent = title;
   document.getElementById('modal-msg').textContent = msg;
@@ -1042,35 +1045,45 @@ async function loadFilePreview(f) {
   // Build inline URL — browser streams directly, no blob buffering needed
   const inlineUrl = `/api/download?name=${encodeURIComponent(f.name)}&repoIdx=${_currentFileRepoIdx}&inline=1`;
   if (FD_IMG.has(ext)) {
-    if (f.size > 20 * 1024 * 1024) { noPreview('Image too large to preview.<br>Download to view.'); return; }
+    if (f.size > 20 * 1024 * 1024) { noPreview('Image too large to preview.\nDownload to view.'); return; }
     const _img = document.createElement('img');
     _img.className = 'fd-preview-img';
     _img.alt = f.name;
     _img.onerror = () => noPreview('Could not load image preview.');
     el.replaceChildren(_img);
-    _img.src = inlineUrl; // set src after attaching so onerror fires correctly
+    _img.src = inlineUrl;
     return;
   }
   if (FD_AUDIO.has(ext)) {
-    if (f.size > 50 * 1024 * 1024) { noPreview('Audio file is large.<br>Download to listen.'); return; }
-    const _aud = document.createElement('audio');
-    _aud.className = 'fd-preview-audio';
-    _aud.controls = true;
-    _aud.preload = 'metadata';
-    _aud.onerror = () => noPreview('Could not load audio preview.');
-    el.replaceChildren(_aud);
-    _aud.src = inlineUrl;
+    // Audio: show tap-to-load on mobile to avoid downloading on metered connections
+    const tapBtn = document.createElement('button');
+    tapBtn.className = 'btn btn-outline fd-tap-load';
+    tapBtn.textContent = 'Tap to load audio';
+    tapBtn.onclick = () => {
+      const _aud = document.createElement('audio');
+      _aud.className = 'fd-preview-audio';
+      _aud.controls = true; _aud.preload = 'metadata';
+      _aud.onerror = () => noPreview('Could not load audio preview.');
+      el.replaceChildren(_aud);
+      _aud.src = inlineUrl;
+    };
+    el.replaceChildren(tapBtn);
     return;
   }
   if (FD_VIDEO.has(ext)) {
-    if (f.size > 200 * 1024 * 1024) { noPreview('Video too large to preview here.<br>Download to watch.'); return; }
-    const _vid = document.createElement('video');
-    _vid.className = 'fd-preview-video';
-    _vid.controls = true;
-    _vid.preload = 'metadata';
-    _vid.onerror = () => noPreview('Could not load video preview.');
-    el.replaceChildren(_vid);
-    _vid.src = inlineUrl;
+    // Video: always tap-to-load — never auto-buffer video on mobile
+    const tapBtn = document.createElement('button');
+    tapBtn.className = 'btn btn-outline fd-tap-load';
+    tapBtn.textContent = 'Tap to load video';
+    tapBtn.onclick = () => {
+      const _vid = document.createElement('video');
+      _vid.className = 'fd-preview-video';
+      _vid.controls = true; _vid.preload = 'metadata';
+      _vid.onerror = () => noPreview('Could not load video preview.');
+      el.replaceChildren(_vid);
+      _vid.src = inlineUrl;
+    };
+    el.replaceChildren(tapBtn);
     return;
   }
   if (FD_TEXT.has(ext) || f.size <= 200 * 1024) {
