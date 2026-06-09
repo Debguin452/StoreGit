@@ -637,46 +637,22 @@ function isDistributed(totalSize, repos) {
   return Number.isInteger(totalSize) && totalSize > DIST_THRESHOLD && Array.isArray(repos) && repos.length > 1;
 }
 // ── Index caching helpers ─────────────────────────────────────────────────────
-function indexCacheKey(sess) {
-  return `idx_cache:${sess.ghOwner}:${sess.ghRepo}:${(sess.ghBranch||'main').replace(/\//g,'_')}:${sess.folder||'uploads'}`;
+// readIndex — always reads fresh from GitHub. No KV caching for the index.
+async function readIndexCached(sess, _kv) {
+  return readIndex(sess);
 }
-// readIndex with KV-backed cache (INDEX_CACHE_TTL seconds).
-// Cache is keyed by repo coordinates so multiple users sharing a repo still benefit.
-async function readIndexCached(sess, kv) {
-  if (!kv) return readIndex(sess);
-  const cKey = indexCacheKey(sess);
-  try {
-    const cached = await kv.get(cKey, 'json').catch(() => null);
-    if (cached && typeof cached.data === 'object') return { data: cached.data, sha: cached.sha ?? null };
-  } catch {}
-  const result = await readIndex(sess);
-  kv.put(cKey, JSON.stringify(result), { expirationTtl: INDEX_CACHE_TTL }).catch(() => {});
-  return result;
-}
-// Bust the index cache after any write to the repo.
-function invalidateIndexCache(sess, kv) {
-  if (!kv) return;
-  kv.delete(indexCacheKey(sess)).catch(() => {});
-}
+// No-op: no KV index cache to invalidate.
+function invalidateIndexCache(_sess, _kv) {}
 // ── Space-aware routing helpers ──────────────────────────────────────────────
-// Fetch current byte totals for every repo in parallel — results cached in KV.
+// Fetch current byte totals for every repo in parallel — reads index directly.
 // Returns 0 for any repo whose index cannot be read.
-async function fetchRepoBytes(fullSess, kv) {
+async function fetchRepoBytes(fullSess, _kv) {
   if (!Array.isArray(fullSess.repos) || fullSess.repos.length === 0) return [];
   return Promise.all(
     fullSess.repos.map(async (repo) => {
       try {
         const s = { ...fullSess, ghOwner: repo.ghOwner, ghRepo: repo.ghRepo,
           ghBranch: repo.ghBranch || 'main', folder: repo.folder || 'uploads' };
-        if (kv) {
-          const bKey = `rbytes:${s.ghOwner}:${s.ghRepo}:${(s.ghBranch||'main').replace(/\//g,'_')}:${s.folder}`;
-          const cb = await kv.get(bKey, 'json').catch(() => null);
-          if (typeof cb === 'number' && cb >= 0) return cb;
-          const { data: idx } = await readIndex(s);
-          const total = Object.values(idx).reduce((sum, f) => sum + (Number(f.totalSize ?? f.size) || 0), 0);
-          kv.put(bKey, JSON.stringify(total), { expirationTtl: REPO_BYTES_CACHE_TTL }).catch(() => {});
-          return total;
-        }
         const { data: idx } = await readIndex(s);
         return Object.values(idx).reduce((sum, f) => sum + (Number(f.totalSize ?? f.size) || 0), 0);
       } catch { return 0; }
@@ -1105,7 +1081,7 @@ async function _handleRequest({ request, env, params }) {
           { method: 'DELETE', path: '/api/delete',           auth: ['session', 'apiKey'] },
           { method: 'GET',    path: '/api/share-link',       auth: ['session', 'apiKey'] },
           { method: 'GET',    path: '/api/read-text',         auth: ['session', 'apiKey'], note: 'Read editable text file content + sha (txt, md, json, csv, yaml…)' },
-          { method: 'PUT',    path: '/api/edit-text',         auth: ['session'],           note: 'Save edited text content back; requires sha from read-text' },
+          { method: 'POST',   path: '/api/edit-text',         auth: ['session'],           note: 'Save edited text content back; requires sha from read-text' },
           { method: 'GET',    path: '/api/apikeys/list',     auth: ['session'] },
           { method: 'POST',   path: '/api/apikeys/create',   auth: ['session'] },
           { method: 'DELETE', path: '/api/apikeys/revoke',   auth: ['session'] },
@@ -1229,6 +1205,9 @@ async function _handleRequest({ request, env, params }) {
         const remaining = Math.ceil((sess.exp - Date.now()) / 1000);
         if (remaining > 0) await kv.put(`revoked:${sess.jti}`, '1', { expirationTtl: remaining }).catch(() => {});
         await kv.delete(`sess_cache:${sess.jti}`).catch(() => {});
+        // Clear index cache so the next user never sees this user's file list
+        const fullSessForLogout = await getFullSession(sess, env, secret).catch(() => null);
+        if (fullSessForLogout) invalidateIndexCache(fullSessForLogout, kv);
       }
     }
     return jsonRes(request, { ok:true }, 200, { 'Set-Cookie': buildSetCookie(request, '', 0) });
@@ -1908,9 +1887,6 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
           : [finalSess];
         for (const rs of affectedRepos) {
           invalidateIndexCache(rs, kv);
-          // Bust repo-bytes cache so next upload sees fresh sizes
-          const bKey = `rbytes:${rs.ghOwner}:${rs.ghRepo}:${(rs.ghBranch||'main').replace(/\//g,'_')}:${rs.folder||'uploads'}`;
-          kv.delete(bKey).catch(() => {});
         }
       }
       const { data: idx, sha: idxSha } = await readIndex(finalSess);
@@ -2011,7 +1987,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
         delete idx[safe];
         await writeIndex(delSess, idx, idxSha);
         invalidateIndexCache(delSess, kv);
-        if (kv) { const bKey = `rbytes:${delSess.ghOwner}:${delSess.ghRepo}:${(delSess.ghBranch||'main').replace(/\//g,'_')}:${delSess.folder||'uploads'}`; kv.delete(bKey).catch(() => {}); }
+        if (kv) { kv.delete(`sess_cache:${sess.jti}`).catch(() => {}); }
         return jRes({ ok:true });
       } catch { return jRes({ error: ERRS[502] },502); }
     } else {
@@ -2022,7 +1998,6 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
           const { data: idx, sha: idxSha } = await readIndex(delSess);
           if (idx[safe]) { delete idx[safe]; await writeIndex(delSess, idx, idxSha); }
           invalidateIndexCache(delSess, kv);
-          if (kv) { const bKey = `rbytes:${delSess.ghOwner}:${delSess.ghRepo}:${(delSess.ghBranch||'main').replace(/\//g,'_')}:${delSess.folder||'uploads'}`; kv.delete(bKey).catch(() => {}); }
         } catch {}
         return jRes({ ok:true });
       } catch { return jRes({ error: ERRS[502] },502); }
@@ -2057,7 +2032,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
   // Saves edited text content back to the repo. Body: { name, content, sha, repoIdx? }
   // `sha` must be the blob SHA returned by /api/read-text (GitHub requires it to
   // detect conflicts — if the file was modified externally the PUT will 409).
-  if (route === 'edit-text' && method === 'PUT') {
+  if (route === 'edit-text' && method === 'POST') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
     const { name: rawName, content, sha: fileSha, repoIdx: editRepoIdx } = body || {};
