@@ -170,6 +170,7 @@ function openDrawer() {
   document.getElementById('drawer-overlay').classList.add('is-open');
   document.getElementById('hamburger-btn').classList.add('is-open');
   document.body.style.overflow = 'hidden';
+  hideApiKeyReveal();
   loadApiKeys();
 }
 function closeDrawer() {
