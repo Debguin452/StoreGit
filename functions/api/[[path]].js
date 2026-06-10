@@ -78,7 +78,6 @@ const SEC = {
     "connect-src 'self'; frame-ancestors 'none'; form-action 'none'; base-uri 'none';",
   'Cache-Control': 'no-store',
 };
-// allowedOrigins: null=same-origin, []=any, [...]=whitelist
 function corsHeaders(req, allowedOrigins = null) {
   const o = req.headers.get('Origin') || '';
   const h = req.headers.get('Host')   || '';
@@ -89,15 +88,16 @@ function corsHeaders(req, allowedOrigins = null) {
     allowOrigin = o; allowCreds = 'true';
   } else if (allowedOrigins !== null) {
     if (allowedOrigins.length === 0) {
-      allowOrigin = o || '*';   // unrestricted API key
+      allowOrigin = o || '*';
     } else if (o && allowedOrigins.includes(o)) {
-      allowOrigin = o;          // domain-bound API key
+      allowOrigin = o;
     }
   }
   return {
     'Access-Control-Allow-Origin':      allowOrigin,
-    'Access-Control-Allow-Methods':     'GET,POST,DELETE,OPTIONS',
-    'Access-Control-Allow-Headers':     'Content-Type,X-API-Key',
+    'Access-Control-Allow-Methods':     'GET,POST,PUT,DELETE,OPTIONS',
+    'Access-Control-Allow-Headers':     'Content-Type,X-API-Key,Authorization,Accept',
+    'Access-Control-Expose-Headers':    'Content-Length,Content-Disposition',
     'Access-Control-Allow-Credentials': allowCreds,
     'Vary': 'Origin',
   };
@@ -1335,7 +1335,7 @@ async function _handleRequest({ request, env, params }) {
     if (!akResult) return fail(request, 401);
     if (akResult.blocked) return jsonRes(request, { error: akResult.reason }, 403);
     // API keys can access storage routes only (not account management)
-    const AK_ALLOWED = new Set(['files','upload','upload-chunk','finalize-upload','download','delete','share-link','me','repos','storage']);
+    const AK_ALLOWED = new Set(['files','upload','upload-chunk','finalize-upload','download','delete','share-link','me','repos','storage','read-text']);
     if (!AK_ALLOWED.has(route)) return fail(request, 403);
     return _dispatchRoute(route, method, request, env, akResult.fullSess, null, secret, akResult.allowedOrigins);
   }
