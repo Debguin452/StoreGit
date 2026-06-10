@@ -568,7 +568,7 @@ const regH = env => ({
 const regBase = env =>
   `https://api.github.com/repos/${encodeURIComponent(env.REGISTRY_GITHUB_OWNER)}/${encodeURIComponent(env.REGISTRY_GITHUB_REPO)}`;
 
-const EDITABLE_EXTS = new Set(['txt','md','markdown','csv','json','log','ini','cfg','conf','yaml','yml','toml','diff','patch','nfo','css','sql','r','lua','xml','sh','bash']);
+const EDITABLE_EXTS = new Set(['txt','md','markdown','log','nfo','json','yaml','yml','toml','ini','cfg','conf','csv','tsv','html','htm','css','js','mjs','cjs','ts','jsx','tsx','c','h','cpp','hpp','cc','cxx','java','go','rs','swift','kt','py','rb','php','lua','r','sh','bash','sql','xml','diff','patch','tex']);
 function getRepoSess(fullSess, repoIdx) {
   const repos = fullSess.repos || [];
   const idx   = (Number.isInteger(repoIdx) && repoIdx >= 0 && repoIdx < repos.length) ? repoIdx : 0;
