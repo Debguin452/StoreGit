@@ -79,19 +79,30 @@ const SEC = {
   'Cache-Control': 'no-store',
 };
 function corsHeaders(req, allowedOrigins = null) {
-  const o = req.headers.get('Origin') || '';
-  const h = req.headers.get('Host')   || '';
-  const isSame = o === `https://${h}` || o === `http://${h}`;
-  let allowOrigin = 'null';
-  let allowCreds  = 'false';
-  if (isSame) {
-    allowOrigin = o; allowCreds = 'true';
-  } else if (allowedOrigins !== null) {
-    if (allowedOrigins.length === 0) {
-      allowOrigin = o || '*';
-    } else if (o && allowedOrigins.includes(o)) {
-      allowOrigin = o;
-    }
+  const o      = req.headers.get('Origin') || '';
+  // ── Open-CORS logic ───────────────────────────────────────────────────────
+  // allowedOrigins === null  → session-cookie route (credentials: 'include').
+  //   Browsers forbid Access-Control-Allow-Origin: * with credentials, so we
+  //   echo the request Origin so the browser accepts it.
+  //
+  // allowedOrigins !== null  → API-key or public route.
+  //   API keys are bearer tokens in X-API-Key; no cookie is involved, so
+  //   we return * and any server / any origin can call the API freely.
+  //   If the key owner restricted origins to a list, we honour that list.
+  let allowOrigin;
+  let allowCreds;
+  if (allowedOrigins === null) {
+    // Session route — echo origin (not *) so credentials work
+    allowOrigin = o || 'null';
+    allowCreds  = 'true';
+  } else if (allowedOrigins.length === 0) {
+    // API-key / public route with no restriction → fully open
+    allowOrigin = '*';
+    allowCreds  = 'false';
+  } else {
+    // API-key route with an explicit origin allowlist
+    allowOrigin = (o && allowedOrigins.includes(o)) ? o : 'null';
+    allowCreds  = 'false';
   }
   return {
     'Access-Control-Allow-Origin':      allowOrigin,
@@ -99,7 +110,7 @@ function corsHeaders(req, allowedOrigins = null) {
     'Access-Control-Allow-Headers':     'Content-Type,X-API-Key,Authorization,Accept',
     'Access-Control-Expose-Headers':    'Content-Length,Content-Disposition',
     'Access-Control-Allow-Credentials': allowCreds,
-    'Vary': 'Origin',
+    'Vary': allowOrigin === '*' ? 'Accept-Encoding' : 'Origin',
   };
 }
 
@@ -270,7 +281,7 @@ async function resolveApiKey(request, env, secret) {
 function jsonRes(req, data, status = 200, extra = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { ...SEC, ...corsHeaders(req), 'Content-Type': 'application/json', ...extra },
+    headers: { ...SEC, ...corsHeaders(req, []), 'Content-Type': 'application/json', ...extra },
   });
 }
 const ERRS = {
