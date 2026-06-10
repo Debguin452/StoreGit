@@ -129,12 +129,19 @@ document.getElementById('share-ttl-opts')?.addEventListener('click', e => {
 });
 
 const dropZone = document.getElementById('drop-zone');
-if (dropZone) {
-  // No explicit 'click' handler needed — the <input type="file"> is already positioned
-  // absolute/inset-0 over the zone (opacity:0), so clicks land on it directly.
-  // Adding dropZone.click→input.click() caused a double file-picker on Safari/Firefox.
+const fileInput = document.getElementById('file-input');
+if (dropZone && fileInput) {
+  // Click anywhere on the zone (including icon/text children) opens the picker.
+  // Guard: if the click already landed on the input itself, skip to avoid double-open.
+  dropZone.addEventListener('click', e => {
+    if (e.target === fileInput) return;
+    fileInput.click();
+  });
   dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
-  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+  dropZone.addEventListener('dragleave', e => {
+    // Only remove if leaving the zone entirely (not entering a child element)
+    if (!dropZone.contains(e.relatedTarget)) dropZone.classList.remove('drag-over');
+  });
   dropZone.addEventListener('drop', e => {
     e.preventDefault(); dropZone.classList.remove('drag-over');
     if (e.dataTransfer?.files?.length) onFilePicked(e.dataTransfer.files);
@@ -151,12 +158,16 @@ async function doLogout() {
 
 function unauth() { window.location.replace('/'); }
 
+let _repoStorage = []; // storage bytes per repo index from /api/me
+
 async function loadMeta() {
   try {
     const r = await fetch('/api/me', { credentials: 'same-origin' });
     if (r.status === 401) { unauth(); return; }
     if (r.ok) {
       const d = await r.json();
+      // /api/me returns storage stats per repo in d.storage (array of {bytes, limit})
+      _repoStorage = Array.isArray(d.storage) ? d.storage : [];
       updateRepoChip(d.repos || []);
     }
   } catch {}
@@ -174,6 +185,7 @@ function openDrawer() {
   document.body.style.overflow = 'hidden';
   hideApiKeyReveal();
   loadApiKeys();
+  loadMeta(); // refresh storage stats every time drawer opens
 }
 function closeDrawer() {
   document.getElementById('drawer').classList.remove('is-open');
@@ -200,6 +212,36 @@ function renderDrawerRepoList() {
     const slug  = elem('div', 'drawer-repo-item-slug');
     slug.textContent = customLabel ? `${repo.ghOwner}/${repo.ghRepo}` : '';
     item.append(label, slug);
+
+    // ── Storage bar ─────────────────────────────────────────────────────────
+    const stor = _repoStorage[i];
+    const storWrap = elem('div', 'drawer-repo-storage');
+    if (stor && (stor.bytes > 0 || stor.limit > 0)) {
+      const used  = stor.bytes  || 0;
+      const limit = stor.limit  || (1024 * 1024 * 1024); // default 1 GB visual cap
+      const pct   = Math.min(100, Math.round(used / limit * 100));
+      const bar   = elem('div', 'drawer-repo-storage-bar');
+      const fill  = elem('div', 'drawer-repo-storage-fill');
+      fill.style.width = pct + '%';
+      if (pct > 85) fill.classList.add('warn');
+      bar.appendChild(fill);
+      const lbl = elem('div', 'drawer-repo-storage-label');
+      lbl.textContent = `${fmtSize(used)} used`;
+      storWrap.append(bar, lbl);
+    } else {
+      // Compute from cached file list if /api/me didn't return storage
+      const group = _repoFiles.find(g => g.repoIdx === i);
+      if (group) {
+        const used = (group.files || [])
+          .filter(f => f.name !== '.storegit' && !f.name.startsWith('.sgkeys/'))
+          .reduce((s, f) => s + (f.size || 0), 0);
+        const lbl = elem('div', 'drawer-repo-storage-label');
+        lbl.textContent = used > 0 ? `${fmtSize(used)} used` : 'Empty';
+        storWrap.appendChild(lbl);
+      }
+    }
+    item.appendChild(storWrap);
+
     if (i > 0) {
       const rmBtn = elem('button', 'drawer-repo-remove-btn');
       rmBtn.title = 'Remove repository';
@@ -212,7 +254,7 @@ function renderDrawerRepoList() {
           async () => {
             try {
               const r = await fetch('/api/remove-repo', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repoIdx: i }) });
-              if (r.ok) { toast('Repository removed.', 'ok'); await loadMeta(); loadFiles(); }
+              if (r.ok) { toast('Repository removed.', 'ok'); await loadMeta(); loadFiles(true); }
               else toast('Failed to remove.', 'error');
             } catch { toast('Connection error.', 'error'); }
           });
@@ -405,8 +447,15 @@ function buildFileRow(f) {
   return row;
 }
 
-async function loadFiles() {
+let _filesCachedAt = 0;
+const FILES_CACHE_TTL = 30_000; // 30 seconds
+
+async function loadFiles(force = false) {
   const el = document.getElementById('file-list');
+  // Return cached render if data is fresh and not forced
+  if (!force && _repoFiles.length && Date.now() - _filesCachedAt < FILES_CACHE_TTL) {
+    renderFiles(); return;
+  }
   el.innerHTML = '<div class="loading-row"><span class="spinner"></span> Loading files…</div>';
   try {
     if (_allRepos.length <= 1) {
@@ -425,6 +474,7 @@ async function loadFiles() {
       );
       _repoFiles = results.filter(r => r.status === 'fulfilled').map(r => r.value);
     }
+    _filesCachedAt = Date.now();
     renderFiles();
   } catch { el.innerHTML = '<div class="empty-state">Could not load files.</div>'; }
 }
@@ -526,7 +576,7 @@ async function startUpload() {
   uploadPending = uploadPending.filter(i => i.status !== 'done');
   renderQueue();
   if (!uploadPending.length) document.getElementById('upload-actions').style.display = 'none';
-  loadFiles();
+  loadFiles(true);
 }
 
 async function uploadSmall(item, repoIdx) {
@@ -622,50 +672,76 @@ async function loadFilePreview(f) {
   const noPreview = msg => { const p = elem('div', 'fd-preview-empty'); p.textContent = msg; el.replaceChildren(p); };
 
   if (!f.chunked) {
-    const r = await fetch(`/api/download?name=${encodeURIComponent(f.name)}&inline=1&repoIdx=${_currentFileRepoIdx}`, { credentials: 'same-origin' });
-    if (!r.ok) { noPreview('Preview unavailable.'); return; }
-    const d = await r.json();
-    const inlineUrl = d.url;
+    // /api/download streams the file bytes directly (not a JSON with a url field).
+    // We fetch it and turn it into a local blob: URL so the CSP never sees
+    // raw.githubusercontent.com — only blob: which is already whitelisted.
+    const fetchBlob = async () => {
+      const r = await fetch(
+        `/api/download?name=${encodeURIComponent(f.name)}&inline=1&repoIdx=${_currentFileRepoIdx}`,
+        { credentials: 'same-origin' }
+      );
+      if (!r.ok) throw new Error('not_ok');
+      return URL.createObjectURL(await r.blob());
+    };
 
     if (FD_IMG.has(ext)) {
       if (f.size > 20 * 1024 * 1024) { noPreview('Image too large to preview. Download to view.'); return; }
-      const img = elem('img', 'fd-preview-img');
-      img.alt    = f.name;
-      img.onerror = () => noPreview('Could not load image preview.');
-      el.replaceChildren(img);
-      img.src = inlineUrl;
+      el.innerHTML = '<div class="fd-preview-loading"><span class="spinner"></span> Loading preview…</div>';
+      try {
+        const blobUrl = await fetchBlob();
+        const img = elem('img', 'fd-preview-img');
+        img.alt = f.name;
+        img.onload  = () => { /* keep */ };
+        img.onerror = () => { URL.revokeObjectURL(blobUrl); noPreview('Could not load image preview.'); };
+        el.replaceChildren(img);
+        img.src = blobUrl;
+      } catch { noPreview('Preview unavailable.'); }
       return;
     }
     if (FD_AUDIO.has(ext)) {
       const tapBtn = elem('button', 'btn btn-outline fd-tap-load');
       tapBtn.textContent = 'Tap to load audio';
-      tapBtn.onclick = () => {
-        const aud = elem('audio', 'fd-preview-audio');
-        aud.controls = true; aud.preload = 'metadata';
-        aud.onerror = () => noPreview('Could not load audio preview.');
-        el.replaceChildren(aud); aud.src = inlineUrl;
+      tapBtn.onclick = async () => {
+        tapBtn.disabled = true; tapBtn.textContent = 'Loading…';
+        try {
+          const blobUrl = await fetchBlob();
+          const aud = elem('audio', 'fd-preview-audio');
+          aud.controls = true; aud.preload = 'metadata';
+          aud.onerror = () => { URL.revokeObjectURL(blobUrl); noPreview('Could not load audio preview.'); };
+          el.replaceChildren(aud); aud.src = blobUrl;
+        } catch { noPreview('Could not load audio.'); }
       };
       el.replaceChildren(tapBtn); return;
     }
     if (FD_VIDEO.has(ext)) {
       const tapBtn = elem('button', 'btn btn-outline fd-tap-load');
       tapBtn.textContent = 'Tap to load video';
-      tapBtn.onclick = () => {
-        const vid = elem('video', 'fd-preview-video');
-        vid.controls = true; vid.preload = 'metadata';
-        vid.onerror = () => noPreview('Could not load video preview.');
-        el.replaceChildren(vid); vid.src = inlineUrl;
+      tapBtn.onclick = async () => {
+        tapBtn.disabled = true; tapBtn.textContent = 'Loading…';
+        try {
+          const blobUrl = await fetchBlob();
+          const vid = elem('video', 'fd-preview-video');
+          vid.controls = true; vid.preload = 'metadata';
+          vid.onerror = () => { URL.revokeObjectURL(blobUrl); noPreview('Could not load video preview.'); };
+          el.replaceChildren(vid); vid.src = blobUrl;
+        } catch { noPreview('Could not load video.'); }
       };
       el.replaceChildren(tapBtn); return;
     }
     if (FD_TEXT.has(ext) && f.size <= 200_000) {
+      el.innerHTML = '<div class="fd-preview-loading"><span class="spinner"></span> Loading preview…</div>';
       try {
-        const res = await fetch(inlineUrl);
-        const text = await res.text();
+        const r = await fetch(
+          `/api/download?name=${encodeURIComponent(f.name)}&inline=1&repoIdx=${_currentFileRepoIdx}`,
+          { credentials: 'same-origin' }
+        );
+        if (!r.ok) { noPreview('Could not load text preview.'); return; }
+        const text = await r.text();
         const pre  = elem('pre', 'fd-preview-text');
         pre.textContent = text.length > 6000 ? text.slice(0, 6000) + '\n\n… (truncated)' : text;
-        el.replaceChildren(pre); return;
-      } catch { noPreview('Could not load text preview.'); return; }
+        el.replaceChildren(pre);
+      } catch { noPreview('Could not load text preview.'); }
+      return;
     }
   }
   noPreview('No preview available. Download to open this file.');
@@ -719,7 +795,7 @@ async function deleteFile(name, sha, chunked, displayName, repoIdx) {
     try {
       const r = await fetch('/api/delete', { method: 'DELETE', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, sha, chunked, repoIdx }) });
       if (r.status === 401) { unauth(); return; }
-      if (r.ok) { toast('File deleted.', 'ok'); loadFiles(); }
+      if (r.ok) { toast('File deleted.', 'ok'); loadFiles(true); }
       else toast('Delete failed.', 'error');
     } catch { toast('Connection error.', 'error'); }
   });
@@ -771,7 +847,7 @@ async function saveEditSheet() {
       _editSha = d.sha || _editSha;
       statusEl.textContent = 'Saved!';
       setTimeout(() => { statusEl.textContent = ''; }, 2000);
-      toast('File saved.', 'ok'); loadFiles();
+      toast('File saved.', 'ok'); loadFiles(true);
     } else if (r.status === 409) {
       statusEl.textContent = 'Conflict — file changed externally. Re-open to reload.';
     } else { statusEl.textContent = d.error || 'Save failed.'; }
