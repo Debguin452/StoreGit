@@ -222,10 +222,15 @@ function renderDrawerRepoList() {
 
 function toggleDrawerAddRepoForm() {
   const form = document.getElementById('drawer-add-repo-form');
-  const btn  = document.getElementById('drawer-add-repo-btn');
+  const btn = document.getElementById('drawer-add-repo-btn');
   if (!form || !btn) return;
-  if (form.style.display === 'none') { form.style.display = ''; btn.textContent = 'Cancel'; document.getElementById('dar-owner')?.focus(); }
-  else closeDrawerAddRepoForm();
+  if (getComputedStyle(form).display === 'none') {
+    form.style.display = 'flex';
+    btn.textContent = 'Cancel';
+    document.getElementById('dar-owner')?.focus();
+  } else {
+    closeDrawerAddRepoForm();
+  }
 }
 function closeDrawerAddRepoForm() {
   const form = document.getElementById('drawer-add-repo-form');
@@ -299,8 +304,12 @@ function toggleApiKeyForm() {
   const btn  = document.getElementById('apikey-new-btn');
   if (!form || !btn) return;
   hideApiKeyReveal();
-  if (form.style.display === 'none') { form.style.display = ''; btn.textContent = 'Cancel'; document.getElementById('ak-label')?.focus(); }
-  else closeApiKeyForm();
+  if (getComputedStyle(form).display === 'none') {
+    form.style.display = 'flex'; // or '' if CSS defines display
+    btn.textContent = 'Cancel';
+    document.getElementById('ak-label')?.focus();
+  } else {
+    closeApiKeyForm();}
 }
 function closeApiKeyForm() {
   const form = document.getElementById('apikey-form');
