@@ -88,7 +88,7 @@ export async function onRequest({ request, next, env }) {
   if (isRateLimited(ip)) return deny(429, 'Too many requests');
 
   // ── 4. Block bad methods ──────────────────────────────────────────────────
-  const ALLOWED_METHODS = new Set(['GET','POST','DELETE','OPTIONS','HEAD']);
+  const ALLOWED_METHODS = new Set(['GET','POST','PUT','DELETE','OPTIONS','HEAD']);
   if (!ALLOWED_METHODS.has(method)) return deny(405, 'Method not allowed');
 
   // ── 5. Block path traversal & null bytes ─────────────────────────────────
