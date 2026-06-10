@@ -4,7 +4,9 @@
   "exclude": [
     "/app.css",
     "/app.js",
+    "/auth.js",
     "/storegit-logo.png",
-    "/index.html"
+    "/index.html",
+    "/files.html"
   ]
 }

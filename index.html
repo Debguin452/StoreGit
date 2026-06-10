@@ -2,10 +2,9 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="google-site-verification" content="5MsDsTAwtGw6vur-L1tL4IPjLOmzUAmjDEpChKCidmc" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <meta http-equiv="Content-Security-Policy"
-  content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self' https://api.github.com; base-uri 'none';">
+  content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://api.github.com; base-uri 'none';">
 <meta name="referrer" content="no-referrer">
 <title>StoreGit</title>
 <link rel="icon" type="image/png" href="storegit-logo.png" sizes="any">
@@ -13,13 +12,11 @@
 <meta name="theme-color" content="#2563eb">
 <link rel="stylesheet" href="app.css">
 </head>
-<body>
-<div id="login-screen" class="screen">
+<body class="auth-body">
+<div id="view-login" class="auth-view active">
   <div class="auth-card">
     <div class="brand">
-      <div class="brand-logo">
-        <img src="storegit-logo.png" alt="StoreGit" width="44" height="44">
-      </div>
+      <div class="brand-logo"><img src="storegit-logo.png" alt="StoreGit" width="44" height="44"></div>
       <h1>StoreGit</h1>
       <p>Sign in to your storage</p>
     </div>
@@ -32,18 +29,16 @@
       <label for="login-password">Password</label>
       <input id="login-password" type="password" placeholder="Your password" autocomplete="current-password">
     </div>
-    <div class="form-error"  id="login-error"></div>
+    <div class="form-error" id="login-error"></div>
     <div class="lockout-msg" id="login-lockout"></div>
     <button class="btn btn-primary" id="login-btn">Sign In</button>
     <div class="form-note">No account yet? <a href="#" id="goto-signup">Create one</a> &nbsp;&middot;&nbsp; <a href="#" id="goto-reset">Forgot password?</a></div>
   </div>
 </div>
-<div id="signup-screen" class="screen">
+<div id="view-signup" class="auth-view">
   <div class="auth-card">
     <div class="brand">
-      <div class="brand-logo">
-        <img src="storegit-logo.png" alt="StoreGit" width="44" height="44">
-      </div>
+      <div class="brand-logo"><img src="storegit-logo.png" alt="StoreGit" width="44" height="44"></div>
       <h1>StoreGit</h1>
       <p>Create your personal storage</p>
     </div>
@@ -63,8 +58,7 @@
       </div>
       <div class="field">
         <label for="s-password">Password</label>
-        <input id="s-password" type="password" placeholder="Minimum 8 characters"
-               autocomplete="new-password">
+        <input id="s-password" type="password" placeholder="Minimum 8 characters" autocomplete="new-password">
         <div class="pw-strength" id="pw-strength">
           <div class="pw-strength-bar"><div class="pw-strength-fill" id="pw-strength-fill"></div></div>
           <div class="pw-strength-label" id="pw-strength-label"></div>
@@ -113,12 +107,10 @@
       <div class="step-sub">Your account has been created. Sign in to start using your storage.</div>
       <button class="btn btn-primary" id="step3-signin-btn">Go to Sign In</button>
     </div>
-    <div class="form-note" id="signup-footer-note">
-      Already have an account? <a href="#" id="goto-login">Sign in</a>
-    </div>
+    <div class="form-note" id="signup-footer-note">Already have an account? <a href="#" id="goto-login">Sign in</a></div>
   </div>
 </div>
-<div id="reset-screen" class="screen">
+<div id="view-reset" class="auth-view">
   <div class="auth-card">
     <div class="brand">
       <div class="brand-logo"><img src="storegit-logo.png" alt="StoreGit" width="44" height="44"></div>
@@ -142,228 +134,7 @@
     <div class="form-note"><a href="#" id="reset-back">Back to Sign In</a></div>
   </div>
 </div>
-<div id="app-screen">
-  <div class="app-topbar">
-    <div class="app-brand">
-      <div class="app-brand-logo">
-        <img src="storegit-logo.png" alt="StoreGit" width="26" height="26">
-      </div>
-      <div class="app-brand-text">
-        <h1>StoreGit</h1>
-      </div>
-    </div>
-    <div class="topbar-right">
-      <button class="hamburger-btn" id="hamburger-btn" aria-label="Open menu" title="Menu">
-        <span></span><span></span><span></span>
-      </button>
-      <button class="btn-signout" id="signout-btn" title="Sign out" aria-label="Sign out">
-        <svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-      </button>
-    </div>
-  </div>
-  <div class="app-body">
-    <div class="card">
-      <div class="card-header">
-        <div class="card-title">Upload</div>
-      </div>
-      <div class="drop-zone" id="drop-zone">
-        <input type="file" id="file-input" multiple>
-        <div class="drop-zone-icon">
-          <svg viewBox="0 0 36 36" fill="none">
-            <path d="M18 24V12M12 18l6-6 6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M6 26c0 1.1.9 2 2 2h20a2 2 0 0 0 2-2v-2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-          </svg>
-        </div>
-        <div class="drop-zone-title">Click to select files or drag them here</div>
-      </div>
-      <div class="upload-queue" id="upload-queue"></div>
-      <div class="upload-actions" id="upload-actions">
-        <button class="btn btn-primary btn-sm" id="upload-btn">Upload Files</button>
-        <button class="btn btn-ghost btn-sm" id="pause-btn">Pause</button>
-        <button class="btn btn-ghost btn-sm" id="clear-queue-btn">Clear</button>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-header">
-        <div class="card-title">Files</div>
-        <button class="btn btn-ghost btn-sm" id="refresh-files-btn">Refresh</button>
-      </div>
-      <div id="file-list"></div>
-    </div>
-  </div>
-  <div class="app-footer">Created by Deb Guin &nbsp;&middot;&nbsp; StoreGit</div>
-</div>
-
-<!-- Drawer overlay -->
-<div class="drawer-overlay" id="drawer-overlay"></div>
-
-<!-- Side drawer -->
-<div class="drawer" id="drawer" role="dialog" aria-modal="true" aria-label="Menu">
-  <div class="drawer-header">
-    <span class="drawer-title">Menu</span>
-    <button class="drawer-close-btn" id="drawer-close-btn" aria-label="Close menu">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-    </button>
-  </div>
-
-  <!-- Repositories -->
-  <div class="drawer-section">
-    <div class="drawer-section-header">
-      <span class="drawer-section-title">Repositories</span>
-      <button class="btn btn-ghost btn-sm" id="drawer-add-repo-btn">Add</button>
-    </div>
-    <div id="drawer-repo-list" class="drawer-repo-list"></div>
-    <div id="drawer-add-repo-form" style="display:none" class="drawer-form">
-      <div class="field"><label for="dar-label">Label</label><input id="dar-label" placeholder="e.g. Media Backup" autocomplete="off" autocorrect="off" spellcheck="false"></div>
-      <div class="field"><label for="dar-owner">GitHub Owner</label><input id="dar-owner" placeholder="your-github-username" autocomplete="off" autocorrect="off" spellcheck="false"></div>
-      <div class="field"><label for="dar-repo">Repository Name</label><input id="dar-repo" placeholder="my-storage" autocomplete="off" autocorrect="off" spellcheck="false"></div>
-      <div class="field"><label for="dar-branch">Branch</label><input id="dar-branch" value="main" autocomplete="off"></div>
-      <div class="form-error" id="dar-error"></div>
-      <div class="drawer-form-actions">
-        <button class="btn btn-primary btn-sm" id="dar-submit-btn">Add Repository</button>
-        <button class="btn btn-ghost btn-sm" id="dar-cancel-btn">Cancel</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- API Keys -->
-  <div class="drawer-section">
-    <div class="drawer-section-header">
-      <span class="drawer-section-title">API Keys</span>
-      <button class="btn btn-ghost btn-sm" id="apikey-new-btn">New Key</button>
-    </div>
-    <p class="drawer-section-sub">Use API keys to access your storage from external apps. Bind a key to specific origins for maximum security.</p>
-    <div id="apikey-list" class="apikey-list"></div>
-    <div id="apikey-reveal" style="display:none" class="apikey-reveal-box">
-      <div class="apikey-reveal-label">Copy your new key now — it will never be shown again:</div>
-      <div class="apikey-reveal-row">
-        <code class="apikey-reveal-code" id="apikey-reveal-code"></code>
-        <button class="btn btn-ghost btn-sm" id="apikey-copy-btn">Copy</button>
-      </div>
-    </div>
-    <div id="apikey-form" style="display:none" class="drawer-form">
-      <div class="field"><label for="ak-label">Key Label</label><input id="ak-label" placeholder="e.g. My Blog, Dev Project" autocomplete="off" autocorrect="off" spellcheck="false"></div>
-      <div class="field">
-        <label for="ak-origins">Allowed Origins <span class="field-hint-inline">(one per line, blank = any)</span></label>
-        <textarea id="ak-origins" rows="3" placeholder="https://myapp.com&#10;https://localhost:3000" spellcheck="false" autocomplete="off"></textarea>
-        <div class="field-hint">Restricts which websites can use this key via CORS. Leave blank to allow any origin.</div>
-      </div>
-      <div class="form-error" id="ak-error"></div>
-      <div class="drawer-form-actions">
-        <button class="btn btn-primary btn-sm" id="ak-submit-btn">Generate Key</button>
-        <button class="btn btn-ghost btn-sm" id="ak-cancel-btn">Cancel</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- API reference -->
-  <div class="drawer-section drawer-api-docs">
-    <div class="drawer-section-title">API Reference</div>
-    <p class="drawer-section-sub">Pass your key as the <code class="ic">X-API-Key</code> header. All endpoints return JSON.</p>
-    <div class="api-doc-list">
-      <div class="api-doc-row"><span class="api-badge api-get">GET</span><code class="ic">/api/files</code><span class="api-doc-desc">List all files</span></div>
-      <div class="api-doc-row"><span class="api-badge api-get">GET</span><code class="ic">/api/download?name=…</code><span class="api-doc-desc">Download a file</span></div>
-      <div class="api-doc-row"><span class="api-badge api-post">POST</span><code class="ic">/api/upload</code><span class="api-doc-desc">Upload (JSON body)</span></div>
-      <div class="api-doc-row"><span class="api-badge api-del">DELETE</span><code class="ic">/api/delete</code><span class="api-doc-desc">Delete a file</span></div>
-      <div class="api-doc-row"><span class="api-badge api-get">GET</span><code class="ic">/api/me</code><span class="api-doc-desc">Current user + repos</span></div>
-    </div>
-  </div>
-</div>
-<div class="dl-progress-bar" id="dl-bar">
-  <div class="dl-filename" id="dl-filename"></div>
-  <div class="dl-track"><div class="dl-fill" id="dl-fill"></div></div>
-  <div class="dl-label" id="dl-label">Preparing download…</div>
-</div>
-<div class="fd-overlay" id="fd-overlay">
-  <div class="fd-sheet" id="fd-sheet">
-    <div class="fd-handle"></div>
-    <div class="fd-header">
-      <div class="fd-header-icon" id="fd-icon">FILE</div>
-      <div class="fd-header-info">
-        <div class="fd-header-name" id="fd-name"></div>
-        <div class="fd-header-meta" id="fd-meta"></div>
-      </div>
-      <button class="fd-close" id="fd-close-btn" aria-label="Close">
-        <svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-      </button>
-    </div>
-    <div class="fd-preview" id="fd-preview"></div>
-    <div class="fd-actions">
-      <button class="btn btn-primary" id="fd-dl-btn">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M12 5v14M5 12l7 7 7-7"/></svg>
-        Download
-      </button>
-      <button class="btn btn-outline" id="fd-edit-btn" style="display:none">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-        Edit
-      </button>
-      <button class="btn btn-outline" id="fd-share-btn">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
-        Share
-      </button>
-      <button class="btn btn-danger" id="fd-del-btn">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
-        Delete
-      </button>
-    </div>
-  </div>
-</div>
-<div class="modal-overlay" id="share-overlay">
-  <div class="modal share-modal">
-    <div class="modal-title">Share File</div>
-    <div class="share-file-name" id="share-file-name"></div>
-    <div id="share-pre">
-      <div class="share-ttl-row">
-        <span class="share-ttl-label">Expires in</span>
-        <div class="share-ttl-opts" id="share-ttl-opts">
-          <button class="ttl-opt active" data-ttl="3600">1 hr</button>
-          <button class="ttl-opt" data-ttl="86400">24 hr</button>
-          <button class="ttl-opt" data-ttl="604800">7 days</button>
-          <button class="ttl-opt" data-ttl="0">Never</button>
-        </div>
-      </div>
-    </div>
-    <div id="share-post" style="display:none">
-      <div class="share-link-row">
-        <input class="share-link-input" id="share-link-input" type="text" readonly>
-        <button class="share-copy-btn" id="share-copy-btn">Copy</button>
-      </div>
-      <div class="share-exp" id="share-exp"></div>
-    </div>
-    <div class="share-spinner" id="share-spinner"><span class="spinner"></span></div>
-    <div class="modal-actions">
-      <button class="btn btn-ghost" id="share-close-btn">Close</button>
-      <button class="btn btn-primary" id="share-create-btn">Create Link</button>
-    </div>
-  </div>
-</div>
-<div class="modal-overlay" id="modal-overlay">
-  <div class="modal">
-    <div class="modal-title" id="modal-title"></div>
-    <div class="modal-msg" id="modal-msg"></div>
-    <div class="modal-actions">
-      <button class="btn btn-ghost" id="modal-cancel-btn">Cancel</button>
-      <button class="btn btn-danger" id="modal-confirm-btn">Confirm</button>
-    </div>
-  </div>
-</div>
-<!-- Text editor overlay -->
-<div class="edit-overlay" id="edit-overlay">
-  <div class="edit-sheet">
-    <div class="edit-header">
-      <div class="edit-filename" id="edit-filename"></div>
-      <div class="edit-header-actions">
-        <span class="edit-status" id="edit-status"></span>
-        <button class="btn btn-primary btn-sm" id="edit-save-btn">Save</button>
-        <button class="edit-close-btn" id="edit-close-btn" aria-label="Close editor">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" width="18" height="18"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-        </button>
-      </div>
-    </div>
-    <textarea class="edit-textarea" id="edit-textarea" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"></textarea>
-  </div>
-</div>
 <div class="toast" id="toast"></div>
-<script src="app.js"></script>
+<script src="auth.js"></script>
 </body>
 </html>
