@@ -101,17 +101,10 @@
     </div>
     <div id="apikey-form" style="display:none" class="drawer-form">
       <div class="field"><label for="ak-label">Key Label</label><input id="ak-label" placeholder="e.g. My Blog, Dev Project" autocomplete="off" autocorrect="off" spellcheck="false"></div>
-      <div class="field ak-restrict-row">
-        <label class="ak-toggle-label">
-          <input type="checkbox" id="ak-restrict-toggle">
-          <span>Restrict to specific domains</span>
-        </label>
-        <div class="field-hint">Off by default — key works from any platform, server, or app.</div>
-      </div>
-      <div id="ak-origins-wrap" style="display:none" class="field">
-        <label for="ak-origins">Allowed Origins <span class="field-hint-inline">(one per line)</span></label>
+      <div class="field">
+        <label for="ak-origins">Allowed Origins <span class="field-hint-inline">(one per line, leave blank for any)</span></label>
         <textarea id="ak-origins" rows="3" placeholder="https://myapp.com&#10;https://localhost:3000" spellcheck="false" autocomplete="off"></textarea>
-        <div class="field-hint">Only requests from these origins will be accepted.</div>
+        <div class="field-hint">Blank = works from any platform, server, or app. Add origins to restrict to specific domains.</div>
       </div>
       <div class="form-error" id="ak-error"></div>
       <div class="drawer-form-actions">
