@@ -347,7 +347,7 @@ async function submitApiKey() {
       closeApiKeyForm();
       const box = document.getElementById('apikey-reveal');
       const code = document.getElementById('apikey-reveal-code');
-      if (box && code) { code.textContent = d.rawKey; box.style.display = ''; }
+      if (box && code) { code.textContent = d.rawKey; box.style.display = 'block'; }
       toast('API key created. Copy it now — it will not be shown again!', 'ok');
       loadApiKeys();
     } else errEl.textContent = d.error || 'Failed to create API key.';
