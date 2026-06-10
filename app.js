@@ -111,7 +111,10 @@ on('apikey-copy-btn',    'click',  () => {
   const code = document.getElementById('apikey-reveal-code');
   if (code) navigator.clipboard?.writeText(code.textContent).then(() => toast('API key copied.', 'ok')).catch(() => {});
 });
-
+on('ak-restrict-toggle', 'change', e  => {
+  const wrap = document.getElementById('ak-origins-wrap');
+  if (wrap) wrap.style.display = e.target.checked ? '' : 'none';
+});
 document.addEventListener('paste', e => {
   const files = [];
   for (const item of e.clipboardData?.items || [])
@@ -163,10 +166,9 @@ async function loadMeta() {
     if (r.status === 401) { unauth(); return; }
     if (r.ok) {
       const d = await r.json();
+      // /api/me returns storage stats per repo in d.storage (array of {bytes, limit})
       _repoStorage = Array.isArray(d.storage) ? d.storage : [];
       updateRepoChip(d.repos || []);
-      const userEl = document.getElementById('topbar-user');
-      if (userEl && (d.display || d.username)) userEl.textContent = d.display || d.username;
     }
   } catch {}
 }
@@ -240,7 +242,7 @@ function renderDrawerRepoList() {
     }
     item.appendChild(storWrap);
 
-    if (_allRepos.length > 1) {
+    if (i > 0) {
       const rmBtn = elem('button', 'drawer-repo-remove-btn');
       rmBtn.title = 'Remove repository';
       rmBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
@@ -359,16 +361,19 @@ function closeApiKeyForm() {
   const btn  = document.getElementById('apikey-new-btn');
   if (form) form.style.display = 'none';
   if (btn)  btn.textContent = 'New Key';
-  const err  = document.getElementById('ak-error');  if (err)  err.textContent = '';
-  const lbl  = document.getElementById('ak-label');  if (lbl)  lbl.value = '';
+  const err = document.getElementById('ak-error'); if (err) err.textContent = '';
+  const lbl = document.getElementById('ak-label'); if (lbl) lbl.value = '';
+  const tog = document.getElementById('ak-restrict-toggle'); if (tog) tog.checked = false;
+  const wrap = document.getElementById('ak-origins-wrap'); if (wrap) wrap.style.display = 'none';
   const orig = document.getElementById('ak-origins'); if (orig) orig.value = '';
 }
 function hideApiKeyReveal() {
   const box = document.getElementById('apikey-reveal'); if (box) box.style.display = 'none';
 }
 async function submitApiKey() {
-  const label      = document.getElementById('ak-label')?.value.trim() || '';
-  const originsRaw = (document.getElementById('ak-origins')?.value || '');
+  const label    = document.getElementById('ak-label')?.value.trim() || '';
+  const restrict = document.getElementById('ak-restrict-toggle')?.checked || false;
+  const originsRaw = restrict ? (document.getElementById('ak-origins')?.value || '') : '';
   const allowedOrigins = originsRaw.split('\n').map(s => s.trim()).filter(s => {
     try { const u = new URL(s); return ALLOWED_SCHEMES.has(u.protocol); } catch { return false; }
   });
@@ -376,8 +381,8 @@ async function submitApiKey() {
   const btn   = document.getElementById('ak-submit-btn');
   errEl.textContent = '';
   if (!label) { errEl.textContent = 'Please enter a label for this key.'; return; }
-  if (originsRaw.trim() && !allowedOrigins.length) {
-    errEl.textContent = 'Enter valid https:// origins (e.g. https://myapp.com), or leave blank for unrestricted.'; return;
+  if (restrict && originsRaw.trim() && !allowedOrigins.length) {
+    errEl.textContent = 'Enter valid origins (e.g. https://myapp.com) or disable restriction.'; return;
   }
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
   try {
@@ -426,19 +431,6 @@ function fileColor(ext) {
   return map[ext] || '#64748b';
 }
 
-function fmtDate(iso) {
-  if (!iso) return '';
-  try {
-    const d = new Date(iso);
-    const now = new Date();
-    const diff = now - d;
-    if (diff < 60000)         return 'just now';
-    if (diff < 3600000)       return Math.floor(diff / 60000) + 'm ago';
-    if (diff < 86400000)      return Math.floor(diff / 3600000) + 'h ago';
-    if (diff < 7 * 86400000)  return Math.floor(diff / 86400000) + 'd ago';
-    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: d.getFullYear() !== now.getFullYear() ? 'numeric' : undefined });
-  } catch { return ''; }
-}
 function buildFileRow(f) {
   const row   = elem('div', 'file-row');
   const badge = elem('div', 'file-type-badge');
@@ -448,9 +440,7 @@ function buildFileRow(f) {
   badge.style.color       = '#fff';
   const info = elem('div', 'file-info');
   const nm   = elem('div', 'file-name'); nm.textContent = displayName; nm.title = displayName;
-  const datePart = fmtDate(f.uploadedAt);
-  const mt   = elem('div', 'file-meta');
-  mt.textContent = datePart ? `${fmtSize(f.size)} · ${datePart}` : fmtSize(f.size);
+  const mt   = elem('div', 'file-meta'); mt.textContent = fmtSize(f.size);
   info.append(nm, mt);
   row.append(badge, info);
   row.addEventListener('click', () => openFileDetail(f));
@@ -498,14 +488,7 @@ function renderFiles() {
       .map(f => ({ ...f, _repoIdx: g.repoIdx }))
   );
   if (!allFiles.length) {
-    el.innerHTML =
-      '<div class="empty-state">' +
-      '<div class="empty-state-icon"><svg viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">' +
-      '<rect x="8" y="6" width="24" height="28" rx="3"/><line x1="14" y1="14" x2="26" y2="14"/><line x1="14" y1="20" x2="26" y2="20"/><line x1="14" y1="26" x2="20" y2="26"/>' +
-      '</svg></div>' +
-      '<p>No files yet.<br>Upload your first file above.</p>' +
-      '</div>';
-    return;
+    const e = elem('div', 'empty-state'); e.textContent = 'No files uploaded yet.'; el.appendChild(e); return;
   }
   allFiles.sort((a, b) => {
     const at = a.uploadedAt || a.name, bt = b.uploadedAt || b.name;
@@ -531,28 +514,24 @@ function onFilePicked(files) {
 
 function renderQueue() {
   const q = document.getElementById('upload-queue');
-  if (!q) return;
   q.innerHTML = '';
-  q.style.display = uploadPending.length ? '' : 'none';
   uploadPending.forEach(item => {
-    const row  = elem('div', 'queue-item');
-    const icon = elem('div', 'queue-file-icon');
-    icon.textContent = fileExt(item.file.name);
-    const info = elem('div', 'queue-info');
-    const nm   = elem('div', 'queue-name'); nm.textContent = item.file.name;
-    const sz   = elem('div', 'queue-size'); sz.textContent = fmtSize(item.file.size);
-    const bar  = elem('div', 'queue-bar');
-    const fill = elem('div', 'queue-fill');
-    if (item.status === 'uploading') { fill.style.width = item.progress + '%'; fill.classList.add('wave'); }
-    else if (item.status === 'done') { fill.style.width = '100%'; }
-    bar.appendChild(fill);
-    info.append(nm, sz, bar);
-    const status = elem('div', 'queue-status');
-    if      (item.status === 'queued')    { status.className = 'queue-status wait'; status.textContent = 'Queued'; }
-    else if (item.status === 'uploading') { status.className = 'queue-status go';   status.textContent = item.progress + '%'; }
-    else if (item.status === 'done')      { status.className = 'queue-status ok';   status.textContent = 'Done'; }
-    else if (item.status === 'error')     { status.className = 'queue-status fail'; status.textContent = 'Failed'; }
-    row.append(icon, info, status);
+    const row   = elem('div', 'upload-queue-row');
+    const badge = elem('div', 'file-type-badge');
+    badge.textContent      = fileExt(item.file.name);
+    badge.style.background = fileColor(fileExtRaw(item.file.name));
+    badge.style.color      = '#fff';
+    const info = elem('div', 'upload-queue-info');
+    const nm   = elem('div', 'upload-queue-name'); nm.textContent = item.file.name;
+    const mt   = elem('div', 'upload-queue-meta'); mt.textContent = fmtSize(item.file.size);
+    info.append(nm, mt);
+    const progress = elem('div', 'upload-progress');
+    const bar = elem('div', 'upload-progress-bar');
+    if (item.status === 'uploading') { bar.style.width = item.progress + '%'; }
+    else if (item.status === 'done') { bar.style.width = '100%'; bar.classList.add('done'); }
+    else if (item.status === 'error') { bar.classList.add('error'); }
+    progress.appendChild(bar);
+    row.append(badge, info, progress);
     q.appendChild(row);
   });
 }
@@ -561,8 +540,6 @@ function clearQueue() {
   if (_uploadActive) return;
   uploadPending = [];
   renderQueue();
-  const q = document.getElementById('upload-queue');
-  if (q) q.style.display = 'none';
   document.getElementById('upload-actions').style.display = 'none';
 }
 
@@ -614,14 +591,12 @@ async function uploadSmall(item, repoIdx) {
 }
 
 async function uploadChunked(item, repoIdx) {
-  const file      = item.file;
-  const chunkSize = CHUNK_SIZE;
-  const slices    = _sliceCache.get(file) || Array.from({ length: Math.ceil(file.size / chunkSize) }, (_, i) => file.slice(i * chunkSize, Math.min((i + 1) * chunkSize, file.size)));
-  const total     = slices.length;
-  let uploaded    = 0;
-  const sem       = { n: UPLOAD_CONCURRENCY };
-  const errs      = [];
-  const blobResults = new Array(total);
+  const file   = item.file;
+  const slices = _sliceCache.get(file) || Array.from({ length: Math.ceil(file.size / CHUNK_SIZE) }, (_, i) => file.slice(i * CHUNK_SIZE, Math.min((i + 1) * CHUNK_SIZE, file.size)));
+  const total  = slices.length;
+  let uploaded = 0;
+  const sem    = { n: UPLOAD_CONCURRENCY };
+  const errs   = [];
   await Promise.all(slices.map((slice, idx) => (async () => {
     while (sem.n <= 0) await new Promise(r => setTimeout(r, 50));
     sem.n--;
@@ -630,14 +605,10 @@ async function uploadChunked(item, repoIdx) {
       const r = await fetch('/api/upload-chunk', {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: file.name, chunkIndex: idx, totalChunks: total, totalSize: file.size, content: b64, repoIdx }),
+        body: JSON.stringify({ name: file.name, chunkIndex: idx, totalChunks: total, content: b64, size: file.size, repoIdx }),
       });
       if (!r.ok) { const d = await r.json().catch(() => ({})); errs.push(d.error || 'chunk failed'); }
-      else {
-        const d = await r.json();
-        blobResults[idx] = { index: d.index, blobSha: d.blobSha, blobToken: d.blobToken, size: d.size, repoIdx: d.repoIdx };
-        uploaded++; item.progress = Math.round(uploaded / total * 90); renderQueue();
-      }
+      else { uploaded++; item.progress = Math.round(uploaded / total * 90); renderQueue(); }
     } catch (e) { errs.push(e.message); }
     sem.n++;
   })()));
@@ -646,7 +617,7 @@ async function uploadChunked(item, repoIdx) {
   const fr = await fetch('/api/finalize-upload', {
     method: 'POST', credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: file.name, totalChunks: total, totalSize: file.size, chunkSize, blobs: blobResults, repoIdx }),
+    body: JSON.stringify({ name: file.name, totalChunks: total, size: file.size, repoIdx }),
   });
   if (!fr.ok) throw new Error((await fr.json().catch(() => ({}))).error || 'finalize failed');
 }
