@@ -650,7 +650,7 @@ body {
   background: #f0fdf4; border: 1px solid #86efac;
 }
 .apikey-reveal-label { font-size: .72rem; color: #166534; margin-bottom: .45rem; font-weight: 500; }
-.apikey-reveal-row { display: none; align-items: center; gap: .5rem; }
+.apikey-reveal-row { display: flex; align-items: center; gap: .5rem; }
 .apikey-reveal-code {
   font-size: .68rem; font-family: 'SFMono-Regular','Consolas',monospace;
   color: #14532d; background: #dcfce7; border-radius: 5px;
