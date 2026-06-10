@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <meta http-equiv="Content-Security-Policy"
-  content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self' https://api.github.com; base-uri 'none';">
+  content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none';">
 <meta name="referrer" content="no-referrer">
 <title>StoreGit</title>
 <link rel="icon" type="image/png" href="storegit-logo.png" sizes="any">
@@ -19,6 +19,7 @@
     <div class="app-brand-text"><h1>StoreGit</h1></div>
   </div>
   <div class="topbar-right">
+    <span class="topbar-user" id="topbar-user"></span>
     <button class="hamburger-btn" id="hamburger-btn" aria-label="Open menu" title="Menu">
       <span></span><span></span><span></span>
     </button>
@@ -40,7 +41,8 @@
           <path d="M6 26c0 1.1.9 2 2 2h20a2 2 0 0 0 2-2v-2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
         </svg>
       </div>
-      <div class="drop-zone-title">Click to select files or drag them here</div>
+      <div class="drop-zone-title">Click or drag files here</div>
+      <div class="drop-zone-sub">Any file type &middot; up to 5 GB per file</div>
     </div>
     <div class="upload-queue" id="upload-queue"></div>
     <div class="upload-actions" id="upload-actions">
@@ -57,7 +59,7 @@
     <div id="file-list"></div>
   </div>
 </div>
-<div class="app-footer">Created by Deb Guin &nbsp;&middot;&nbsp; StoreGit</div>
+<div class="app-footer">StoreGit &nbsp;&middot;&nbsp; Free &amp; open source &nbsp;&middot;&nbsp; Powered by GitHub</div>
 
 <div class="drawer-overlay" id="drawer-overlay"></div>
 <div class="drawer" id="drawer" role="dialog" aria-modal="true" aria-label="Menu">
