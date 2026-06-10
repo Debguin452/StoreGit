@@ -83,7 +83,7 @@ function showModal(title, msg, confirmLabel, confirmClass, onConfirm) {
 }
 
 on('signout-btn',        'click',  () => doLogout());
-on('file-input',         'change', e  => onFilePicked(e.target.files));
+on('file-input',         'change', e  => { onFilePicked(e.target.files); e.target.value = ''; });
 on('upload-btn',         'click',  () => startUpload());
 on('clear-queue-btn',    'click',  () => clearQueue());
 on('refresh-files-btn',  'click',  () => loadFiles());
@@ -130,7 +130,9 @@ document.getElementById('share-ttl-opts')?.addEventListener('click', e => {
 
 const dropZone = document.getElementById('drop-zone');
 if (dropZone) {
-  dropZone.addEventListener('click', () => document.getElementById('file-input')?.click());
+  // No explicit 'click' handler needed — the <input type="file"> is already positioned
+  // absolute/inset-0 over the zone (opacity:0), so clicks land on it directly.
+  // Adding dropZone.click→input.click() caused a double file-picker on Safari/Firefox.
   dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
   dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
   dropZone.addEventListener('drop', e => {

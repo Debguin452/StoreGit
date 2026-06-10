@@ -103,7 +103,7 @@ body {
   text-align: center; cursor: pointer; position: relative;
   transition: border-color .15s, background .15s;
 }
-.drop-zone.dragging { border-color: #2563eb; background: #eff6ff; }
+.drop-zone.drag-over { border-color: #2563eb; background: #eff6ff; }
 .drop-zone input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
 .drop-zone-icon  { width: 36px; height: 36px; margin: 0 auto .6rem; opacity: .3; color: #2563eb; }
 .drop-zone-icon svg { width: 100%; height: 100%; }
@@ -267,7 +267,7 @@ body {
   .card-title { color: #3b5a8a; }
 
   .drop-zone { border-color: #2a3550; color: #888; }
-  .drop-zone.dragging { border-color: #3b82f6; background: #1a2035; }
+  .drop-zone.drag-over { border-color: #3b82f6; background: #1a2035; }
   .drop-zone-title { color: #ddd; }
   .drop-zone-sub   { color: #666; }
   .drop-zone-icon  { color: #3b82f6; opacity: .7; }
