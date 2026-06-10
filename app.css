@@ -4,6 +4,9 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', Helvetica, Arial, sans-serif;
   background: #eff6ff; color: #111; min-height: 100vh; line-height: 1.5;
 }
+.auth-body { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.5rem; }
+.auth-view { display: none; width: 100%; max-width: 420px; }
+.auth-view.active { display: block; }
 .screen { display: none; min-height: 100vh; align-items: center; justify-content: center; padding: 1.5rem; flex-direction: column; }
 .screen.active { display: flex; }
 .auth-card {
