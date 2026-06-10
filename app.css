@@ -605,7 +605,7 @@ body {
 .drawer-repo-remove-btn:hover { background: #fee2e2; color: #dc2626; }
 
 /* ── Forms inside drawer ── */
-.drawer-form { display: flex; flex-direction: column; gap: 0; margin-top: .75rem; }
+.drawer-form { display: none; flex-direction: column; gap: 0; margin-top: .75rem; }
 .drawer-form .field { margin-bottom: .65rem; }
 .drawer-form textarea {
   width: 100%; box-sizing: border-box;
@@ -650,7 +650,7 @@ body {
   background: #f0fdf4; border: 1px solid #86efac;
 }
 .apikey-reveal-label { font-size: .72rem; color: #166534; margin-bottom: .45rem; font-weight: 500; }
-.apikey-reveal-row { display: flex; align-items: center; gap: .5rem; }
+.apikey-reveal-row { display: none; align-items: center; gap: .5rem; }
 .apikey-reveal-code {
   font-size: .68rem; font-family: 'SFMono-Regular','Consolas',monospace;
   color: #14532d; background: #dcfce7; border-radius: 5px;
