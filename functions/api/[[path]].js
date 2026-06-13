@@ -64,7 +64,12 @@ function formatBytes(b) {
   return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
-const _memRate = new Map();
+const _memRate    = new Map();
+const _sessCache  = new Map();
+const _revokedMem = new Map();
+
+const SESS_CACHE_MEM_TTL = 60_000;
+const REVOKE_CACHE_TTL   = 15_000;
 
 const SEC = {
   'X-Content-Type-Options':    'nosniff',
@@ -233,33 +238,86 @@ async function deleteApiKeyFromGit(sha256hex, ghToken, ghOwner, ghRepo, ghBranch
   ).catch(() => {});
 }
 
+function apiKeyRegistryPath(sha256hex) {
+  return `keys/${sha256hex.slice(0, 2)}/${sha256hex}.json`;
+}
+async function readApiKeyFromRegistry(sha256hex, env) {
+  const token = env.REGISTRY_GITHUB_TOKEN || '';
+  const owner = env.REGISTRY_GITHUB_OWNER || '';
+  const repo  = env.REGISTRY_GITHUB_REPO  || '';
+  if (!token || !owner || !repo) return null;
+  const res = await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${apiKeyRegistryPath(sha256hex)}?ref=${REGISTRY_BRANCH}`,
+    { headers: ghH(token) }
+  ).catch(() => null);
+  if (!res || res.status === 404 || !res.ok) return null;
+  try {
+    const d = await res.json();
+    return JSON.parse(DEC.decode(b64urlDec(d.content.replace(/\s/g, ''))));
+  } catch { return null; }
+}
+async function writeApiKeyToRegistry(sha256hex, record, env) {
+  const token = env.REGISTRY_GITHUB_TOKEN || '';
+  const owner = env.REGISTRY_GITHUB_OWNER || '';
+  const repo  = env.REGISTRY_GITHUB_REPO  || '';
+  if (!token || !owner || !repo) return;
+  const path   = apiKeyRegistryPath(sha256hex);
+  const chkRes = await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path}?ref=${REGISTRY_BRANCH}`,
+    { headers: ghH(token) }
+  ).catch(() => null);
+  const existingSha = (chkRes && chkRes.ok) ? (await chkRes.json()).sha : null;
+  await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path}`,
+    { method: 'PUT', headers: ghH(token), body: JSON.stringify({ message: `StoreGit: API key index ${record.keyId}`, content: utf8b64(JSON.stringify({ username: record.username, keyId: record.keyId, allowedOrigins: record.allowedOrigins || [], label: record.label || '' })), branch: REGISTRY_BRANCH, ...(existingSha ? { sha: existingSha } : {}) }) }
+  ).catch(() => {});
+}
+async function deleteApiKeyFromRegistry(sha256hex, env) {
+  const token = env.REGISTRY_GITHUB_TOKEN || '';
+  const owner = env.REGISTRY_GITHUB_OWNER || '';
+  const repo  = env.REGISTRY_GITHUB_REPO  || '';
+  if (!token || !owner || !repo) return;
+  const path   = apiKeyRegistryPath(sha256hex);
+  const chkRes = await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path}?ref=${REGISTRY_BRANCH}`,
+    { headers: ghH(token) }
+  ).catch(() => null);
+  if (!chkRes || !chkRes.ok) return;
+  const fileSha = (await chkRes.json()).sha;
+  await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path}`,
+    { method: 'DELETE', headers: ghH(token), body: JSON.stringify({ message: `StoreGit: revoke API key`, sha: fileSha, branch: REGISTRY_BRANCH }) }
+  ).catch(() => {});
+}
+async function isRevoked(jti, kv) {
+  const now = Date.now();
+  const c = _revokedMem.get(jti);
+  if (c && now < c.until) return c.revoked;
+  const revoked = kv ? !!(await kv.get(`revoked:${jti}`).catch(() => null)) : false;
+  _revokedMem.set(jti, { revoked, until: now + REVOKE_CACHE_TTL });
+  if (_revokedMem.size > 10000) for (const [k, v] of _revokedMem) if (now > v.until) _revokedMem.delete(k);
+  return revoked;
+}
 async function resolveApiKey(request, env, secret) {
   const apiKey = request.headers.get('X-API-Key') || '';
   if (!APIKEY_RE.test(apiKey)) return null;
-
   const sha256hex = await apiKeyHash(apiKey);
   const kv        = env.RATE_LIMIT_KV || null;
-  let keyData     = null;
-
-  // 1. KV — fast path; also the legacy store for pre-migration keys
-  if (kv) {
-    keyData = await kv.get(apiKeyKvKey(sha256hex), 'json').catch(() => null);
+  let keyData     = kv ? await kv.get(apiKeyKvKey(sha256hex), 'json').catch(() => null) : null;
+  if (!keyData || !keyData.username) {
+    const regEntry = await readApiKeyFromRegistry(sha256hex, env);
+    if (!regEntry || !regEntry.username) return null;
+    keyData = regEntry;
+    if (kv) kv.put(apiKeyKvKey(sha256hex), JSON.stringify(keyData)).catch(() => {});
   }
-
-  if (!keyData || !keyData.username) return null;
-
-  // Domain binding check
   const origin  = request.headers.get('Origin') || '';
-  const origins = keyData.allowedOrigins || [];
+  const origins = Array.isArray(keyData.allowedOrigins) ? keyData.allowedOrigins : [];
   if (origins.length > 0 && origin && !origins.includes(origin)) {
     return { blocked: true, reason: 'Origin not allowed for this API key' };
   }
-
-  // Per-key rate limiting (in-memory; no KV r/w on hot path)
-  if (await checkRate(`apikey_rate:${apiKey}`, APIKEY_RATE_MAX, env, APIKEY_RATE_WINDOW)) {
+  if (await checkRate(`apikey_rate:${sha256hex}`, APIKEY_RATE_MAX, env, APIKEY_RATE_WINDOW)) {
     return { blocked: true, reason: 'API key rate limit exceeded' };
   }
-
   const rec = await getUser(keyData.username, env).catch(() => null);
   if (!rec) return null;
   const { content: user } = rec;
@@ -273,7 +331,7 @@ async function resolveApiKey(request, env, secret) {
     ghToken, ghOwner: repo.ghOwner, ghRepo: repo.ghRepo,
     ghBranch: repo.ghBranch, folder: repo.folder,
     repoLabel: (repo.label && repo.label !== 'Default') ? repo.label : '',
-    repos: repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo })),
+    repos: repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo, ghBranch: r.ghBranch || 'main', folder: r.folder || 'uploads' })),
     activeRepoIdx: 0,
   };
   return { fullSess, allowedOrigins: origins, keyData };
@@ -376,7 +434,10 @@ function contentDisposition(safeName, forDownload = true) {
   const disp  = forDownload ? 'attachment' : 'inline';
   return `${disp}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(safeName)}`;
 }
-function buildSharePage(filename, displayName, size, expIso, tok) {
+function generateNonce() {
+  return btoa(Array.from(crypto.getRandomValues(new Uint8Array(16)), b => String.fromCharCode(b)).join(''));
+}
+function buildSharePage(filename, displayName, size, expIso, tok, nonce) {
   const extRaw = (displayName.split('.').pop() || '').toLowerCase();
   const extLabel = extRaw.slice(0,5).toUpperCase() || 'FILE';
   const sz = size > 0 ? (size < 1048576 ? (size/1024).toFixed(1)+' KB' : size < 1073741824 ? (size/1048576).toFixed(1)+' MB' : (size/1073741824).toFixed(2)+' GB') : '';
@@ -398,7 +459,8 @@ function buildSharePage(filename, displayName, size, expIso, tok) {
   } else if (isVid) {
     preview = `<div class="pv-wrap vid-wrap"><video controls preload="metadata" src="${dlUrl}" onerror="this.closest('.pv-wrap').style.display='none'"></video></div>`;
   } else if (isText) {
-    preview = `<div class="pv-wrap code-wrap"><div class="code-loading" id="cl"><span class="spin"></span>Loading preview\u2026</div><pre id="cp" class="code-pre" style="display:none"></pre><div id="ce" class="code-err" style="display:none">Preview unavailable.</div></div><script>(function(){fetch(${JSON.stringify(dlUrl)}).then(function(r){if(!r.ok)throw 0;return r.text();}).then(function(t){document.getElementById('cp').textContent=t.length>10000?t.slice(0,10000)+'\n\n\u2026 (truncated)':t;document.getElementById('cl').style.display='none';document.getElementById('cp').style.display='';}).catch(function(){document.getElementById('cl').style.display='none';document.getElementById('ce').style.display='';});})();<\/script>`;
+    const nonceAttr = nonce ? ` nonce="${nonce}"` : '';
+    preview = `<div class="pv-wrap code-wrap"><div class="code-loading" id="cl"><span class="spin"></span>Loading preview\u2026</div><pre id="cp" class="code-pre" style="display:none"></pre><div id="ce" class="code-err" style="display:none">Preview unavailable.</div></div><script${nonceAttr}>(function(){fetch(${JSON.stringify(dlUrl)}).then(function(r){if(!r.ok)throw 0;return r.text();}).then(function(t){document.getElementById('cp').textContent=t.length>10000?t.slice(0,10000)+'\n\n\u2026 (truncated)':t;document.getElementById('cl').style.display='none';document.getElementById('cp').style.display='';}).catch(function(){document.getElementById('cl').style.display='none';document.getElementById('ce').style.display='';});})();<\/script>`;
   }
   return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${nameSafe} \u2014 StoreGit</title><style>:root{--bg:#eff6ff;--card:#fff;--border:#dbeafe;--t1:#111827;--t2:#6b7280;--t3:#9ca3af;--dl-bg:#2563eb;--dl-fg:#fff;--code-bg:#f8faff;--code-text:#1e293b;color-scheme:light}@media(prefers-color-scheme:dark){:root{--bg:#0d0f1a;--card:#131929;--border:#1e2e50;--t1:#f1f5f9;--t2:#94a3b8;--t3:#475569;--dl-bg:#3b82f6;--dl-fg:#fff;--code-bg:#0d1117;--code-text:#c9d1d9;color-scheme:dark}}*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--t1);min-height:100vh;display:flex;flex-direction:column}.topbar{height:54px;background:var(--card);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 1.75rem}.brand{display:flex;align-items:center;gap:.55rem;font-weight:700;font-size:.95rem;color:var(--t1);text-decoration:none}.brand-logo{width:20px;height:20px;border-radius:5px;background:#2563eb;display:flex;align-items:center;justify-content:center;flex-shrink:0}.brand-logo svg{display:block}main{flex:1;display:flex;justify-content:center;padding:2.5rem 1.25rem 4rem}.wrap{width:100%;max-width:${isImg||isVid||isText?'700':'420'}px;display:flex;flex-direction:column;gap:1rem}.pv-wrap{width:100%;border-radius:14px;overflow:hidden;border:1px solid var(--border);background:var(--card)}.img-wrap{background:#000;display:flex;align-items:center;justify-content:center;min-height:180px}.img-wrap img{max-width:100%;max-height:540px;object-fit:contain;display:block}.vid-wrap video{width:100%;max-height:460px;display:block;background:#000}.code-wrap{background:var(--code-bg)}.code-loading{padding:1.75rem 1.5rem;display:flex;align-items:center;gap:.6rem;color:var(--t2);font-size:.85rem}.code-pre{font-family:'SF Mono','Fira Mono',Consolas,monospace;font-size:.775rem;line-height:1.7;padding:1.25rem 1.5rem;overflow:auto;max-height:440px;white-space:pre;color:var(--code-text)}.code-err{padding:1.5rem;color:var(--t3);font-size:.85rem}.spin{width:15px;height:15px;border:2px solid var(--border);border-top-color:#2563eb;border-radius:50%;animation:sp .7s linear infinite;flex-shrink:0}@keyframes sp{to{transform:rotate(360deg)}}.info-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.5rem 1.75rem}.file-row{display:flex;align-items:center;gap:1rem;margin-bottom:1.35rem}.badge{width:50px;height:50px;min-width:50px;border-radius:11px;display:flex;align-items:center;justify-content:center;font-size:.58rem;font-weight:800;letter-spacing:.06em;color:#fff}.file-name{font-size:1.05rem;font-weight:600;color:var(--t1);word-break:break-all;line-height:1.4;margin-bottom:.3rem}.file-meta{font-size:.8rem;color:var(--t2)}.dl-btn{display:flex;align-items:center;justify-content:center;gap:.5rem;width:100%;padding:.95rem 1.25rem;background:var(--dl-bg);color:var(--dl-fg);border:none;border-radius:10px;font-family:inherit;font-size:.95rem;font-weight:600;text-decoration:none;cursor:pointer;transition:opacity .15s}.dl-btn:hover{opacity:.82}.dl-btn:active{opacity:.65}footer{text-align:center;font-size:.72rem;color:var(--t3);padding:.5rem 1.25rem 2rem}@media(max-width:480px){main{padding:1.25rem .75rem 3rem}.info-card{padding:1.25rem}.topbar{padding:0 1.25rem}}</style></head><body><header class="topbar"><a href="/" class="brand"><span class="brand-logo"><svg viewBox="0 0 20 20" width="12" height="12"><path d="M4 10h12M10 4v12" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/></svg></span>StoreGit</a></header><main><div class="wrap">${preview}<div class="info-card"><div class="file-row"><div class="badge" style="background:${badgeColor}">${extLabel}</div><div><div class="file-name">${nameSafe}</div><div class="file-meta">${meta}</div></div></div><a class="dl-btn" href="${dlUrl}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M12 5v14M5 12l7 7 7-7"/></svg>Download</a></div></div></main><footer>Shared via StoreGit</footer></body></html>`;
 }
@@ -435,17 +497,22 @@ function getUserRepos(user) {
 }
 async function getFullSession(sess, env, secret) {
   if (!sess || !sess.username) return null;
-  const kv      = env.RATE_LIMIT_KV || null;
+  const now      = Date.now();
+  const kv       = env.RATE_LIMIT_KV || null;
   const cacheKey = `sess_cache:${sess.jti}`;
+  const L1 = _sessCache.get(cacheKey);
+  if (L1 && now < L1.exp) return L1.data;
   if (kv) {
     const cached = await kv.get(cacheKey, 'json').catch(() => null);
     if (cached) {
       try {
         const ghToken = await aesDecrypt(cached.encGhToken, secret, `user-token:${cached.username}`);
         const repoIdx = typeof sess.repoIdx === 'number' ? sess.repoIdx : 0;
-        const repos   = cached.repos || [];
+        const repos   = Array.isArray(cached.repos) ? cached.repos : [];
         const repo    = repos[repoIdx] || repos[0] || {};
-        return { ...sess, ghToken, ghOwner: repo.ghOwner, ghRepo: repo.ghRepo, ghBranch: repo.ghBranch, folder: repo.folder, repoLabel: (repo.label && repo.label !== 'Default') ? repo.label : '', repos, activeRepoIdx: repoIdx };
+        const result  = { ...sess, ghToken, ghOwner: repo.ghOwner, ghRepo: repo.ghRepo, ghBranch: repo.ghBranch, folder: repo.folder, repoLabel: (repo.label && repo.label !== 'Default') ? repo.label : '', repos, activeRepoIdx: repoIdx };
+        _sessCache.set(cacheKey, { data: result, exp: now + SESS_CACHE_MEM_TTL });
+        return result;
       } catch {}
     }
   }
@@ -455,16 +522,17 @@ async function getFullSession(sess, env, secret) {
   let ghToken;
   try { ghToken = await aesDecrypt(user.encGhToken, secret, `user-token:${user.username}`); }
   catch { return null; }
-  const repoIdx = typeof sess.repoIdx === 'number' ? sess.repoIdx : 0;
-  const repos   = getUserRepos(user);
-  const repo    = repos[repoIdx] || repos[0];
+  const repoIdx  = typeof sess.repoIdx === 'number' ? sess.repoIdx : 0;
+  const repos    = getUserRepos(user);
+  const repo     = repos[repoIdx] || repos[0];
+  const repoList = repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo, ghBranch: r.ghBranch || 'main', folder: r.folder || 'uploads' }));
+  const result   = { ...sess, ghToken, ghOwner: repo.ghOwner, ghRepo: repo.ghRepo, ghBranch: repo.ghBranch, folder: repo.folder, repoLabel: (repo.label && repo.label !== 'Default') ? repo.label : '', repos: repoList, activeRepoIdx: repoIdx };
+  _sessCache.set(cacheKey, { data: result, exp: now + SESS_CACHE_MEM_TTL });
   if (kv) {
-    const ttl = Math.min(300, Math.ceil((sess.exp - Date.now()) / 1000));
-    if (ttl > 0) {
-      await kv.put(cacheKey, JSON.stringify({ username: user.username, encGhToken: user.encGhToken, repos }), { expirationTtl: ttl }).catch(() => {});
-    }
+    const ttl = Math.min(300, Math.ceil(Math.max(1, (sess.exp - now) / 1000)));
+    if (ttl > 0) await kv.put(cacheKey, JSON.stringify({ username: user.username, encGhToken: user.encGhToken, repos }), { expirationTtl: ttl }).catch(() => {});
   }
-  return { ...sess, ghToken, ghOwner: repo.ghOwner, ghRepo: repo.ghRepo, ghBranch: repo.ghBranch, folder: repo.folder, repoLabel: (repo.label && repo.label !== 'Default') ? repo.label : '', repos: repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo, ghBranch: r.ghBranch || 'main', folder: r.folder || 'uploads' })), activeRepoIdx: repoIdx };
+  return result;
 }
 function isHttps(req) {
   try { return new URL(req.url).protocol === 'https:'; } catch { return false; }
@@ -506,23 +574,23 @@ function getIP(req) {
 async function checkRate(key, max, env, windowMs = RATE_WINDOW_MS) {
   const now = Date.now();
   const kv  = env.RATE_LIMIT_KV || null;
-  let r = kv
-    ? await kv.get(key, 'json').catch(() => null)
-    : _memRate.get(key) || null;
+  let r = _memRate.get(key) || null;
   if (!r || now > r.resetAt) {
-    const f = { count: 1, resetAt: now + windowMs };
-    if (kv) await kv.put(key, JSON.stringify(f), { expirationTtl: Math.ceil(windowMs / 1000) }).catch(() => {});
-    else { _memRate.set(key, f); if (_memRate.size > 20000) for (const [k, v] of _memRate) if (now > v.resetAt) _memRate.delete(k); }
-    return false;
+    const kvR = kv ? await kv.get(key, 'json').catch(() => null) : null;
+    r = (kvR && now <= kvR.resetAt) ? { ...kvR, count: (kvR.count || 0) + 1 } : { count: 1, resetAt: now + windowMs };
+    _memRate.set(key, r);
+    if (_memRate.size > 20000) for (const [k, v] of _memRate) if (now > v.resetAt) _memRate.delete(k);
+    if (r.count >= max && kv) await kv.put(key, JSON.stringify(r), { expirationTtl: Math.ceil(Math.max(1, (r.resetAt - now) / 1000)) }).catch(() => {});
+    return r.count > max;
   }
   r.count++;
-  if (kv) await kv.put(key, JSON.stringify(r), { expirationTtl: Math.ceil((r.resetAt - now) / 1000) }).catch(() => {});
-  else _memRate.set(key, r);
+  if (r.count >= max && kv) await kv.put(key, JSON.stringify(r), { expirationTtl: Math.ceil(Math.max(1, (r.resetAt - now) / 1000)) }).catch(() => {});
   return r.count > max;
 }
 async function clearRate(key, env) {
-  if (env.RATE_LIMIT_KV) await env.RATE_LIMIT_KV.delete(key).catch(() => {});
-  else _memRate.delete(key);
+  _memRate.delete(key);
+  const kv = env.RATE_LIMIT_KV || null;
+  if (kv) kv.delete(key).catch(() => {});
 }
 function sanitize(name) {
   if (!name || typeof name !== 'string') return null;
@@ -1216,10 +1284,9 @@ async function _handleRequest({ request, env, params }) {
         const remaining = Math.ceil((sess.exp - Date.now()) / 1000);
         if (remaining > 0) await kv.put(`revoked:${sess.jti}`, '1', { expirationTtl: remaining }).catch(() => {});
         await kv.delete(`sess_cache:${sess.jti}`).catch(() => {});
-        // Clear index cache so the next user never sees this user's file list
-        const fullSessForLogout = await getFullSession(sess, env, secret).catch(() => null);
-        if (fullSessForLogout) invalidateIndexCache(fullSessForLogout, kv);
       }
+      _revokedMem.set(sess.jti, { revoked: true, until: sess.exp });
+      _sessCache.delete(`sess_cache:${sess.jti}`);
     }
     return jsonRes(request, { ok:true }, 200, { 'Set-Cookie': buildSetCookie(request, '', 0) });
   }
@@ -1236,8 +1303,9 @@ async function _handleRequest({ request, env, params }) {
       return fail(request, 403);
     }
     if (!isDownload && (request.headers.get('Accept') || '').includes('text/html')) {
-      const page = buildSharePage(data.filename, data.displayName || data.filename, data.size || 0, data.exp === 0 ? null : new Date(data.exp).toISOString(), tok);
-      return new Response(page, { status:200, headers:{'Content-Type':'text/html;charset=utf-8','X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'no-referrer','Cache-Control':'no-store','Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self'; media-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none';"} });
+      const spNonce = generateNonce();
+      const page = buildSharePage(data.filename, data.displayName || data.filename, data.size || 0, data.exp === 0 ? null : new Date(data.exp).toISOString(), tok, spNonce);
+      return new Response(page, { status:200, headers:{'Content-Type':'text/html;charset=utf-8','X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'no-referrer','Cache-Control':'no-store','Content-Security-Policy':`default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${spNonce}'; img-src 'self'; media-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none';`} });
     }
     const rec = await getUser(data.username, env);
     if (!rec) return fail(request, 404);
@@ -1355,10 +1423,7 @@ async function _handleRequest({ request, env, params }) {
   const sess     = await verifyToken(rawToken, secret);
   if (!sess) return fail(request, 401);
   const kv = env.RATE_LIMIT_KV || null;
-  if (kv) {
-    const revoked = await kv.get(`revoked:${sess.jti}`).catch(() => null);
-    if (revoked) return fail(request, 401);
-  }
+  if (kv && await isRevoked(sess.jti, kv)) return fail(request, 401);
   const fullSess = await getFullSession(sess, env, secret);
   if (!fullSess) return fail(request, 401);
   let refreshCookie = null;
@@ -1465,7 +1530,8 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const updated = { ...user, repos };
     try { await writeReg(userPath(sess.username), updated, `Add repo ${ghOwner}/${ghRepo}`, env, userSha); }
     catch { return jRes({ error: ERRS[502] }, 502); }
-    if (kv) await env.RATE_LIMIT_KV.delete(`sess_cache:${sess.jti}`).catch(() => {});
+    if (kv) await kv.delete(`sess_cache:${sess.jti}`).catch(() => {});
+    _sessCache.delete(`sess_cache:${sess.jti}`);
     return jRes({ ok:true, repos: repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo })) });
   }
   if (route === 'remove-repo' && method === 'POST') {
@@ -1483,7 +1549,8 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const updated = { ...user, repos };
     try { await writeReg(userPath(sess.username), updated, `Remove repo ${repoIdx}`, env, userSha); }
     catch { return jRes({ error: ERRS[502] }, 502); }
-    if (kv) await env.RATE_LIMIT_KV.delete(`sess_cache:${sess.jti}`).catch(() => {});
+    if (kv) await kv.delete(`sess_cache:${sess.jti}`).catch(() => {});
+    _sessCache.delete(`sess_cache:${sess.jti}`);
     return jRes({ ok: true, repos: repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo })) });
   }
 
@@ -1610,23 +1677,16 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     } catch (gitErr) {
       return jRes({ error: `Failed to write API key to your repository: ${gitErr?.message || 'unknown error'}` }, 502);
     }
-
-    // ── 2. Write to KV (write-through cache + backwards compat) ───────────────
-    if (kv) {
-      await kv.put(
-        apiKeyKvKey(sha256hex),
-        JSON.stringify({ username: sess.username, label, allowedOrigins, keyId }),
-      ).catch(() => { console.warn('[StoreGit] KV write failed for new API key'); });
-    }
-    // Store metadata (not raw key) in user record
+    if (kv) await kv.put(apiKeyKvKey(sha256hex), JSON.stringify({ username: sess.username, label, allowedOrigins, keyId })).catch(() => {});
+    writeApiKeyToRegistry(sha256hex, keyRecord, env).catch(() => {});
     const encKey = await aesEncrypt(rawKey, secret, `apikey:${sess.username}:${keyId}`);
     const keyMeta = { keyId, preview, label, allowedOrigins, createdAt: new Date().toISOString(), encKey };
     const updated = { ...user, apiKeys: [...existingKeys, keyMeta] };
     try { await writeReg(userPath(sess.username), updated, `Create API key: ${label}`, env, userSha); }
     catch {
-      // Registry write failed — roll back git and KV so no orphaned key exists
       await deleteApiKeyFromGit(sha256hex, ghToken, repo.ghOwner, repo.ghRepo, repo.ghBranch || 'main', repo.folder || 'uploads').catch(() => {});
       if (kv) await kv.delete(apiKeyKvKey(sha256hex)).catch(() => {});
+      deleteApiKeyFromRegistry(sha256hex, env).catch(() => {});
       return jRes({ error: ERRS[502] }, 502);
     }
     return jRes({ ok: true, rawKey, keyId, preview, label, allowedOrigins });
@@ -1655,8 +1715,8 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
           const repo  = repos[0];
           await deleteApiKeyFromGit(sha256hex, ghToken, repo.ghOwner, repo.ghRepo, repo.ghBranch || 'main', repo.folder || 'uploads').catch(() => {});
         }
-        // Delete from KV (cache + legacy store)
         if (kv) await kv.delete(apiKeyKvKey(sha256hex)).catch(() => {});
+        deleteApiKeyFromRegistry(sha256hex, env).catch(() => {});
       } catch {}
     }
     const updated = { ...user, apiKeys: existing.filter(k => k.keyId !== keyId) };
@@ -1769,7 +1829,6 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
         const { data: idx, sha: idxSha } = await readIndex(uploadSess);
         idx[safe] = { originalName: getOriginalName(rawName, safe), uploadedAt: new Date().toISOString(), size: decodedSize };
         await writeIndex(uploadSess, idx, idxSha);
-        invalidateIndexCache(uploadSess, kv);
       } catch {}
       return jRes({ ok:true, name:safe, size:decodedSize });
     } catch { return jRes({ error: ERRS[502] }, 502); }
@@ -1784,41 +1843,31 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const tot = parseInt(totalChunks, 10);
     if (isNaN(chunkIdx)||chunkIdx<0) return jRes({ error: ERRS[400] },400);
     if (isNaN(tot)||tot<1||tot>C_MAX_TOTAL_CHUNKS) return jRes({ error: ERRS[400] },400);
+    if (chunkIdx >= tot) return jRes({ error: ERRS[400] }, 400);
+    if (totalSize !== undefined) {
+      const C_MAX_FILE_BYTES = C_MAX_TOTAL_CHUNKS * Math.floor(C_CHUNK_B64_MAX * 3 / 4);
+      if (!Number.isInteger(totalSize) || totalSize < 1 || totalSize > C_MAX_FILE_BYTES) return jRes({ error: ERRS[400] }, 400);
+    }
     const safe = sanitize(String(rawName));
     if (!safe) return jRes({ error: ERRS[415] },415);
     if (chunkIdx === 0 && !checkMagicBase64(b64)) return jRes({ error: ERRS[415] },415);
     const decodedSize = Math.floor(b64.length * 3 / 4);
     // ── Space-aware repo routing ─────────────────────────────────────────────
-    // All repos are equal — no "target" or "primary" repo.
-    // A chunk→repo assignment is computed once (using live repo sizes) and cached
-    // in KV for the duration of this upload so every chunk routes consistently,
-    // even when chunks arrive out of order or are retried.
+    // Assignment is computed fresh from live repo sizes on each chunk.
+    // For single-repo setups this is a no-op (resolvedRepoIdx stays 0).
     const dist = isDistributed(totalSize, fullSess.repos);
     let resolvedRepoIdx = 0;
     if (fullSess.repos.length > 1) {
-      const assignKey = `chunk_assign:${fullSess.username}:${safe}:${tot}`;
-      let assignment = null;
-      if (kv) {
-        const cached = await kv.get(assignKey, 'json').catch(() => null);
-        if (Array.isArray(cached) && cached.length === tot &&
-            cached.every(r => Number.isInteger(r) && r >= 0 && r < fullSess.repos.length)) {
-          assignment = cached;
-        }
-      }
-      if (!assignment) {
-        const repoBytes = await fetchRepoBytes(fullSess, kv).catch(() => fullSess.repos.map(() => 0));
-        const approxChunkBytes = (Number.isFinite(totalSize) && totalSize > 0 && tot > 0)
-          ? Math.ceil(totalSize / tot) : 0;
-        if (dist) {
-          // Large file: contiguous ranges per repo (minimises fragmentation + equalisies usage)
-          assignment = computeContiguousAssignment(tot, approxChunkBytes, repoBytes);
-        } else {
-          // Normal file: all chunks to the repo with most free space
-          let min = 0;
-          for (let r = 1; r < repoBytes.length; r++) if (repoBytes[r] < repoBytes[min]) min = r;
-          assignment = Array.from({ length: tot }, () => min);
-        }
-        if (kv) await kv.put(assignKey, JSON.stringify(assignment), { expirationTtl: 86400 }).catch(() => {});
+      const repoBytes = await fetchRepoBytes(fullSess, null).catch(() => fullSess.repos.map(() => 0));
+      const approxChunkBytes = (Number.isFinite(totalSize) && totalSize > 0 && tot > 0)
+        ? Math.ceil(totalSize / tot) : 0;
+      let assignment;
+      if (dist) {
+        assignment = computeContiguousAssignment(tot, approxChunkBytes, repoBytes);
+      } else {
+        let min = 0;
+        for (let r = 1; r < repoBytes.length; r++) if (repoBytes[r] < repoBytes[min]) min = r;
+        assignment = Array.from({ length: tot }, () => min);
       }
       resolvedRepoIdx = assignment[chunkIdx] ?? (dist ? chunkIdx % fullSess.repos.length : 0);
       resolvedRepoIdx = Math.max(0, Math.min(resolvedRepoIdx, fullSess.repos.length - 1));
@@ -1850,18 +1899,11 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const safe = sanitize(String(name));
     if (!safe) return jRes({ error: ERRS[415] }, 415);
     const dist = isDistributed(totalSize, fullSess.repos);
-    // Recover the repo that was chosen at upload-chunk time from the KV assignment cache.
-    // For non-distributed uploads all chunks went to one repo — read it from cached[0].
-    // For distributed uploads finalSess is only used for the manifest commit, which lands
-    // on the session's context repo (same as before).
-    const assignKey = `chunk_assign:${fullSess.username}:${safe}:${totalChunks}`;
+    // Derive the target repo from the blobs the client sent (set by upload-chunk responses).
+    // For non-distributed uploads all chunks go to a single repo; use the first blob's repoIdx.
     let finalRepoIdx = 0;
-    if (!dist && fullSess.repos.length > 1 && kv) {
-      const cached = await kv.get(assignKey, 'json').catch(() => null);
-      if (Array.isArray(cached) && cached.length > 0 &&
-          Number.isInteger(cached[0]) && cached[0] >= 0 && cached[0] < fullSess.repos.length) {
-        finalRepoIdx = cached[0];
-      }
+    if (!dist && blobs.length > 0 && typeof blobs[0].repoIdx === 'number') {
+      finalRepoIdx = Math.max(0, Math.min(blobs[0].repoIdx, (fullSess.repos.length || 1) - 1));
     }
     const finalSess = dist ? fullSess : getRepoSess(fullSess, finalRepoIdx);
     const jti = sess ? sess.jti : `ak:${fullSess.username}`;
@@ -1889,21 +1931,9 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       } else {
         await finalizeChunkedUpload(finalSess, safe, blobs, totalSize, chunkSize);
       }
-      // Clean up upload assignment cache and bust index/bytes caches for all affected repos
-      if (kv) {
-        kv.delete(assignKey).catch(() => {});
-        // Invalidate index cache for repos that received chunks
-        const affectedRepos = dist
-          ? [...new Set(blobs.map(b => b.repoIdx ?? 0))].map(ri => getRepoSess(fullSess, ri))
-          : [finalSess];
-        for (const rs of affectedRepos) {
-          invalidateIndexCache(rs, kv);
-        }
-      }
       const { data: idx, sha: idxSha } = await readIndex(finalSess);
       idx[safe] = { originalName: getOriginalName(name, safe), totalSize, totalChunks, uploadedAt: new Date().toISOString(), ...(dist && { distributed: true, repoCount: fullSess.repos.length }) };
       await writeIndex(finalSess, idx, idxSha);
-      invalidateIndexCache(finalSess, kv);
       return jRes({ ok: true, name: safe, distributed: dist, ...(dist && { repoCount: fullSess.repos.length }) });
     } catch { return jRes({ error: ERRS[502] }, 502); }
   }
@@ -1997,8 +2027,6 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
         }
         delete idx[safe];
         await writeIndex(delSess, idx, idxSha);
-        invalidateIndexCache(delSess, kv);
-        if (kv) { kv.delete(`sess_cache:${sess.jti}`).catch(() => {}); }
         return jRes({ ok:true });
       } catch { return jRes({ error: ERRS[502] },502); }
     } else {
@@ -2008,7 +2036,6 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
         try {
           const { data: idx, sha: idxSha } = await readIndex(delSess);
           if (idx[safe]) { delete idx[safe]; await writeIndex(delSess, idx, idxSha); }
-          invalidateIndexCache(delSess, kv);
         } catch {}
         return jRes({ ok:true });
       } catch { return jRes({ error: ERRS[502] },502); }
@@ -2078,7 +2105,6 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       if (idx[safe]) {
         idx[safe] = { ...idx[safe], size: content.length, uploadedAt: new Date().toISOString() };
         await writeIndex(targetSess, idx, idxSha);
-        invalidateIndexCache(targetSess, kv);
       }
     } catch {}
     return jRes({ ok: true, name: safe, sha: newSha });
