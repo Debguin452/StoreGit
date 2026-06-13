@@ -1,5 +1,8 @@
 'use strict';
 const ID_RE = /^[A-Za-z0-9_\-]{1,5}$/;
+function generateNonce() {
+  return btoa(Array.from(crypto.getRandomValues(new Uint8Array(16)), b => String.fromCharCode(b)).join(''));
+}
 export async function onRequestGet({ env, params, request }) {
   const id = params.id;
   if (!id || !ID_RE.test(id)) {
@@ -17,16 +20,18 @@ export async function onRequestGet({ env, params, request }) {
   if (!entry?.tok) return page(errorHTML('notfound'), 404);
   const { tok, displayName = 'file', size = 0, exp } = entry;
   if (exp && Date.now() > new Date(exp).getTime()) return page(errorHTML('expired'), 410);
-  return page(shareHTML(tok, displayName, size, exp), 200);
+  const nonce = generateNonce();
+  return page(shareHTML(tok, displayName, size, exp, nonce), 200, nonce);
 }
-function page(html, status) {
+function page(html, status, nonce) {
+  const scriptSrc = nonce ? `'nonce-${nonce}'` : "'none'";
   return new Response(html, { status, headers: {
     'Content-Type': 'text/html;charset=utf-8',
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
     'Cache-Control': 'no-store',
-    'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self'; media-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none';",
+    'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; script-src ${scriptSrc}; img-src 'self'; media-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none';`,
   }});
 }
 function fmtSize(b) {
@@ -111,7 +116,7 @@ p{font-size:.85rem;color:var(--t2);line-height:1.65;margin-bottom:1.75rem}
 .back-btn{display:inline-flex;align-items:center;gap:.35rem;padding:.66rem 1.4rem;border:1px solid var(--border);border-radius:8px;font-family:inherit;font-size:.85rem;font-weight:500;color:var(--t1);text-decoration:none;background:transparent;transition:background .15s}
 .back-btn:hover{background:var(--bg)}`;
 const TOPBAR = `<header class="topbar"><a href="/" class="brand"><span class="brand-logo"><img src="/storegit-logo.png" alt=""></span>StoreGit</a></header>`;
-function shareHTML(tok, displayName, size, exp) {
+function shareHTML(tok, displayName, size, exp, nonce) {
   const ext    = extOf(displayName);
   const label  = ext ? ext.slice(0, 5).toUpperCase() : 'FILE';
   const color  = badgeColor(ext);
@@ -129,7 +134,8 @@ function shareHTML(tok, displayName, size, exp) {
   } else if (VIDS.has(ext)) {
     preview = `<div class="pv-wrap vid-wrap"><video controls preload="metadata" src="${dlUrl}" onerror="this.closest('.pv-wrap').style.display='none'"></video></div>`;
   } else if (TEXTS.has(ext)) {
-    preview = `<div class="pv-wrap code-wrap"><div class="code-loading" id="cl"><span class="spin"></span>Loading preview\u2026</div><pre id="cp" class="code-pre" style="display:none"></pre><div id="ce" class="code-err" style="display:none">Preview unavailable.</div></div><script>(function(){fetch(${JSON.stringify(dlUrl)}).then(function(r){if(!r.ok)throw 0;return r.text();}).then(function(t){var p=document.getElementById('cp');p.textContent=t.length>10000?t.slice(0,10000)+'\\n\\n\\u2026 (truncated)':t;document.getElementById('cl').style.display='none';p.style.display='';}).catch(function(){document.getElementById('cl').style.display='none';document.getElementById('ce').style.display='';});})();<\/script>`;
+    const nonceAttr = nonce ? ` nonce="${nonce}"` : '';
+    preview = `<div class="pv-wrap code-wrap"><div class="code-loading" id="cl"><span class="spin"></span>Loading preview\u2026</div><pre id="cp" class="code-pre" style="display:none"></pre><div id="ce" class="code-err" style="display:none">Preview unavailable.</div></div><script${nonceAttr}>(function(){fetch(${JSON.stringify(dlUrl)}).then(function(r){if(!r.ok)throw 0;return r.text();}).then(function(t){var p=document.getElementById('cp');p.textContent=t.length>10000?t.slice(0,10000)+'\\n\\n\\u2026 (truncated)':t;document.getElementById('cl').style.display='none';p.style.display='';}).catch(function(){document.getElementById('cl').style.display='none';document.getElementById('ce').style.display='';});})();<\/script>`;
   }
   const metaParts = [];
   if (sz) metaParts.push(`<span>${sz}</span>`);

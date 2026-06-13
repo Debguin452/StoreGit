@@ -106,8 +106,10 @@ export async function onRequest({ request, next, env }) {
   }
 
   // ── 7. Enforce max request body size (10 MB hard limit) ───────────────────
+  // Only upload-related API routes are allowed to exceed the 10 MB limit.
+  const LARGE_BODY_ALLOWED = new Set(['/api/upload', '/api/upload-chunk', '/api/finalize-upload']);
   const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
-  if (contentLength > 10 * 1024 * 1024 && !path.startsWith('/api/')) {
+  if (contentLength > 10 * 1024 * 1024 && !LARGE_BODY_ALLOWED.has(path)) {
     return deny(413, 'Payload too large');
   }
 
