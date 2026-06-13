@@ -1,6 +1,7 @@
 # StoreGit
 
-> A serverless file-storage platform built on **Cloudflare Pages Functions** and the **GitHub Contents / Git Data APIs**. Each user connects their own GitHub repository as storage. You deploy one Cloudflare Pages project; users bring their own GitHub repo and personal access token.
+> A serverless system built on **Cloudflare Pages Functions** and the **GitHub Contents / Git Data APIs**. Each user connects their own GitHub repository as storage. Lets developers see,edit or modify their files on github from any remote device without logging in to their github account.
+
 
 [![Live Site](https://img.shields.io/badge/Live%20Site-storegit.pages.dev-F38020?style=flat-square&logo=cloudflare&logoColor=white)](https://storegit.pages.dev/)
 
