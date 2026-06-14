@@ -56,7 +56,7 @@
       <div class="card-title">Files</div>
       <button class="btn btn-ghost btn-sm" id="refresh-files-btn">Refresh</button>
     </div>
-    <div id="file-list"></div>
+    <div id="file-list"><div class="loading-row"><span class="spinner"></span> Loading…</div></div>
   </div>
 </div>
 <div class="app-footer">StoreGit &nbsp;&middot;&nbsp; Free &amp; open source &nbsp;&middot;&nbsp; Powered by GitHub</div>
@@ -94,8 +94,7 @@
     </div>
     <p class="drawer-section-sub">Use API keys to access your storage from external apps. Bind a key to specific origins for maximum security.</p>
     <div id="apikey-list" class="apikey-list"></div>
-    <div id="apikey-reveal" style="display:none" class="apikey-reveal-box">
-      <div class="apikey-reveal-label">Copy your new key now — it will never be shown again:</div>
+   <div id="apikey-reveal" hidden class="apikey-reveal-box">  <div class="apikey-reveal-label">Copy your new key now — it will never be shown again:</div>
       <div class="apikey-reveal-row">
         <code class="apikey-reveal-code" id="apikey-reveal-code"></code>
         <button class="btn btn-ghost btn-sm" id="apikey-copy-btn">Copy</button>
