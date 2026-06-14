@@ -10,7 +10,6 @@ export const state = {
   uploadAbortFn:    null,
   shareFile:        null,
   allRepos:         [],
-  activeRepoIdx:    0,
   repoFiles:        [],
   repoStorage:      [],
   currentFileRepoIdx: 0,

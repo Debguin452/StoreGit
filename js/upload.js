@@ -132,7 +132,7 @@ export async function startUpload() {
   if (allDone) {
     const ok  = state.uploadPending.some(i => i.status === 'done');
     const bad = state.uploadPending.some(i => i.status === 'error');
-    if (ok)  { toast('Upload complete.', 'ok');  if (_loadFilesRef) _loadFilesRef(true); }
+    if (ok)  { toast('Upload complete.', 'ok');  if (_loadFilesRef) _loadFilesRef(true); import('./drawer.js').then(m => m.loadMeta()); }
     if (bad) toast('Some files failed. Tap Retry.', 'error');
   }
   renderQueue();

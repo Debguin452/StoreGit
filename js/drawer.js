@@ -20,22 +20,13 @@ export async function loadMeta() {
     if (r.status === 401) { window.location.replace('/'); return; }
     if (r.ok) {
       const d = await r.json();
-      state.repoStorage   = Array.isArray(d.storage) ? d.storage : [];
-      state.activeRepoIdx = d.activeRepoIdx || 0;
-      _updateRepoChip(d.repos || []);
+      state.repoStorage = Array.isArray(d.storage) ? d.storage : [];
+      state.allRepos    = d.repos || [];
+      renderDrawerRepoList();
       const userEl = document.getElementById('topbar-user');
       if (userEl && (d.display || d.username)) userEl.textContent = d.display || d.username;
     }
   } catch {}
-}
-
-function _updateRepoChip(repos) {
-  state.allRepos = repos || [];
-  renderDrawerRepoList();
-  const chip = document.getElementById('repo-chip');
-  if (!chip) return;
-  const r = repos[state.activeRepoIdx];
-  chip.textContent = r ? (r.label || `${r.ghOwner}/${r.ghRepo}`) : '';
 }
 
 export function renderDrawerRepoList() {
@@ -43,70 +34,46 @@ export function renderDrawerRepoList() {
   if (!list) return;
   list.innerHTML = '';
   state.allRepos.forEach((repo, i) => {
-    const isActive = i === state.activeRepoIdx;
-    const item = elem('div', 'drawer-repo-item' + (isActive ? ' active' : ''));
+    const item = elem('div', 'drawer-repo-item');
     const info = elem('div', 'drawer-repo-item-info');
     const lbl  = elem('div', 'drawer-repo-item-label');
     lbl.textContent = repo.label || `Repo ${i + 1}`;
     const slug = elem('div', 'drawer-repo-item-slug');
     slug.textContent = `${repo.ghOwner}/${repo.ghRepo}`;
-    if (isActive) {
-      const badge = elem('span', 'drawer-repo-item-badge'); badge.textContent = 'Active';
-      lbl.appendChild(badge);
-    }
-    const stor = state.repoStorage[i] || {};
+    const stor  = state.repoStorage[i] || {};
     const bytes = stor.bytes || 0;
-    const limitBytes = stor.limit || (5 * 1024 * 1024 * 1024);
-    const pct   = Math.min(100, (bytes / limitBytes) * 100);
     const storEl = elem('div', 'drawer-repo-storage');
-    const barEl  = elem('div', 'drawer-repo-storage-bar');
-    const fill   = elem('div', 'drawer-repo-storage-fill' + (pct > 90 ? ' warn' : ''));
-    fill.style.width = '0%';
-    barEl.appendChild(fill);
-    const label = elem('div', 'drawer-repo-storage-label');
-    label.textContent = bytes ? `${fmtSize(bytes)} used` : 'Usage unavailable';
-    storEl.append(barEl, label);
+    if (bytes) {
+      const label = elem('div', 'drawer-repo-storage-label');
+      label.textContent = `${fmtSize(bytes)} used`;
+      storEl.appendChild(label);
+    }
     info.append(lbl, slug, storEl);
     item.appendChild(info);
-    item.addEventListener('click', async () => {
-      if (isActive) return;
-      try {
-        const r = await fetch('/api/switch-repo', {
-          method: 'POST', credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ repoIdx: i }),
-        });
-        if (r.ok) { await loadMeta(); loadFiles(true); closeDrawer(); }
-        else toast('Could not switch repository.', 'error');
-      } catch { toast('Connection error.', 'error'); }
-    });
-    if (state.allRepos.length > 1) {
-      const rmBtn = elem('button', 'drawer-repo-remove-btn');
-      rmBtn.title = `Remove ${repo.label || 'this repository'}`;
-      rmBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
-      rmBtn.onclick = e => {
-        e.stopPropagation();
-        showModal(
-          `Remove "${repo.label || `Repo ${i + 1}`}"`,
-          'Files stay on GitHub — only the connection is removed from StoreGit.',
-          'Remove', 'btn-danger',
-          async () => {
-            try {
-              const r = await fetch('/api/remove-repo', {
-                method: 'POST', credentials: 'same-origin',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ repoIdx: i }),
-              });
-              if (r.ok) { toast('Repository removed.', 'ok'); await loadMeta(); loadFiles(true); }
-              else toast('Failed to remove.', 'error');
-            } catch { toast('Connection error.', 'error'); }
-          }
-        );
-      };
-      item.appendChild(rmBtn);
-    }
+    const rmBtn = elem('button', 'drawer-repo-remove-btn');
+    rmBtn.title = `Remove ${repo.label || 'this repository'}`;
+    rmBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+    rmBtn.onclick = e => {
+      e.stopPropagation();
+      showModal(
+        `Remove "${repo.label || `Repo ${i + 1}`}"`,
+        'Files stay on GitHub — only the connection is removed from StoreGit.',
+        'Remove', 'btn-danger',
+        async () => {
+          try {
+            const r = await fetch('/api/remove-repo', {
+              method: 'POST', credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ repoIdx: i }),
+            });
+            if (r.ok) { toast('Repository removed.', 'ok'); await loadMeta(); loadFiles(true); }
+            else toast('Failed to remove.', 'error');
+          } catch { toast('Connection error.', 'error'); }
+        }
+      );
+    };
+    item.appendChild(rmBtn);
     list.appendChild(item);
-    requestAnimationFrame(() => requestAnimationFrame(() => { fill.style.width = pct + '%'; }));
   });
 }
 
