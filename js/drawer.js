@@ -199,7 +199,7 @@ export function closeApiKeyForm() {
 
 export function hideApiKeyReveal() {
   const box = document.getElementById('apikey-reveal');
-  if (box) box.style.display = 'none';
+  if (box) box.hidden = true;
 }
 
 export async function submitApiKey() {
@@ -227,7 +227,7 @@ export async function submitApiKey() {
       closeApiKeyForm();
       const box  = document.getElementById('apikey-reveal');
       const code = document.getElementById('apikey-reveal-code');
-      if (box && code) { code.textContent = d.rawKey; box.style.display = 'block'; }
+      if (box && code) { code.textContent = d.rawKey; box.hidden = false; }
       toast('API key created. Copy it now — it will not be shown again!', 'ok');
       loadApiKeys();
     } else { if (errEl) errEl.textContent = d.error || 'Failed to create API key.'; }
