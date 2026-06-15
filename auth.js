@@ -13,10 +13,14 @@ let _signupData = {};
       return;
     }
   } catch {}
-  try {
-    const r = await fetch('/api/me', { credentials: 'same-origin' });
-    if (r.ok) { window.location.replace('/files'); return; }
-  } catch {}
+  if (sessionStorage.getItem('sg_logged_out')) {
+    sessionStorage.removeItem('sg_logged_out');
+  } else {
+    try {
+      const r = await fetch('/api/me', { credentials: 'same-origin' });
+      if (r.ok) { window.location.replace('/files'); return; }
+    } catch {}
+  }
   const view = location.hash === '#signup' ? 'signup' : location.hash === '#reset' ? 'reset' : 'login';
   showView(view);
 })();
