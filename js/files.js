@@ -111,40 +111,49 @@ export function closeFileDetail() {
 export async function loadFilePreview(f) {
   const el  = document.getElementById('fd-preview');
   const ext = fileExtRaw(f.originalName || f.name);
+  const cacheKey = `${f._repoIdx ?? 0}:${f.name}`;
   const noPreview = msg => {
     const p = elem('div', 'fd-preview-none'); p.textContent = msg; el.replaceChildren(p);
   };
   if (!f.chunked) {
     const fetchBlob = async () => {
+      if (state.previewCache.has(cacheKey)) return state.previewCache.get(cacheKey);
       const r = await fetch(
         `/api/download?name=${encodeURIComponent(f.name)}&inline=1&repoIdx=${state.currentFileRepoIdx}`,
         { credentials: 'same-origin' }
       );
       if (!r.ok) throw new Error();
-      return URL.createObjectURL(await r.blob());
+      const url = URL.createObjectURL(await r.blob());
+      state.previewCache.set(cacheKey, url);
+      return url;
     };
     if (FD_IMG.has(ext)) {
       if (f.size > 20 * 1024 * 1024) { noPreview('Image too large to preview.'); return; }
+      if (state.previewCache.has(cacheKey)) {
+        const img = elem('img', 'fd-preview-img');
+        img.alt = f.name; img.src = state.previewCache.get(cacheKey);
+        el.replaceChildren(img); return;
+      }
       el.innerHTML = '<div class="fd-preview-loading"><span class="spinner"></span></div>';
       try {
         const blobUrl = await fetchBlob();
         const img = elem('img', 'fd-preview-img');
         img.alt = f.name;
-        img.onerror = () => { URL.revokeObjectURL(blobUrl); noPreview('Could not load image.'); };
+        img.onerror = () => { state.previewCache.delete(cacheKey); noPreview('Could not load image.'); };
         el.replaceChildren(img); img.src = blobUrl;
       } catch { noPreview('Preview unavailable.'); }
       return;
     }
     if (FD_AUDIO.has(ext)) {
       const btn = elem('button', 'btn btn-outline fd-tap-load');
-      btn.textContent = 'Tap to load audio';
+      btn.textContent = state.previewCache.has(cacheKey) ? 'Tap to play audio' : 'Tap to load audio';
       btn.onclick = async () => {
         btn.disabled = true; btn.textContent = 'Loading…';
         try {
           const blobUrl = await fetchBlob();
           const a = elem('audio', 'fd-preview-audio');
           a.controls = true; a.preload = 'metadata';
-          a.onerror = () => { URL.revokeObjectURL(blobUrl); noPreview('Could not load audio.'); };
+          a.onerror = () => { state.previewCache.delete(cacheKey); noPreview('Could not load audio.'); };
           el.replaceChildren(a); a.src = blobUrl;
         } catch { noPreview('Could not load audio.'); }
       };
@@ -152,20 +161,26 @@ export async function loadFilePreview(f) {
     }
     if (FD_VIDEO.has(ext)) {
       const btn = elem('button', 'btn btn-outline fd-tap-load');
-      btn.textContent = 'Tap to load video';
+      btn.textContent = state.previewCache.has(cacheKey) ? 'Tap to play video' : 'Tap to load video';
       btn.onclick = async () => {
         btn.disabled = true; btn.textContent = 'Loading…';
         try {
           const blobUrl = await fetchBlob();
           const v = elem('video', 'fd-preview-video');
           v.controls = true; v.preload = 'metadata';
-          v.onerror = () => { URL.revokeObjectURL(blobUrl); noPreview('Could not load video.'); };
+          v.onerror = () => { state.previewCache.delete(cacheKey); noPreview('Could not load video.'); };
           el.replaceChildren(v); v.src = blobUrl;
         } catch { noPreview('Could not load video.'); }
       };
       el.replaceChildren(btn); return;
     }
     if (FD_TEXT.has(ext) && f.size <= 200_000) {
+      const textKey = cacheKey + ':text';
+      if (state.previewCache.has(textKey)) {
+        const pre = elem('pre', 'fd-preview-code');
+        pre.textContent = state.previewCache.get(textKey);
+        el.replaceChildren(pre); return;
+      }
       el.innerHTML = '<div class="fd-preview-loading"><span class="spinner"></span></div>';
       try {
         const r = await fetch(
@@ -173,9 +188,11 @@ export async function loadFilePreview(f) {
           { credentials: 'same-origin' }
         );
         if (!r.ok) { noPreview('Could not load preview.'); return; }
-        const text = await r.text();
+        const raw  = await r.text();
+        const text = raw.length > 6000 ? raw.slice(0, 6000) + '\n\n… (truncated)' : raw;
+        state.previewCache.set(textKey, text);
         const pre  = elem('pre', 'fd-preview-code');
-        pre.textContent = text.length > 6000 ? text.slice(0, 6000) + '\n\n… (truncated)' : text;
+        pre.textContent = text;
         el.replaceChildren(pre);
       } catch { noPreview('Could not load preview.'); }
       return;
@@ -238,7 +255,12 @@ export function deleteFile(name, sha, chunked, displayName, repoIdx) {
           body: JSON.stringify({ name, sha, chunked, repoIdx }),
         });
         if (r.status === 401) { window.location.replace('/'); return; }
-        if (r.ok) { toast('File deleted.', 'ok'); loadFiles(true); }
+        if (r.ok) {
+          const ck = `${repoIdx}:${name}`;
+          state.previewCache.delete(ck);
+          state.previewCache.delete(ck + ':text');
+          toast('File deleted.', 'ok'); loadFiles(true);
+        }
         else toast('Delete failed.', 'error');
       } catch { toast('Connection error.', 'error'); }
     }

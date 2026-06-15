@@ -1,5 +1,5 @@
 import { state }                                                    from './state.js';
-import { on, toast }                                               from './util.js';
+import { on, toast, showModal }                                    from './util.js';
 import { loadFiles, closeFileDetail }                              from './files.js';
 import { onFilePicked, clearQueue, togglePause, startUpload, setLoadFilesRef } from './upload.js';
 import { openDrawer, closeDrawer, loadMeta, toggleDrawerAddRepoForm, closeDrawerAddRepoForm,
@@ -33,10 +33,13 @@ async function _boot() {
 
 async function doLogout() {
   try { await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' }); } catch {}
+  sessionStorage.setItem('sg_logged_out', '1');
   window.location.replace('/');
 }
 
-on('signout-btn',         'click', () => doLogout());
+on('signout-btn', 'click', () => {
+  showModal('Sign out', 'Are you sure you want to sign out?', 'Sign out', 'btn-danger', doLogout);
+});
 on('file-input',          'change', e  => { onFilePicked(e.target.files); e.target.value = ''; });
 on('upload-btn',          'click', () => startUpload());
 on('clear-queue-btn',     'click', () => clearQueue());

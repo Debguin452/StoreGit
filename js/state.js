@@ -17,4 +17,5 @@ export const state = {
   editSha:          null,
   filesCachedAt:    0,
   sliceCache:       new WeakMap(),
+  previewCache:     new Map(),
 };

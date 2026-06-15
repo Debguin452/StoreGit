@@ -1,8 +1,39 @@
 import { state }                            from './state.js';
 import { elem, toast, fmtSize, fileExt, fileExtRaw, fileColor } from './util.js';
+import { renderFiles }                      from './files.js';
 
 let _loadFilesRef = null;
 export function setLoadFilesRef(fn) { _loadFilesRef = fn; }
+
+function _appendUploadedToState() {
+  const done = state.uploadPending.filter(i => i.status === 'done');
+  if (!done.length) return;
+  const repoIdx = getSmartRepoIdx();
+  if (!state.repoFiles.length) {
+    state.repoFiles = [{ repo: state.allRepos[0] || null, repoIdx: 0, files: [] }];
+  }
+  let group = state.repoFiles.find(g => g.repoIdx === repoIdx);
+  if (!group) {
+    group = { repo: state.allRepos[repoIdx] || null, repoIdx, files: [] };
+    state.repoFiles.push(group);
+  }
+  const now = new Date().toISOString();
+  for (const item of done) {
+    const idx = group.files.findIndex(f => f.name === item.file.name);
+    const entry = {
+      name: item.file.name,
+      originalName: item.file.name,
+      size: item.file.size,
+      uploadedAt: now,
+      sha: null,
+      _repoIdx: repoIdx,
+    };
+    if (idx >= 0) group.files[idx] = entry;
+    else group.files.push(entry);
+  }
+  state.filesCachedAt = Date.now();
+  renderFiles();
+}
 
 export function precacheSlices(file) {
   if (file.size <= state.CHUNK_SIZE || state.sliceCache.has(file)) return;
@@ -132,7 +163,7 @@ export async function startUpload() {
   if (allDone) {
     const ok  = state.uploadPending.some(i => i.status === 'done');
     const bad = state.uploadPending.some(i => i.status === 'error');
-    if (ok)  { toast('Upload complete.', 'ok');  if (_loadFilesRef) _loadFilesRef(true); import('./drawer.js').then(m => m.loadMeta()); }
+    if (ok)  { toast('Upload complete.', 'ok');  _appendUploadedToState(); import('./drawer.js').then(m => m.loadMeta()); }
     if (bad) toast('Some files failed. Tap Retry.', 'error');
   }
   renderQueue();
