@@ -206,34 +206,57 @@ export async function downloadFile(name, size, displayName, repoIdx) {
   const fill = document.getElementById('dl-fill');
   const lbl  = document.getElementById('dl-label');
   const fnEl = document.getElementById('dl-filename');
-  fnEl.textContent  = displayName;
-  fill.style.width  = '0%';
-  lbl.textContent   = 'Preparing…';
+  fnEl.textContent = displayName;
+  fill.style.width = '0%';
+  lbl.textContent  = 'Preparing…';
   bar.classList.add('active');
   try {
     const r = await fetch(`/api/download?name=${encodeURIComponent(name)}&repoIdx=${repoIdx}`, { credentials: 'same-origin' });
     if (r.status === 401) { window.location.replace('/'); return; }
-    if (!r.ok) { toast('Download failed.', 'error'); return; }
-    const d = await r.json();
-    if (d.chunked) {
-      const chunks = [];
-      for (let i = 0; i < d.totalChunks; i++) {
-        fill.style.width = Math.round(i / d.totalChunks * 90) + '%';
-        lbl.textContent  = `Part ${i + 1} of ${d.totalChunks}…`;
-        const cr = await fetch(d.chunkUrls[i]);
-        if (!cr.ok) throw new Error();
-        chunks.push(await cr.arrayBuffer());
-      }
-      fill.style.width = '100%'; lbl.textContent = 'Assembling…';
-      _triggerDownload(URL.createObjectURL(new Blob(chunks)), displayName);
-    } else {
-      fill.style.width = '80%'; lbl.textContent = 'Downloading…';
-      const fr = await fetch(d.url);
-      _triggerDownload(URL.createObjectURL(new Blob([await fr.arrayBuffer()])), displayName);
-      fill.style.width = '100%';
+    if (!r.ok) {
+      let msg = 'Download failed.';
+      try { const d = await r.json(); if (d.error) msg = d.error; } catch {}
+      toast(msg, 'error');
+      return;
     }
-  } catch { toast('Download failed.', 'error'); }
-  setTimeout(() => bar.classList.remove('active'), 1200);
+    // Server streams the file directly — read with progress tracking
+    const contentLength = parseInt(r.headers.get('content-length') || '0', 10);
+    const reader  = r.body.getReader();
+    const chunks  = [];
+    let received  = 0;
+    lbl.textContent = 'Downloading…';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
+      if (contentLength > 0) {
+        fill.style.width = Math.min(99, Math.round(received / contentLength * 100)) + '%';
+        lbl.textContent  = _fmtBytes(received) + (contentLength ? ' / ' + _fmtBytes(contentLength) : '');
+      } else {
+        fill.style.width = '60%';
+        lbl.textContent  = _fmtBytes(received) + ' received…';
+      }
+    }
+    fill.style.width = '100%';
+    lbl.textContent  = 'Saving…';
+    // Derive filename from Content-Disposition if available
+    const cd = r.headers.get('content-disposition') || '';
+    const cdMatch = cd.match(/filename\*=UTF-8''([^;]+)/i) || cd.match(/filename="?([^";]+)"?/i);
+    const saveName = cdMatch ? decodeURIComponent(cdMatch[1]) : displayName;
+    const mime = r.headers.get('content-type') || 'application/octet-stream';
+    _triggerDownload(URL.createObjectURL(new Blob(chunks, { type: mime })), saveName);
+  } catch (e) {
+    toast('Download failed' + (e?.message ? ': ' + e.message : '.'), 'error');
+  }
+  setTimeout(() => bar.classList.remove('active'), 1400);
+}
+
+function _fmtBytes(n) {
+  if (n < 1024)       return n + ' B';
+  if (n < 1048576)    return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+  return (n / 1073741824).toFixed(2) + ' GB';
 }
 
 function _triggerDownload(url, name) {
