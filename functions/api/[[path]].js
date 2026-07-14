@@ -1242,7 +1242,7 @@ async function _handleRequest({ request, env, params }) {
     }
     return jsonRes(request, { ok:true });
   }
-  if (route === 'auth' && method === 'POST') {
+  if ((route === 'login' || route === 'auth') && method === 'POST') {
     const ip = getIP(request);
     if (await checkRate(`login:${ip}`, LOGIN_LOCKOUT_ATTEMPTS, env, LOGIN_LOCKOUT_MS)) return fail(request, 429);
     let body; try { body = await request.json(); } catch { return fail(request, 400); }
