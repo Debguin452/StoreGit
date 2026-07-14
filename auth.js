@@ -68,7 +68,7 @@ async function doLogin() {
   if (!username || !password) { errEl.textContent = 'Please enter your username and password.'; return; }
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
   try {
-    const r = await fetch('/api/auth', {
+    const r = await fetch('/api/login', {
       method: 'POST', credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
