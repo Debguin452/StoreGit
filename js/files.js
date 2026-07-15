@@ -51,30 +51,7 @@ export async function loadFiles(force = false) {
   } catch { el.innerHTML = '<div class="empty-state"><p>Could not load files.</p></div>'; }
 }
 
-export function renderFiles() {
-  const el = document.getElementById('file-list');
-  if (!el) return;
-  el.innerHTML = '';
-  const all = state.repoFiles.flatMap(g =>
-    (g.files || [])
-      .filter(f => f.name !== '.storegit' && !f.name.startsWith('.sgkeys/'))
-      .map(f => ({ ...f, _repoIdx: g.repoIdx }))
-  );
-  if (!all.length) {
-    el.innerHTML =
-      '<div class="empty-state">' +
-      '<div class="empty-state-icon"><svg viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">' +
-      '<rect x="8" y="6" width="24" height="28" rx="3"/>' +
-      '<line x1="14" y1="14" x2="26" y2="14"/><line x1="14" y1="20" x2="26" y2="20"/><line x1="14" y1="26" x2="20" y2="26"/>' +
-      '</svg></div><p>No files yet.<br>Upload your first file above.</p></div>';
-    return;
-  }
-  all.sort((a, b) => {
-    const at = a.uploadedAt || a.name, bt = b.uploadedAt || b.name;
-    return at < bt ? 1 : at > bt ? -1 : 0;
-  });
-  all.forEach(f => el.appendChild(buildFileRow(f)));
-}
+
 
 export function openFileDetail(f) {
   state.shareFile        = f;
