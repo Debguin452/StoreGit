@@ -1139,28 +1139,31 @@ async function _handleRequest({ request, env, params }) {
       endpoints: {
         public: [
           { method: 'GET',    path: '/api/status' },
+          { method: 'GET',    path: '/api/health' },
           { method: 'POST',   path: '/api/signup' },
-          { method: 'POST',   path: '/api/auth' },
+          { method: 'POST',   path: '/api/login' },
           { method: 'POST',   path: '/api/reset-password' },
           { method: 'GET',    path: '/api/dl?tok=<token>' },
         ],
         authenticated: [
           { method: 'POST',   path: '/api/logout',          auth: ['session'] },
-          { method: 'GET',    path: '/api/me',               auth: ['session', 'apiKey'], note: 'Includes active-repo storage stats' },
+          { method: 'GET',    path: '/api/me',               auth: ['session', 'apiKey'] },
           { method: 'GET',    path: '/api/repos',            auth: ['session', 'apiKey'] },
-          { method: 'GET',    path: '/api/storage',          auth: ['session', 'apiKey'], note: 'Per-repo and total storage breakdown' },
-          { method: 'POST',   path: '/api/switch-repo',      auth: ['session'] },
+          { method: 'GET',    path: '/api/storage',          auth: ['session', 'apiKey'] },
           { method: 'POST',   path: '/api/add-repo',         auth: ['session'] },
           { method: 'POST',   path: '/api/remove-repo',      auth: ['session'] },
-          { method: 'GET',    path: '/api/files',            auth: ['session', 'apiKey'], note: 'Returns file array — supports ?repoIdx=N. Use /api/storage for size totals.' },
+          { method: 'GET',    path: '/api/files',            auth: ['session', 'apiKey'] },
           { method: 'POST',   path: '/api/upload',           auth: ['session', 'apiKey'] },
           { method: 'POST',   path: '/api/upload-chunk',     auth: ['session', 'apiKey'] },
           { method: 'POST',   path: '/api/finalize-upload',  auth: ['session', 'apiKey'] },
           { method: 'GET',    path: '/api/download',         auth: ['session', 'apiKey'] },
           { method: 'DELETE', path: '/api/delete',           auth: ['session', 'apiKey'] },
           { method: 'GET',    path: '/api/share-link',       auth: ['session', 'apiKey'] },
-          { method: 'GET',    path: '/api/read-text',         auth: ['session', 'apiKey'], note: 'Read editable text file content + sha (txt, md, json, csv, yaml…)' },
-          { method: 'POST',   path: '/api/edit-text',         auth: ['session'],           note: 'Save edited text content back; requires sha from read-text' },
+          { method: 'GET',    path: '/api/read-text',        auth: ['session', 'apiKey'] },
+          { method: 'POST',   path: '/api/edit-text',        auth: ['session']           },
+          { method: 'POST',   path: '/api/mkdir',            auth: ['session', 'apiKey'] },
+          { method: 'DELETE', path: '/api/rmdir',            auth: ['session', 'apiKey'] },
+          { method: 'POST',   path: '/api/move',             auth: ['session', 'apiKey'] },
           { method: 'GET',    path: '/api/apikeys/list',     auth: ['session'] },
           { method: 'POST',   path: '/api/apikeys/create',   auth: ['session'] },
           { method: 'DELETE', path: '/api/apikeys/revoke',   auth: ['session'] },
@@ -1169,6 +1172,26 @@ async function _handleRequest({ request, env, params }) {
       },
     });
   }
+  if (route === 'health' && method === 'GET') {
+    const checks = {};
+    const ready  = !!(env.REGISTRY_GITHUB_TOKEN && env.REGISTRY_GITHUB_OWNER && env.REGISTRY_GITHUB_REPO);
+    checks.config = ready ? 'ok' : 'missing env vars';
+    checks.kv     = env.RATE_LIMIT_KV ? 'ok' : 'not bound';
+    let ghStatus  = 'unchecked';
+    if (ready) {
+      try {
+        const r = await fetch(
+          `https://api.github.com/repos/${env.REGISTRY_GITHUB_OWNER}/${env.REGISTRY_GITHUB_REPO}`,
+          { headers: { Authorization: `token ${env.REGISTRY_GITHUB_TOKEN}`, 'User-Agent': 'StoreGit/1' } }
+        );
+        ghStatus = r.ok ? 'ok' : `HTTP ${r.status}`;
+      } catch(e) { ghStatus = `network error: ${e.message}`; }
+    }
+    checks.github_registry = ghStatus;
+    const allOk = ready && ghStatus === 'ok';
+    return jsonRes(request, { ok: allOk, checks, version: '1', ts: new Date().toISOString() }, allOk ? 200 : 503);
+  }
+
   if (route === 'signup' && method === 'POST') {
     const ip = getIP(request);
     if (await checkRate(`signup:${ip}`, RATE_MAX_SIGNUP, env)) return fail(request, 429);
@@ -2112,7 +2135,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
 
   if (route === 'mkdir' && method === 'POST') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
-    let body; try { body = await request.json(); } catch { return jJs({ error: ERRS[400] }, 400); }
+    let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
     const { path: folderPath, repoIdx: ri } = body || {};
     if (!folderPath || typeof folderPath !== 'string') return jRes({ error: ERRS[400] }, 400);
     const safe = folderPath.replace(/[^a-zA-Z0-9_\-./]/g, '_').replace(/\.{2,}/g, '_').replace(/^\/+|\/+$/g, '');
@@ -2121,11 +2144,13 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const { ghToken, ghOwner, ghRepo, ghBranch, folder } = dlSess;
     const keepPath = `${folder}/${safe}/.gitkeep`;
     try {
-      await uploadSmall(dlSess, '.gitkeep', btoa(''));
-      const res2 = await fetch(
-        `https://api.github.com/repos/${ghOwner}/${ghRepo}/contents/${keepPath}`,
-        { method: 'PUT', headers: ghH(ghToken), body: JSON.stringify({ message: `mkdir ${safe}`, content: btoa(''), branch: ghBranch }) }
-      );
+      let res2;
+      try {
+        res2 = await fetch(
+          `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/contents/${encodeURIComponent(folder)}/${encodeURIComponent(safe)}/.gitkeep`,
+          { method: 'PUT', headers: ghH(ghToken), body: JSON.stringify({ message: `mkdir ${safe}`, content: '', branch: ghBranch }) }
+        );
+      } catch { throw new GitHubError(0, 'Network error creating folder', 'mkdir'); }
       if (!res2.ok && res2.status !== 422) {
         const msg = await ghErrMsg(res2, 'Failed to create folder');
         throw new GitHubError(res2.status, msg, 'mkdir');
@@ -2186,7 +2211,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       const content = await fetch(srcUrl, { headers: { Authorization: `token ${srcSess.ghToken}`, 'User-Agent': 'StoreGit/1' } });
       if (!content.ok) return jRes({ error: 'Source file not found' }, 404);
       const buf = await content.arrayBuffer();
-      const b64 = bufToBase64(new Uint8Array(buf));
+      const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
       await uploadSmall(destSess, safeDest, b64);
       const { data: idx } = await readIndex(srcSess).catch(() => ({ data: {}, sha: null }));
       if (idx[safeSrc]) {
