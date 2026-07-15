@@ -93,6 +93,8 @@ export function openFileDetail(f) {
     closeFileDetail();
     setTimeout(() => deleteFile(f.name, f.sha, f.chunked || false, displayName, state.currentFileRepoIdx), 250);
   };
+  const moveBtn = document.getElementById('fd-move-btn');
+  if (moveBtn) moveBtn.onclick = () => { closeFileDetail(); setTimeout(() => moveFileToFolderUI(f), 250); };
   const editBtn = document.getElementById('fd-edit-btn');
   if (editBtn) {
     const canEdit = FD_EDITABLE.has(ext) && !f.chunked && (f.size || 0) <= 1_000_000;
@@ -288,4 +290,164 @@ export function deleteFile(name, sha, chunked, displayName, repoIdx) {
       } catch { toast('Connection error.', 'error'); }
     }
   );
+}
+
+export let currentFolder = '';
+
+export function setCurrentFolder(f) { currentFolder = f; renderFiles(); }
+
+export function getFolderGroups(files) {
+  const folders = new Map();
+  const root    = [];
+  for (const f of files) {
+    const parts = (f.originalName || f.name).split('/');
+    if (parts.length > 1) {
+      const dir = parts[0];
+      if (!folders.has(dir)) folders.set(dir, []);
+      folders.get(dir).push({ ...f, _displayName: parts.slice(1).join('/') });
+    } else {
+      root.push(f);
+    }
+  }
+  return { folders, root };
+}
+
+export function renderBreadcrumb() {
+  const bc = document.getElementById('folder-breadcrumb');
+  if (!bc) return;
+  bc.innerHTML = '';
+  const home = document.createElement('span');
+  home.className = 'bc-item bc-link';
+  home.textContent = 'All files';
+  home.onclick = () => { currentFolder = ''; renderFiles(); };
+  bc.appendChild(home);
+  if (currentFolder) {
+    const sep = document.createElement('span');
+    sep.textContent = ' / ';
+    sep.className = 'bc-sep';
+    const name = document.createElement('span');
+    name.className = 'bc-item bc-current';
+    name.textContent = currentFolder;
+    bc.append(sep, name);
+  }
+}
+
+export function buildFolderRow(name, count) {
+  const row   = elem('div', 'file-row folder-row');
+  const badge = elem('div', 'file-type-badge folder-badge');
+  badge.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M10 4H2v16h20V6H12l-2-2z"/></svg>';
+  const info = elem('div', 'file-info');
+  const nm   = elem('div', 'file-name'); nm.textContent = name;
+  const mt   = elem('div', 'file-meta'); mt.textContent = `${count} file${count !== 1 ? 's' : ''}`;
+  const chev = elem('div', 'file-chevron');
+  chev.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><polyline points="9 18 15 12 9 6"/></svg>';
+  const del = elem('button', 'folder-del-btn');
+  del.title = 'Delete folder';
+  del.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>';
+  del.onclick = e => { e.stopPropagation(); deleteFolderUI(name); };
+  info.append(nm, mt);
+  row.append(badge, info, del, chev);
+  row.onclick = () => { currentFolder = name; renderFiles(); };
+  return row;
+}
+
+export function renderFiles() {
+  const el = document.getElementById('file-list');
+  if (!el) return;
+  el.innerHTML = '';
+
+  renderBreadcrumb();
+
+  const all = state.repoFiles.flatMap(g =>
+    (g.files || [])
+      .filter(f => f.name !== '.storegit' && !f.name.startsWith('.sgkeys/') && f.name !== '.gitkeep' && !f.name.endsWith('/.gitkeep'))
+      .map(f => ({ ...f, _repoIdx: g.repoIdx }))
+  );
+
+  if (!all.length) {
+    el.innerHTML = '<div class="empty-state"><div class="empty-state-icon"><svg viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="6" width="24" height="28" rx="3"/><line x1="14" y1="14" x2="26" y2="14"/><line x1="14" y1="20" x2="26" y2="20"/><line x1="14" y1="26" x2="20" y2="26"/></svg></div><p>No files yet.<br>Upload your first file above.</p></div>';
+    return;
+  }
+
+  if (currentFolder) {
+    const prefix = currentFolder + '/';
+    const inFolder = all.filter(f => (f.originalName || f.name).startsWith(prefix));
+    if (!inFolder.length) {
+      el.innerHTML = `<div class="empty-state"><p>Folder "${currentFolder}" is empty.</p></div>`;
+      return;
+    }
+    inFolder.sort((a,b) => { const at=a.uploadedAt||a.name,bt=b.uploadedAt||b.name; return at<bt?1:at>bt?-1:0; });
+    inFolder.forEach(f => {
+      const display = { ...f, originalName: (f.originalName||f.name).slice(prefix.length) };
+      el.appendChild(buildFileRow(display));
+    });
+    return;
+  }
+
+  const { folders, root } = getFolderGroups(all);
+  all.sort((a,b) => { const at=a.uploadedAt||a.name,bt=b.uploadedAt||b.name; return at<bt?1:at>bt?-1:0; });
+
+  for (const [name, files] of [...folders.entries()].sort()) {
+    el.appendChild(buildFolderRow(name, files.length));
+  }
+  root.sort((a,b) => { const at=a.uploadedAt||a.name,bt=b.uploadedAt||b.name; return at<bt?1:at>bt?-1:0; });
+  root.forEach(f => el.appendChild(buildFileRow(f)));
+}
+
+export function showCreateFolderModal(repoIdx = 0) {
+  const body = document.createElement('div');
+  body.innerHTML = `<label style="display:block;margin-bottom:8px;font-size:.85rem;color:var(--text-secondary)">Folder name</label><input id="new-folder-name" class="modal-input" placeholder="e.g. photos" autocomplete="off" style="width:100%;box-sizing:border-box">`;
+  showModal('New Folder', body, 'Create', 'btn-primary', async () => {
+    const name = document.getElementById('new-folder-name')?.value?.trim();
+    if (!name) return;
+    const safe = name.replace(/[^a-zA-Z0-9_\-]/g, '-');
+    try {
+      const r = await fetch('/api/mkdir', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: safe, repoIdx }),
+      });
+      if (r.ok) { toast(`Folder "${safe}" created.`, 'ok'); loadFiles(true); }
+      else { const d = await r.json().catch(()=>{}); toast(d?.error || 'Failed to create folder.', 'error'); }
+    } catch { toast('Connection error.', 'error'); }
+  });
+  setTimeout(() => document.getElementById('new-folder-name')?.focus(), 50);
+}
+
+export function deleteFolderUI(name) {
+  showModal(
+    `Delete folder "${name}"`,
+    'This permanently deletes the folder and all its contents.',
+    'Delete', 'btn-danger',
+    async () => {
+      try {
+        const r = await fetch('/api/rmdir', {
+          method: 'DELETE', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: name, repoIdx: 0 }),
+        });
+        if (r.ok) { toast('Folder deleted.', 'ok'); currentFolder = ''; loadFiles(true); }
+        else toast('Delete failed.', 'error');
+      } catch { toast('Connection error.', 'error'); }
+    }
+  );
+}
+
+export function moveFileToFolderUI(f) {
+  const body = document.createElement('div');
+  body.innerHTML = `<label style="display:block;margin-bottom:8px;font-size:.85rem;color:var(--text-secondary)">Destination folder (leave blank for root)</label><input id="move-folder-dest" class="modal-input" placeholder="e.g. photos" autocomplete="off" style="width:100%;box-sizing:border-box">`;
+  showModal('Move File', body, 'Move', 'btn-primary', async () => {
+    const dest = document.getElementById('move-folder-dest')?.value?.trim();
+    const destName = dest ? `${dest}/${f.originalName || f.name}` : (f.originalName || f.name);
+    try {
+      const r = await fetch('/api/move', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: f.name, destName, srcRepoIdx: f._repoIdx ?? 0, destRepoIdx: f._repoIdx ?? 0 }),
+      });
+      if (r.ok) { toast('File moved.', 'ok'); loadFiles(true); }
+      else { const d = await r.json().catch(()=>{}); toast(d?.error || 'Move failed.', 'error'); }
+    } catch { toast('Connection error.', 'error'); }
+  });
+  setTimeout(() => document.getElementById('move-folder-dest')?.focus(), 50);
 }
