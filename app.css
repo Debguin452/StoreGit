@@ -777,3 +777,20 @@ body.files-body .app-footer { margin-top: auto; }
   .edit-close-btn:hover { background: #1e2e50; color: #e2e8f0; }
   .edit-textarea { background: #0f172a; color: #e2e8f0; }
 }
+
+.card-header-actions { display:flex; gap:8px; align-items:center; }
+
+.folder-breadcrumb { display:flex; align-items:center; gap:4px; padding:8px 16px 4px; font-size:.82rem; min-height:28px; }
+.bc-link { color:var(--accent,#7c6aff); cursor:pointer; }
+.bc-link:hover { text-decoration:underline; }
+.bc-sep { color:var(--text-secondary,#888); }
+.bc-current { color:var(--text-primary,#fff); font-weight:600; }
+
+.folder-row { cursor:pointer; }
+.folder-row:hover { background:var(--surface-hover,rgba(255,255,255,.06)); }
+.folder-badge { background:var(--accent,#7c6aff) !important; color:#fff; display:flex; align-items:center; justify-content:center; }
+.folder-del-btn { margin-left:auto; background:none; border:none; color:var(--text-secondary,#888); cursor:pointer; padding:6px; border-radius:6px; display:flex; align-items:center; }
+.folder-del-btn:hover { color:var(--danger,#f87171); background:rgba(248,113,113,.1); }
+
+.modal-input { background:var(--surface-2,#1e2130); border:1px solid var(--border,rgba(255,255,255,.12)); border-radius:8px; color:var(--text-primary,#fff); font-size:.9rem; padding:10px 12px; outline:none; }
+.modal-input:focus { border-color:var(--accent,#7c6aff); }
