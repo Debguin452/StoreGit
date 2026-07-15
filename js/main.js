@@ -1,6 +1,6 @@
 import { state }                                                    from './state.js';
 import { on, toast, showModal }                                    from './util.js';
-import { loadFiles, closeFileDetail }                              from './files.js';
+import { loadFiles, closeFileDetail, showCreateFolderModal, moveFileToFolderUI } from './files.js';
 import { onFilePicked, clearQueue, togglePause, startUpload, setLoadFilesRef } from './upload.js';
 import { openDrawer, closeDrawer, loadMeta, toggleDrawerAddRepoForm, closeDrawerAddRepoForm,
          submitDrawerAddRepo, loadApiKeys, toggleApiKeyForm, closeApiKeyForm,
@@ -44,6 +44,7 @@ on('file-input',          'change', e  => { onFilePicked(e.target.files); e.targ
 on('upload-btn',          'click', () => startUpload());
 on('clear-queue-btn',     'click', () => clearQueue());
 on('refresh-files-btn',   'click', () => loadFiles(true));
+on('new-folder-btn',      'click', () => showCreateFolderModal(0));
 on('pause-btn',           'click', () => togglePause());
 on('hamburger-btn',       'click', () => openDrawer());
 on('drawer-close-btn',    'click', () => closeDrawer());
