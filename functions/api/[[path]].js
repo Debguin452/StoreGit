@@ -2110,5 +2110,95 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     return jRes({ ok: true, name: safe, sha: newSha });
   }
 
+  if (route === 'mkdir' && method === 'POST') {
+    if (!sess) return jRes({ error: 'Session required' }, 403);
+    let body; try { body = await request.json(); } catch { return jJs({ error: ERRS[400] }, 400); }
+    const { path: folderPath, repoIdx: ri } = body || {};
+    if (!folderPath || typeof folderPath !== 'string') return jRes({ error: ERRS[400] }, 400);
+    const safe = folderPath.replace(/[^a-zA-Z0-9_\-./]/g, '_').replace(/\.{2,}/g, '_').replace(/^\/+|\/+$/g, '');
+    if (!safe) return jRes({ error: 'Invalid folder name' }, 400);
+    const dlSess = getRepoSess(fullSess, Number.isInteger(ri) ? ri : 0);
+    const { ghToken, ghOwner, ghRepo, ghBranch, folder } = dlSess;
+    const keepPath = `${folder}/${safe}/.gitkeep`;
+    try {
+      await uploadSmall(dlSess, '.gitkeep', btoa(''));
+      const res2 = await fetch(
+        `https://api.github.com/repos/${ghOwner}/${ghRepo}/contents/${keepPath}`,
+        { method: 'PUT', headers: ghH(ghToken), body: JSON.stringify({ message: `mkdir ${safe}`, content: btoa(''), branch: ghBranch }) }
+      );
+      if (!res2.ok && res2.status !== 422) {
+        const msg = await ghErrMsg(res2, 'Failed to create folder');
+        throw new GitHubError(res2.status, msg, 'mkdir');
+      }
+      return jRes({ ok: true, path: safe });
+    } catch(err) { return errRes(request, err); }
+  }
+
+  if (route === 'rmdir' && method === 'DELETE') {
+    if (!sess) return jRes({ error: 'Session required' }, 403);
+    let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
+    const { path: folderPath, repoIdx: ri } = body || {};
+    if (!folderPath || typeof folderPath !== 'string') return jRes({ error: ERRS[400] }, 400);
+    const safe = folderPath.replace(/[^a-zA-Z0-9_\-./]/g, '_').replace(/\.{2,}/g, '_').replace(/^\/+|\/+$/g, '');
+    if (!safe) return jRes({ error: 'Invalid folder name' }, 400);
+    const dlSess = getRepoSess(fullSess, Number.isInteger(ri) ? ri : 0);
+    const { ghToken, ghOwner, ghRepo, ghBranch, folder } = dlSess;
+    const gh   = ghH(ghToken);
+    const base = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}`;
+    try {
+      const dirRes = await fetch(`${base}/contents/${folder}/${safe}?ref=${ghBranch}`, { headers: gh });
+      if (!dirRes.ok) return jRes({ error: 'Folder not found' }, 404);
+      const items = await dirRes.json();
+      if (!Array.isArray(items)) return jRes({ error: 'Not a folder' }, 400);
+      const refRes = await fetch(`${base}/git/ref/heads/${ghBranch}`, { headers: gh });
+      if (!refRes.ok) throw new GitHubError(refRes.status, await ghErrMsg(refRes, 'Failed to read branch ref'), 'rmdir');
+      const { object: { sha: headSha } } = await refRes.json();
+      const commitRes = await fetch(`${base}/git/commits/${headSha}`, { headers: gh });
+      const { tree: { sha: treeSha } } = await commitRes.json();
+      const treeItems = items.filter(f => f.type === 'file').map(f => ({
+        path: f.path, mode: '100644', type: 'blob', sha: null,
+      }));
+      if (!treeItems.length) return jRes({ ok: true, deleted: 0 });
+      const newTreeRes = await fetch(`${base}/git/trees`, { method: 'POST', headers: gh, body: JSON.stringify({ base_tree: treeSha, tree: treeItems }) });
+      if (!newTreeRes.ok) throw new GitHubError(newTreeRes.status, await ghErrMsg(newTreeRes, 'Failed to build delete tree'), 'rmdir');
+      const { sha: newTree } = await newTreeRes.json();
+      const newCommitRes = await fetch(`${base}/git/commits`, { method: 'POST', headers: gh, body: JSON.stringify({ message: `rmdir ${safe}`, tree: newTree, parents: [headSha] }) });
+      if (!newCommitRes.ok) throw new GitHubError(newCommitRes.status, await ghErrMsg(newCommitRes, 'Failed to commit folder delete'), 'rmdir');
+      const { sha: newCommit } = await newCommitRes.json();
+      const upRes = await fetch(`${base}/git/refs/heads/${ghBranch}`, { method: 'PATCH', headers: gh, body: JSON.stringify({ sha: newCommit, force: false }) });
+      if (!upRes.ok) throw new GitHubError(upRes.status, await ghErrMsg(upRes, 'Failed to update branch ref'), 'rmdir');
+      return jRes({ ok: true, deleted: treeItems.length });
+    } catch(err) { return errRes(request, err); }
+  }
+
+  if (route === 'move' && method === 'POST') {
+    if (!sess) return jRes({ error: 'Session required' }, 403);
+    let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
+    const { name: rawName, destName: rawDest, srcRepoIdx, destRepoIdx } = body || {};
+    if (!rawName || !rawDest) return jRes({ error: ERRS[400] }, 400);
+    const srcSess  = getRepoSess(fullSess, Number.isInteger(srcRepoIdx)  ? srcRepoIdx  : 0);
+    const destSess = getRepoSess(fullSess, Number.isInteger(destRepoIdx) ? destRepoIdx : 0);
+    const safeSrc  = sanitize(String(rawName));
+    const safeDest = sanitize(String(rawDest));
+    if (!safeSrc || !safeDest) return jRes({ error: ERRS[400] }, 400);
+    try {
+      const srcUrl = `https://raw.githubusercontent.com/${srcSess.ghOwner}/${srcSess.ghRepo}/${srcSess.ghBranch}/${srcSess.folder}/${encodeURIComponent(safeSrc)}`;
+      const content = await fetch(srcUrl, { headers: { Authorization: `token ${srcSess.ghToken}`, 'User-Agent': 'StoreGit/1' } });
+      if (!content.ok) return jRes({ error: 'Source file not found' }, 404);
+      const buf = await content.arrayBuffer();
+      const b64 = bufToBase64(new Uint8Array(buf));
+      await uploadSmall(destSess, safeDest, b64);
+      const { data: idx } = await readIndex(srcSess).catch(() => ({ data: {}, sha: null }));
+      if (idx[safeSrc]) {
+        try {
+          const { data: destIdx, sha: destIdxSha } = await readIndex(destSess).catch(() => ({ data: {}, sha: null }));
+          destIdx[safeDest] = { ...idx[safeSrc], originalName: rawDest };
+          await writeIndex(destSess, destIdx, destIdxSha);
+        } catch {}
+      }
+      return jRes({ ok: true, src: safeSrc, dest: safeDest });
+    } catch(err) { return errRes(request, err); }
+  }
+
   return jRes({ error: ERRS[404] }, 404);
 }
