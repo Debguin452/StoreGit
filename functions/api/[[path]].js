@@ -606,6 +606,19 @@ function sanitize(name) {
   }
   return safe;
 }
+
+function sanitizePath(p) {
+  if (!p || typeof p !== 'string') return null;
+  // Allow forward slash for folder paths — sanitize each segment individually
+  const parts = p.replace(/\\/g, '/').replace(/\.\./g,'_').replace(/\0/g,'').split('/').filter(Boolean);
+  if (!parts.length) return null;
+  const safeParts = parts.map(seg => {
+    const s = seg.trim().replace(/[^a-zA-Z0-9._\-()\s]/g,'_');
+    return s || null;
+  }).filter(Boolean);
+  if (!safeParts.length) return null;
+  return safeParts.join('/');
+}
 function unwrapName(storedName) {
   if (!storedName.endsWith('.txt')) return storedName;
   const original = storedName.slice(0, -4);
@@ -2204,22 +2217,46 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const srcSess  = getRepoSess(fullSess, Number.isInteger(srcRepoIdx)  ? srcRepoIdx  : 0);
     const destSess = getRepoSess(fullSess, Number.isInteger(destRepoIdx) ? destRepoIdx : 0);
     const safeSrc  = sanitize(String(rawName));
-    const safeDest = sanitize(String(rawDest));
-    if (!safeSrc || !safeDest) return jRes({ error: ERRS[400] }, 400);
+    // destName can be a path like "projects/file.pdf" — use sanitizePath
+    let rawDestNorm = String(rawDest);
+    if (rawDestNorm.endsWith('/')) rawDestNorm += String(rawName); // trailing slash = move into folder
+    const safeDest = sanitizePath(rawDestNorm);
+    if (!safeSrc || !safeDest) return jRes({ error: 'Invalid source or destination name' }, 400);
+    if (safeSrc === safeDest && srcRepoIdx === destRepoIdx) return jRes({ error: 'Source and destination are the same' }, 400);
     try {
-      const srcUrl = `https://raw.githubusercontent.com/${srcSess.ghOwner}/${srcSess.ghRepo}/${srcSess.ghBranch}/${srcSess.folder}/${encodeURIComponent(safeSrc)}`;
-      const content = await fetch(srcUrl, { headers: { Authorization: `token ${srcSess.ghToken}`, 'User-Agent': 'StoreGit/1' } });
-      if (!content.ok) return jRes({ error: 'Source file not found' }, 404);
-      const buf = await content.arrayBuffer();
-      const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+      // Fetch source content
+      const srcUrl = `https://raw.githubusercontent.com/${srcSess.ghOwner}/${srcSess.ghRepo}/${srcSess.ghBranch}/${srcSess.folder}/${safeSrc.split('/').map(encodeURIComponent).join('/')}`;
+      const srcRes = await fetch(srcUrl, { headers: { Authorization: `token ${srcSess.ghToken}`, 'User-Agent': 'StoreGit/1' } });
+      if (!srcRes.ok) return jRes({ error: `Source file not found: ${safeSrc}` }, 404);
+      const buf = await srcRes.arrayBuffer();
+      // Safe base64 for large buffers (avoids stack overflow with spread)
+      const bytes = new Uint8Array(buf);
+      let bin = ''; const cs = 8192;
+      for (let i = 0; i < bytes.length; i += cs) bin += String.fromCharCode(...bytes.subarray(i, i + cs));
+      const b64 = btoa(bin);
+      // Write to destination
       await uploadSmall(destSess, safeDest, b64);
-      const { data: idx } = await readIndex(srcSess).catch(() => ({ data: {}, sha: null }));
+      // Update destination index
+      const { data: idx, sha: idxSha } = await readIndex(srcSess).catch(() => ({ data: {}, sha: null }));
       if (idx[safeSrc]) {
         try {
           const { data: destIdx, sha: destIdxSha } = await readIndex(destSess).catch(() => ({ data: {}, sha: null }));
-          destIdx[safeDest] = { ...idx[safeSrc], originalName: rawDest };
+          destIdx[safeDest] = { ...idx[safeSrc], originalName: rawDestNorm };
           await writeIndex(destSess, destIdx, destIdxSha);
         } catch {}
+      }
+      // Delete source from GitHub
+      const delUrl = `https://api.github.com/repos/${srcSess.ghOwner}/${srcSess.ghRepo}/contents/${srcSess.folder}/${safeSrc.split('/').map(encodeURIComponent).join('/')}`;
+      const shaRes = await fetch(`${delUrl}?ref=${srcSess.ghBranch}`, { headers: ghH(srcSess.ghToken) });
+      if (shaRes.ok) {
+        const { sha: fileSha } = await shaRes.json();
+        await fetch(delUrl, { method:'DELETE', headers: ghH(srcSess.ghToken),
+          body: JSON.stringify({ message: `mv ${safeSrc} → ${safeDest}`, sha: fileSha, branch: srcSess.ghBranch }) });
+        // Remove from source index
+        if (idx[safeSrc]) {
+          delete idx[safeSrc];
+          try { await writeIndex(srcSess, idx, idxSha); } catch {}
+        }
       }
       return jRes({ ok: true, src: safeSrc, dest: safeDest });
     } catch(err) { return errRes(request, err); }
