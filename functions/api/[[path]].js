@@ -697,7 +697,7 @@ async function listFiles(sess) {
   if (!res.ok) throw new Error('list_fail');
   const data = await res.json();
   return Array.isArray(data)
-    ? data.filter(f => f.type === 'file' && f.name !== '.storegit').map(f => ({ name: f.name, size: f.size, sha: f.sha }))
+    ? data.filter(f => f.type === 'file' && f.name !== '.storegit' && !f.name.endsWith('/.storegit') && !f.name.endsWith('/.gitkeep')).map(f => ({ name: f.name, size: f.size, sha: f.sha }))
     : [];
 }
 async function readIndex(sess) {
@@ -2148,7 +2148,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       try {
         res2 = await fetch(
           `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/contents/${encodeURIComponent(folder)}/${encodeURIComponent(safe)}/.gitkeep`,
-          { method: 'PUT', headers: ghH(ghToken), body: JSON.stringify({ message: `mkdir ${safe}`, content: '', branch: ghBranch }) }
+          { method: 'PUT', headers: ghH(ghToken), body: JSON.stringify({ message: `mkdir ${safe}`, content: btoa(''), branch: ghBranch }) }
         );
       } catch { throw new GitHubError(0, 'Network error creating folder', 'mkdir'); }
       if (!res2.ok && res2.status !== 422) {
