@@ -31,6 +31,20 @@ export function showModal(title, msg, confirmLabel, confirmClass, onConfirm) {
   overlay.onclick = e => { if (e.target === overlay) close(); };
 }
 
+export function showModalHtml(title, htmlContent, confirmLabel, confirmClass, onConfirm) {
+  document.getElementById('modal-title').textContent = title;
+  document.getElementById('modal-msg').innerHTML     = htmlContent;
+  const overlay    = document.getElementById('modal-overlay');
+  const confirmBtn = document.getElementById('modal-confirm-btn');
+  confirmBtn.textContent = confirmLabel;
+  confirmBtn.className   = 'btn ' + confirmClass;
+  overlay.classList.add('open');
+  const close = () => { overlay.classList.remove('open'); document.getElementById('modal-msg').innerHTML = ''; };
+  confirmBtn.onclick = () => { close(); onConfirm(); };
+  document.getElementById('modal-cancel-btn').onclick = close;
+  overlay.onclick = e => { if (e.target === overlay) close(); };
+}
+
 export function fmtSize(b) {
   if (!b) return '0 B';
   const u = ['B', 'KB', 'MB', 'GB', 'TB'];

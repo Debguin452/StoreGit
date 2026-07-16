@@ -337,7 +337,7 @@ export function renderFiles() {
 
   const all = state.repoFiles.flatMap(g =>
     (g.files || [])
-      .filter(f => f.name !== '.storegit' && !f.name.startsWith('.sgkeys/') && f.name !== '.gitkeep' && !f.name.endsWith('/.gitkeep'))
+      .filter(f => f.name !== '.storegit' && !f.name.startsWith('.sgkeys/') && !f.name.endsWith('/.storegit') && !f.name.endsWith('/.gitkeep') && f.name !== '.gitkeep')
       .map(f => ({ ...f, _repoIdx: g.repoIdx }))
   );
 
@@ -371,24 +371,28 @@ export function renderFiles() {
   root.forEach(f => el.appendChild(buildFileRow(f)));
 }
 
-export function showCreateFolderModal(repoIdx = 0) {
-  const body = document.createElement('div');
-  body.innerHTML = `<label style="display:block;margin-bottom:8px;font-size:.85rem;color:var(--text-secondary)">Folder name</label><input id="new-folder-name" class="modal-input" placeholder="e.g. photos" autocomplete="off" style="width:100%;box-sizing:border-box">`;
-  showModal('New Folder', body, 'Create', 'btn-primary', async () => {
-    const name = document.getElementById('new-folder-name')?.value?.trim();
-    if (!name) return;
-    const safe = name.replace(/[^a-zA-Z0-9_\-]/g, '-');
-    try {
-      const r = await fetch('/api/mkdir', {
-        method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: safe, repoIdx }),
-      });
-      if (r.ok) { toast(`Folder "${safe}" created.`, 'ok'); loadFiles(true); }
-      else { const d = await r.json().catch(()=>{}); toast(d?.error || 'Failed to create folder.', 'error'); }
-    } catch { toast('Connection error.', 'error'); }
-  });
-  setTimeout(() => document.getElementById('new-folder-name')?.focus(), 50);
+export function showCreateFolderModal(repoIdx = 0, afterCreate = null) {
+  showModalHtml(
+    'New Folder',
+    `<label class="modal-field-label">Folder name</label>
+     <input id="new-folder-name" class="modal-input" placeholder="e.g. photos" autocomplete="off">`,
+    'Create', 'btn-primary',
+    async () => {
+      const name = document.getElementById('new-folder-name')?.value?.trim();
+      if (!name) return;
+      const safe = name.replace(/[^a-zA-Z0-9_/\-]/g, '-').replace(/\/+/g, '/').replace(/^\/|\/$/g, '');
+      try {
+        const r = await fetch('/api/mkdir', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: safe, repoIdx }),
+        });
+        if (r.ok) { toast(`Folder "${safe}" created.`, 'ok'); loadFiles(true); if (afterCreate) afterCreate(safe); }
+        else { const d = await r.json().catch(()=>{}); toast(d?.error || 'Failed to create folder.', 'error'); }
+      } catch { toast('Connection error.', 'error'); }
+    }
+  );
+  setTimeout(() => document.getElementById('new-folder-name')?.focus(), 80);
 }
 
 export function deleteFolderUI(name) {
@@ -411,20 +415,55 @@ export function deleteFolderUI(name) {
 }
 
 export function moveFileToFolderUI(f) {
-  const body = document.createElement('div');
-  body.innerHTML = `<label style="display:block;margin-bottom:8px;font-size:.85rem;color:var(--text-secondary)">Destination folder (leave blank for root)</label><input id="move-folder-dest" class="modal-input" placeholder="e.g. photos" autocomplete="off" style="width:100%;box-sizing:border-box">`;
-  showModal('Move File', body, 'Move', 'btn-primary', async () => {
-    const dest = document.getElementById('move-folder-dest')?.value?.trim();
-    const destName = dest ? `${dest}/${f.originalName || f.name}` : (f.originalName || f.name);
-    try {
-      const r = await fetch('/api/move', {
-        method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: f.name, destName, srcRepoIdx: f._repoIdx ?? 0, destRepoIdx: f._repoIdx ?? 0 }),
+  const all = state.repoFiles.flatMap(g => (g.files || []).map(x => x.name));
+  const folderSet = new Set();
+  folderSet.add('');
+  for (const n of all) {
+    const parts = n.split('/');
+    if (parts.length > 1) folderSet.add(parts[0]);
+  }
+  const folders = [...folderSet].filter(x => x !== (f.originalName || f.name).split('/')[0] || (f.originalName || f.name).split('/').length === 1);
+  const chips = folders.map(dir => {
+    const label = dir === '' ? '/ (root)' : dir;
+    return `<button type="button" class="folder-chip" data-dir="${dir}">${label}</button>`;
+  }).join('');
+  showModalHtml(
+    'Move File',
+    `<p class="modal-field-label">Choose destination folder</p>
+     <div class="folder-chips" id="move-chips">${chips}</div>
+     <div style="display:flex;gap:8px;align-items:center;margin-top:10px">
+       <input id="move-folder-dest" class="modal-input" placeholder="Or type a folder name…" autocomplete="off" style="flex:1">
+       <button type="button" class="btn btn-ghost btn-sm" id="move-mkdir-btn">+ New</button>
+     </div>`,
+    'Move', 'btn-primary',
+    async () => {
+      const dest = document.getElementById('move-folder-dest')?.value?.trim();
+      const displayName = f.originalName || f.name;
+      const basename    = displayName.includes('/') ? displayName.split('/').pop() : displayName;
+      const destName    = dest ? `${dest}/${basename}` : basename;
+      try {
+        const r = await fetch('/api/move', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: f.name, destName, srcRepoIdx: f._repoIdx ?? 0, destRepoIdx: f._repoIdx ?? 0 }),
+        });
+        if (r.ok) { toast('File moved.', 'ok'); loadFiles(true); }
+        else { const d = await r.json().catch(()=>{}); toast(d?.error || 'Move failed.', 'error'); }
+      } catch { toast('Connection error.', 'error'); }
+    }
+  );
+  setTimeout(() => {
+    document.querySelectorAll('.folder-chip').forEach(btn => {
+      btn.onclick = () => {
+        document.querySelectorAll('.folder-chip').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById('move-folder-dest').value = btn.dataset.dir;
+      };
+    });
+    document.getElementById('move-mkdir-btn')?.addEventListener('click', () => {
+      showCreateFolderModal(f._repoIdx ?? 0, (name) => {
+        document.getElementById('move-folder-dest').value = name;
       });
-      if (r.ok) { toast('File moved.', 'ok'); loadFiles(true); }
-      else { const d = await r.json().catch(()=>{}); toast(d?.error || 'Move failed.', 'error'); }
-    } catch { toast('Connection error.', 'error'); }
-  });
-  setTimeout(() => document.getElementById('move-folder-dest')?.focus(), 50);
+    });
+  }, 80);
 }
