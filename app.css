@@ -429,9 +429,18 @@ body.files-body .app-footer { margin-top: auto; }
 /* ── Reset password screen ── */
 #reset-screen .auth-card { max-width: 380px; }
 
-/* ── fd-actions three-button layout ── */
-.fd-actions { display: flex; gap: .5rem; }
-.fd-actions .btn { flex:1 1 25%; margin:0; padding:.72rem .5rem; font-size:.82rem; display:flex; justify-content:center; align-items:center; }
+/* ── fd-actions symmetric grid ── */
+.fd-actions { display:grid; grid-template-columns:1fr 1fr; gap:.5rem; padding:.9rem 1rem 1.2rem; }
+.fd-actions .btn { margin:0; padding:.72rem .4rem; font-size:.82rem; display:flex; justify-content:center; align-items:center; gap:.35rem; white-space:nowrap; }
+.fd-actions .btn svg { flex-shrink:0; }
+@media (min-width:480px) { .fd-actions { grid-template-columns:repeat(5,1fr); } }
+
+/* ── folder chips in move modal ── */
+.folder-chips { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }
+.folder-chip { background:var(--surface-2,#1e2130); border:1px solid var(--border,rgba(255,255,255,.12)); border-radius:20px; color:var(--text-primary,#e8eaf0); cursor:pointer; font-size:.8rem; padding:4px 12px; transition:background .15s,border-color .15s; }
+.folder-chip:hover { background:var(--surface-3,#252840); }
+.folder-chip.active { background:var(--accent,#7c6aff); border-color:var(--accent,#7c6aff); color:#fff; }
+.modal-field-label { color:var(--text-secondary,#888); font-size:.82rem; margin:0 0 6px; display:block; }
 .repo-item { display: flex; align-items: center; justify-content: space-between; gap: .5rem; padding: .7rem 0; border-bottom: 1px solid #f0f4ff; }
 .repo-item:last-child { border-bottom: none; }
 .repo-item-info { flex: 1; min-width: 0; }
