@@ -429,11 +429,11 @@ body.files-body .app-footer { margin-top: auto; }
 /* ── Reset password screen ── */
 #reset-screen .auth-card { max-width: 380px; }
 
-/* ── fd-actions 2x2 + full-width delete ── */
+/* ── fd-actions: 2x2 grid, Delete only spans when 5 buttons (fd-5btn class) ── */
 .fd-actions { display:grid; grid-template-columns:1fr 1fr; gap:.5rem; padding:.9rem 1rem 1.2rem; }
 .fd-actions .btn { margin:0; padding:.72rem .4rem; font-size:.82rem; display:flex; justify-content:center; align-items:center; gap:.35rem; white-space:nowrap; }
 .fd-actions .btn svg { flex-shrink:0; }
-.fd-actions #fd-del-btn { grid-column:1 / -1; }
+.fd-actions.fd-5btn #fd-del-btn { grid-column:1 / -1; }
 
 /* ── folder chips in move modal ── */
 .folder-chips { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }
