@@ -343,7 +343,7 @@ function jsonRes(req, data, status = 200, extra = {}) {
   });
 }
 const ERRS = {
-  400:'Bad request', 401:'Invalid credentials', 403:'Forbidden',
+  400:'Bad request', 401:'Session expired — please log in again', 403:'Forbidden',
   404:'Not found',   409:'Username already taken',
   413:'Payload too large', 415:'File type not permitted',
   429:'Too many attempts — please wait and try again',
@@ -702,17 +702,33 @@ const ghH = token => ({
 });
 async function listFiles(sess) {
   const { ghToken, ghOwner, ghRepo, ghBranch, folder } = sess;
-  const res = await fetch(
-    `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/contents/${encodeURIComponent(folder)}?ref=${encodeURIComponent(ghBranch)}`,
-    { headers: ghH(ghToken) }
-  );
+  let res;
+  try {
+    res = await fetch(
+      `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/git/trees/${encodeURIComponent(ghBranch)}?recursive=1`,
+      { headers: ghH(ghToken) }
+    );
+  } catch {
+    throw new GitHubError(0, 'Network error fetching file list from GitHub.', 'listFiles');
+  }
   if (res.status === 404) return [];
-  if (!res.ok) throw new Error('list_fail');
+  if (!res.ok) {
+    const msg = await ghErrMsg(res, 'Failed to list files from GitHub');
+    throw new GitHubError(res.status, msg, 'listFiles');
+  }
   const data = await res.json();
-  return Array.isArray(data)
-    ? data.filter(f => f.type === 'file' && f.name !== '.storegit' && !f.name.endsWith('/.storegit') && !f.name.endsWith('/.gitkeep')).map(f => ({ name: f.name, size: f.size, sha: f.sha }))
-    : [];
+  const prefix = folder + '/';
+  return (data.tree || [])
+    .filter(f =>
+      f.type === 'blob' &&
+      f.path.startsWith(prefix) &&
+      !f.path.endsWith('/.storegit') &&
+      !f.path.endsWith('/.gitkeep') &&
+      f.path !== prefix + '.storegit'
+    )
+    .map(f => ({ name: f.path.slice(prefix.length), size: f.size ?? null, sha: f.sha }));
 }
+
 async function readIndex(sess) {
   const { ghToken, ghOwner, ghRepo, ghBranch, folder } = sess;
   const url = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/contents/${encodeURIComponent(indexP(folder))}?ref=${encodeURIComponent(ghBranch)}`;
@@ -1289,7 +1305,7 @@ async function _handleRequest({ request, env, params }) {
     if (!rec) {
       await pbkdf2Hash(password, crypto.getRandomValues(new Uint8Array(16)));
       await new Promise(r=>setTimeout(r,100+Math.random()*200));
-      return fail(request, 401);
+      return jsonRes(request, { error: 'Invalid credentials' }, 401);
     }
     const { content: user } = rec;
     const salt   = b64urlDec(user.pwSalt);
@@ -1301,7 +1317,7 @@ async function _handleRequest({ request, env, params }) {
       let diffLegacy = 0; for (let i = 0; i < 32; i++) diffLegacy |= derivedLegacy[i] ^ (stored[i] ?? 0);
       if (diffLegacy !== 0) {
         await new Promise(r => setTimeout(r, 300 + Math.random() * 200));
-        return fail(request, 401);
+        return jsonRes(request, { error: 'Invalid credentials' }, 401);
       }
     }
     await clearRate(`login:${ip}`, env);
