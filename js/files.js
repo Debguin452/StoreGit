@@ -1,5 +1,5 @@
 import { state }                       from './state.js';
-import { elem, toast, showModal, fmtSize, fmtDate, fileExt, fileExtRaw, fileColor,
+import { elem, toast, showModal, showModalHtml, fmtSize, fmtDate, fileExt, fileExtRaw, fileColor,
          FD_EDITABLE, FD_IMG, FD_AUDIO, FD_VIDEO, FD_TEXT } from './util.js';
 
 export function buildFileRow(f) {
@@ -73,9 +73,12 @@ export function openFileDetail(f) {
   const moveBtn = document.getElementById('fd-move-btn');
   if (moveBtn) moveBtn.onclick = () => { closeFileDetail(); setTimeout(() => moveFileToFolderUI(f), 250); };
   const editBtn = document.getElementById('fd-edit-btn');
+  const fdActions = document.getElementById('fd-actions') || editBtn?.closest('.fd-actions');
   if (editBtn) {
     const canEdit = FD_EDITABLE.has(ext) && !f.chunked && (f.size || 0) <= 1_000_000;
     editBtn.style.display = canEdit ? '' : 'none';
+    // 5 buttons: Delete spans full width. 4 buttons: 2x2 grid, no spanning.
+    if (fdActions) fdActions.classList.toggle('fd-5btn', canEdit);
   }
   document.getElementById('fd-preview').innerHTML =
     '<div class="fd-preview-loading"><span class="spinner"></span> Loading preview…</div>';
