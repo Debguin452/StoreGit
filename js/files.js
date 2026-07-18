@@ -340,7 +340,16 @@ export function renderFiles() {
 
   const all = state.repoFiles.flatMap(g =>
     (g.files || [])
-      .filter(f => f.name !== '.storegit' && !f.name.startsWith('.sgkeys/') && !f.name.endsWith('/.storegit') && !f.name.endsWith('/.gitkeep') && f.name !== '.gitkeep')
+      .filter(f => {
+      const n = f.name;
+      if (!n) return false;
+      if (f.isFolder) return true;                         // explicit folder entry
+      if (n === '.storegit' || n === '.gitkeep') return false;
+      if (n.endsWith('/.storegit') || n.endsWith('/.gitkeep')) return false;
+      const segs = n.split('/');
+      if (segs.some(s => s === '.chunks' || s === '.manifests' || s === '.sgkeys')) return false;
+      return true;
+    })
       .map(f => ({ ...f, _repoIdx: g.repoIdx }))
   );
 
@@ -365,7 +374,14 @@ export function renderFiles() {
   }
 
   const { folders, root } = getFolderGroups(all);
-  all.sort((a,b) => { const at=a.uploadedAt||a.name,bt=b.uploadedAt||b.name; return at<bt?1:at>bt?-1:0; });
+
+  // Also include explicit folder entries (from .storegit markers via server)
+  for (const f of all) {
+    if (f.isFolder) {
+      const name = (f.name || '').replace(/\/+$/, '');
+      if (name && !folders.has(name)) folders.set(name, []);
+    }
+  }
 
   for (const [name, files] of [...folders.entries()].sort()) {
     el.appendChild(buildFolderRow(name, files.length));
