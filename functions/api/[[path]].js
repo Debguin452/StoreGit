@@ -702,6 +702,7 @@ const ghH = token => ({
 });
 async function listFiles(sess) {
   const { ghToken, ghOwner, ghRepo, ghBranch, folder } = sess;
+  const SYSTEM_DIRS = new Set(['.chunks', '.manifests', '.sgkeys']);
   let res;
   try {
     res = await fetch(
@@ -716,17 +717,50 @@ async function listFiles(sess) {
     const msg = await ghErrMsg(res, 'Failed to list files from GitHub');
     throw new GitHubError(res.status, msg, 'listFiles');
   }
-  const data = await res.json();
+  const data   = await res.json();
   const prefix = folder + '/';
-  return (data.tree || [])
-    .filter(f =>
-      f.type === 'blob' &&
-      f.path.startsWith(prefix) &&
-      !f.path.endsWith('/.storegit') &&
-      !f.path.endsWith('/.gitkeep') &&
-      f.path !== prefix + '.storegit'
-    )
-    .map(f => ({ name: f.path.slice(prefix.length), size: f.size ?? null, sha: f.sha }));
+  const tree   = data.tree || [];
+
+  // Collect user-created folder names from .storegit markers
+  const userFolders = new Set();
+  for (const item of tree) {
+    if (item.type !== 'blob' || !item.path.startsWith(prefix)) continue;
+    const rel = item.path.slice(prefix.length);
+    if (rel.endsWith('/.storegit')) {
+      const folderName = rel.slice(0, -'/.storegit'.length);
+      // Only top-level user folders (no dots, no slashes in name)
+      if (!folderName.includes('/') && !folderName.startsWith('.')) {
+        userFolders.add(folderName);
+      }
+    }
+  }
+
+  // Build file entries, filtering out all system paths
+  const files = tree
+    .filter(item => {
+      if (item.type !== 'blob' || !item.path.startsWith(prefix)) return false;
+      const rel      = item.path.slice(prefix.length);
+      const segments = rel.split('/');
+      // Drop any path whose first segment is a system dir or starts with a dot
+      if (SYSTEM_DIRS.has(segments[0]) || segments[0].startsWith('.')) return false;
+      // Drop .storegit / .gitkeep markers (converted to folder entries above)
+      if (segments[segments.length - 1] === '.storegit') return false;
+      if (segments[segments.length - 1] === '.gitkeep')  return false;
+      return true;
+    })
+    .map(item => ({ name: item.path.slice(prefix.length), size: item.size ?? null, sha: item.sha }));
+
+  // Prepend folder entries so they appear first in the listing
+  const folderEntries = [...userFolders].sort().map(name => ({
+    name:         name + '/',
+    originalName: name + '/',
+    isFolder:     true,
+    size:         null,
+    sha:          null,
+    uploadedAt:   null,
+  }));
+
+  return [...folderEntries, ...files];
 }
 
 async function readIndex(sess) {
@@ -2167,17 +2201,19 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
     const { path: folderPath, repoIdx: ri } = body || {};
     if (!folderPath || typeof folderPath !== 'string') return jRes({ error: ERRS[400] }, 400);
-    const safe = folderPath.replace(/[^a-zA-Z0-9_\-./]/g, '_').replace(/\.{2,}/g, '_').replace(/^\/+|\/+$/g, '');
+    const safe = folderPath.replace(/\.{2,}/g,'_').replace(/\0/g,'').replace(/^\/+|\/+$/g,'').replace(/[^a-zA-Z0-9_\-./]/g,'_');
     if (!safe) return jRes({ error: 'Invalid folder name' }, 400);
     const dlSess = getRepoSess(fullSess, Number.isInteger(ri) ? ri : 0);
     const { ghToken, ghOwner, ghRepo, ghBranch, folder } = dlSess;
-    const keepPath = `${folder}/${safe}/.gitkeep`;
     try {
+      // Use .storegit marker (not .gitkeep) — path segments joined with /
+      const markerPath = `${folder}/${safe}/.storegit`;
       let res2;
       try {
         res2 = await fetch(
-          `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/contents/${encodeURIComponent(folder)}/${encodeURIComponent(safe)}/.gitkeep`,
-          { method: 'PUT', headers: ghH(ghToken), body: JSON.stringify({ message: `mkdir ${safe}`, content: btoa(''), branch: ghBranch }) }
+          `https://api.github.com/repos/${ghOwner}/${ghRepo}/contents/${markerPath}`,
+          { method: 'PUT', headers: ghH(ghToken),
+            body: JSON.stringify({ message: `mkdir ${safe}`, content: btoa('storegit-folder'), branch: ghBranch }) }
         );
       } catch { throw new GitHubError(0, 'Network error creating folder', 'mkdir'); }
       if (!res2.ok && res2.status !== 422) {
@@ -2186,8 +2222,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       }
       return jRes({ ok: true, path: safe });
     } catch(err) { return errRes(request, err); }
-  }
-
+  
   if (route === 'rmdir' && method === 'DELETE') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
