@@ -276,13 +276,21 @@ export let currentFolder = '';
 
 export function setCurrentFolder(f) { currentFolder = f; renderFiles(); }
 
+const WEB_HIDDEN = new Set(['.chunks', '.manifests', '.sgkeys']);
 export function getFolderGroups(files) {
   const folders = new Map();
   const root    = [];
   for (const f of files) {
+    if (f.isFolder) {
+      const name = (f.name || '').replace(/\/+$/, '');
+      if (name && !name.startsWith('.') && !WEB_HIDDEN.has(name) && !folders.has(name))
+        folders.set(name, []);
+      continue;
+    }
     const parts = (f.originalName || f.name).split('/');
     if (parts.length > 1) {
       const dir = parts[0];
+      if (dir.startsWith('.') || WEB_HIDDEN.has(dir)) continue;
       if (!folders.has(dir)) folders.set(dir, []);
       folders.get(dir).push({ ...f, _displayName: parts.slice(1).join('/') });
     } else {
@@ -338,18 +346,20 @@ export function renderFiles() {
 
   renderBreadcrumb();
 
+  const WEB_SYS = new Set(['.chunks', '.manifests', '.sgkeys', '.storegit', '.gitkeep']);
   const all = state.repoFiles.flatMap(g =>
     (g.files || [])
       .filter(f => {
-      const n = f.name;
-      if (!n) return false;
-      if (f.isFolder) return true;                         // explicit folder entry
-      if (n === '.storegit' || n === '.gitkeep') return false;
-      if (n.endsWith('/.storegit') || n.endsWith('/.gitkeep')) return false;
-      const segs = n.split('/');
-      if (segs.some(s => s === '.chunks' || s === '.manifests' || s === '.sgkeys')) return false;
-      return true;
-    })
+        const n = (f.name || '');
+        if (!n) return false;
+        if (f.isFolder) {
+          const clean = n.replace(/\/+$/, '');
+          return clean.length > 0 && !clean.startsWith('.') && !WEB_SYS.has(clean);
+        }
+        if (n === '.storegit' || n === '.gitkeep') return false;
+        const segs = n.split('/');
+        return !segs.some(s => s.startsWith('.') || WEB_SYS.has(s));
+      })
       .map(f => ({ ...f, _repoIdx: g.repoIdx }))
   );
 
