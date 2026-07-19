@@ -2248,7 +2248,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       throw new GitHubError(mkRes.status, msg, 'mkdir');
     }
     return jRes({ ok: true, path: safe });
-  
+  }
   if (route === 'rmdir' && method === 'DELETE') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
