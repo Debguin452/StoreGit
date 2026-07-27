@@ -1333,6 +1333,9 @@ async function _handleRequest({ request, env, params }) {
   if (route === 'logout' && method === 'POST') {
     const rawToken = readSessionCookie(request);
     const sess = await verifyToken(rawToken, secret);
+    if (!sess) {
+        return jsonRes(request, { error: "Not logged in" },401);
+    }
     if (sess) {
       const kv = env.RATE_LIMIT_KV || null;
       if (kv) {
