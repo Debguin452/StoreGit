@@ -157,32 +157,81 @@ function generateRawApiKey() {
   return `sgk_${base64urlFromBytes(crypto.getRandomValues(new Uint8Array(32)))}`;
 }
 
-// ── API key storage helpers ───────────────────────────────────────────────────
+// ── API key storage ────────────────────────────────────────────────────────
 //
-// SOURCE OF TRUTH (new): user's own GitHub repo, at:
+// SOURCE OF TRUTH (only): the user's own GitHub repo, at:
 //   {folder}/.sgkeys/{sha256[0:2]}/{sha256hex}.json
-//   (.sgkeys/ is separate from the .storegit marker file created at signup)
-//
-// CACHE / LEGACY (KV): "apikey:sha256:<sha256hex>"
-//   Still written on every new key and read first on every lookup —
-//   so existing keys keep working unchanged until migration is run.
-//
-// MIGRATION: POST /api/apikeys/migrate copies each KV entry to git.
-//   Idempotent — safe to run multiple times.
+// No KV cache, no separate registry copy — one place, always current.
 
 // Derive SHA-256 hex from raw key
 async function apiKeyHash(rawKey) {
   const digest = await crypto.subtle.digest('SHA-256', ENC.encode(rawKey));
   return hexEnc(new Uint8Array(digest));
 }
-// KV key for a hashed API key (legacy primary + new cache)
-function apiKeyKvKey(sha256hex) { return `apikey:sha256:${sha256hex}`; }
 // Path inside user's repo for a key record.
 // Uses .sgkeys/ — separate from the .storegit marker file created at signup,
 // which is a regular FILE (not a directory). Nesting under it would cause a
-// GitHub 422 conflict, which is why key creation was failing for existing users.
+// GitHub 422 conflict.
 function apiKeyGitPath(sha256hex, folder) {
   return `${folder || 'uploads'}/.sgkeys/${sha256hex.slice(0, 2)}/${sha256hex}.json`;
+}
+
+// Registry lookup index — lives in the shared REGISTRY repo (same repo as
+// users/*.json), keyed only by key hash. This is what makes it possible to
+// resolve an API key to its owning user without knowing the username first.
+// It stores just enough to route the request: username + origin/label for
+// display. The user's own repo (.sgkeys/) holds the authoritative copy.
+function apiKeyRegistryPath(sha256hex) {
+  return `keys/${sha256hex.slice(0, 2)}/${sha256hex}.json`;
+}
+async function readApiKeyFromRegistry(sha256hex, env) {
+  const token = env.REGISTRY_GITHUB_TOKEN || '';
+  const owner = env.REGISTRY_GITHUB_OWNER || '';
+  const repo  = env.REGISTRY_GITHUB_REPO  || '';
+  if (!token || !owner || !repo) return null;
+  const res = await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${apiKeyRegistryPath(sha256hex)}?ref=${REGISTRY_BRANCH}`,
+    { headers: ghH(token) }
+  ).catch(() => null);
+  if (!res || res.status === 404 || !res.ok) return null;
+  try {
+    const d = await res.json();
+    return JSON.parse(DEC.decode(b64urlDec(d.content.replace(/\s/g, ''))));
+  } catch { return null; }
+}
+async function writeApiKeyToRegistry(sha256hex, record, env) {
+  const token = env.REGISTRY_GITHUB_TOKEN || '';
+  const owner = env.REGISTRY_GITHUB_OWNER || '';
+  const repo  = env.REGISTRY_GITHUB_REPO  || '';
+  if (!token || !owner || !repo) throw new Error('registry_not_configured');
+  const path   = apiKeyRegistryPath(sha256hex);
+  const chkRes = await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path}?ref=${REGISTRY_BRANCH}`,
+    { headers: ghH(token) }
+  ).catch(() => null);
+  const existingSha = (chkRes && chkRes.ok) ? (await chkRes.json()).sha : null;
+  const res = await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path}`,
+    { method: 'PUT', headers: ghH(token), body: JSON.stringify({ message: `StoreGit: API key index ${record.keyId}`, content: utf8b64(JSON.stringify({ username: record.username, keyId: record.keyId, allowedOrigins: record.allowedOrigins || [], label: record.label || '' })), branch: REGISTRY_BRANCH, ...(existingSha ? { sha: existingSha } : {}) }) }
+  );
+  if (!res.ok) throw new Error('registry_write_fail');
+}
+async function deleteApiKeyFromRegistry(sha256hex, env) {
+  const token = env.REGISTRY_GITHUB_TOKEN || '';
+  const owner = env.REGISTRY_GITHUB_OWNER || '';
+  const repo  = env.REGISTRY_GITHUB_REPO  || '';
+  if (!token || !owner || !repo) return;
+  const path   = apiKeyRegistryPath(sha256hex);
+  const chkRes = await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path}?ref=${REGISTRY_BRANCH}`,
+    { headers: ghH(token) }
+  ).catch(() => null);
+  if (!chkRes || !chkRes.ok) return;
+  const fileSha = (await chkRes.json()).sha;
+  await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path}`,
+    { method: 'DELETE', headers: ghH(token), body: JSON.stringify({ message: `StoreGit: revoke API key`, sha: fileSha, branch: REGISTRY_BRANCH }) }
+  ).catch(() => {});
 }
 
 // Read key record from user's git repo — returns null if missing/error
@@ -238,57 +287,6 @@ async function deleteApiKeyFromGit(sha256hex, ghToken, ghOwner, ghRepo, ghBranch
   ).catch(() => {});
 }
 
-function apiKeyRegistryPath(sha256hex) {
-  return `keys/${sha256hex.slice(0, 2)}/${sha256hex}.json`;
-}
-async function readApiKeyFromRegistry(sha256hex, env) {
-  const token = env.REGISTRY_GITHUB_TOKEN || '';
-  const owner = env.REGISTRY_GITHUB_OWNER || '';
-  const repo  = env.REGISTRY_GITHUB_REPO  || '';
-  if (!token || !owner || !repo) return null;
-  const res = await fetch(
-    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${apiKeyRegistryPath(sha256hex)}?ref=${REGISTRY_BRANCH}`,
-    { headers: ghH(token) }
-  ).catch(() => null);
-  if (!res || res.status === 404 || !res.ok) return null;
-  try {
-    const d = await res.json();
-    return JSON.parse(DEC.decode(b64urlDec(d.content.replace(/\s/g, ''))));
-  } catch { return null; }
-}
-async function writeApiKeyToRegistry(sha256hex, record, env) {
-  const token = env.REGISTRY_GITHUB_TOKEN || '';
-  const owner = env.REGISTRY_GITHUB_OWNER || '';
-  const repo  = env.REGISTRY_GITHUB_REPO  || '';
-  if (!token || !owner || !repo) return;
-  const path   = apiKeyRegistryPath(sha256hex);
-  const chkRes = await fetch(
-    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path}?ref=${REGISTRY_BRANCH}`,
-    { headers: ghH(token) }
-  ).catch(() => null);
-  const existingSha = (chkRes && chkRes.ok) ? (await chkRes.json()).sha : null;
-  await fetch(
-    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path}`,
-    { method: 'PUT', headers: ghH(token), body: JSON.stringify({ message: `StoreGit: API key index ${record.keyId}`, content: utf8b64(JSON.stringify({ username: record.username, keyId: record.keyId, allowedOrigins: record.allowedOrigins || [], label: record.label || '' })), branch: REGISTRY_BRANCH, ...(existingSha ? { sha: existingSha } : {}) }) }
-  ).catch(() => {});
-}
-async function deleteApiKeyFromRegistry(sha256hex, env) {
-  const token = env.REGISTRY_GITHUB_TOKEN || '';
-  const owner = env.REGISTRY_GITHUB_OWNER || '';
-  const repo  = env.REGISTRY_GITHUB_REPO  || '';
-  if (!token || !owner || !repo) return;
-  const path   = apiKeyRegistryPath(sha256hex);
-  const chkRes = await fetch(
-    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path}?ref=${REGISTRY_BRANCH}`,
-    { headers: ghH(token) }
-  ).catch(() => null);
-  if (!chkRes || !chkRes.ok) return;
-  const fileSha = (await chkRes.json()).sha;
-  await fetch(
-    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path}`,
-    { method: 'DELETE', headers: ghH(token), body: JSON.stringify({ message: `StoreGit: revoke API key`, sha: fileSha, branch: REGISTRY_BRANCH }) }
-  ).catch(() => {});
-}
 async function isRevoked(jti, kv) {
   const now = Date.now();
   const c = _revokedMem.get(jti);
@@ -298,18 +296,18 @@ async function isRevoked(jti, kv) {
   if (_revokedMem.size > 10000) for (const [k, v] of _revokedMem) if (now > v.until) _revokedMem.delete(k);
   return revoked;
 }
+// Resolves an X-API-Key header to its owning session.
+// Lookup path: hash the raw key → read the record from the shared registry
+// repo at keys/{sha256[0:2]}/{sha256hex}.json (this is the only way to find
+// the owning user from the key alone, since usernames aren't derivable from
+// a random key). The registry entry then points to the user, whose own repo
+// holds the full key record (label, origins) as the editable copy.
 async function resolveApiKey(request, env, secret) {
   const apiKey = request.headers.get('X-API-Key') || '';
   if (!APIKEY_RE.test(apiKey)) return null;
   const sha256hex = await apiKeyHash(apiKey);
-  const kv        = env.RATE_LIMIT_KV || null;
-  let keyData     = kv ? await kv.get(apiKeyKvKey(sha256hex), 'json').catch(() => null) : null;
-  if (!keyData || !keyData.username) {
-    const regEntry = await readApiKeyFromRegistry(sha256hex, env);
-    if (!regEntry || !regEntry.username) return null;
-    keyData = regEntry;
-    if (kv) kv.put(apiKeyKvKey(sha256hex), JSON.stringify(keyData)).catch(() => {});
-  }
+  const keyData = await readApiKeyFromRegistry(sha256hex, env);
+  if (!keyData || !keyData.username) return null;
   const origin  = request.headers.get('Origin') || '';
   const origins = Array.isArray(keyData.allowedOrigins) ? keyData.allowedOrigins : [];
   if (origins.length > 0 && origin && !origins.includes(origin)) {
@@ -336,6 +334,7 @@ async function resolveApiKey(request, env, secret) {
   };
   return { fullSess, allowedOrigins: origins, keyData };
 }
+
 function jsonRes(req, data, status = 200, extra = {}) {
   return new Response(JSON.stringify(data), {
     status,
@@ -350,6 +349,17 @@ const ERRS = {
   500:'Server error', 502:'Upstream error',
 };
 const fail = (req, code) => jsonRes(req, { error: ERRS[code] || 'Error' }, code);
+
+// Maps a caught error to a JSON error response. Recognises a `.status` on the
+// error (as set by GitHub API failures) and falls back to 502 for anything
+// else, since most errRes() call sites wrap outbound GitHub API operations.
+function errRes(req, err, fallbackStatus = 502) {
+  const status = (err && Number.isInteger(err.status) && err.status >= 400 && err.status < 600)
+    ? err.status
+    : fallbackStatus;
+  const message = (err instanceof Error) ? err.message : String(err || 'Unknown error');
+  return jsonRes(req, { error: message || ERRS[status] || 'Error' }, status);
+}
 const ENC = new TextEncoder();
 const DEC = new TextDecoder();
 function b64Enc(u8) {
@@ -644,12 +654,15 @@ function checkMagic(bytes) {
 }
 function checkMagicBase64(b64) {
   try {
-    const prefix = b64.slice(0, 24).replace(/-/g, '+').replace(/_/g, '/');
-    const bin = atob(prefix);
-    const head = new Uint8Array(bin.length);
+    if (!b64 || b64.length < 4) return true;
+    const raw    = b64.replace(/-/g, '+').replace(/_/g, '/');
+    const chunk  = raw.slice(0, 32);
+    const padded = chunk + '='.repeat((4 - chunk.length % 4) % 4);
+    const bin    = atob(padded);
+    const head   = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) head[i] = bin.charCodeAt(i);
     return checkMagic(head);
-  } catch { return false; }
+  } catch { return true; }  // allow if we can't determine type
 }
 const regH = env => ({
   Authorization: `token ${env.REGISTRY_GITHUB_TOKEN}`,
@@ -702,75 +715,22 @@ const ghH = token => ({
 });
 async function listFiles(sess) {
   const { ghToken, ghOwner, ghRepo, ghBranch, folder } = sess;
-
-  // System dirs generated by chunked uploads — never shown to users
-  const HIDDEN_DIRS = new Set(['.chunks', '.manifests', '.sgkeys']);
-
-  // Markers that indicate a user-created empty folder
-  const FOLDER_MARKERS = ['.storegit', '.gitkeep'];
-
   let res;
   try {
     res = await fetch(
-      `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/git/trees/${encodeURIComponent(ghBranch)}?recursive=1`,
+      'https://api.github.com/repos/' + encodeURIComponent(ghOwner) + '/' + encodeURIComponent(ghRepo) + '/contents/' + encodeURIComponent(folder) + '?ref=' + encodeURIComponent(ghBranch),
       { headers: ghH(ghToken) }
     );
-  } catch {
-    throw new GitHubError(0, 'Network error fetching file list from GitHub.', 'listFiles');
-  }
+  } catch { throw new GitHubError(0, 'Network error fetching file list from GitHub.', 'listFiles'); }
   if (res.status === 404) return [];
   if (!res.ok) {
     const msg = await ghErrMsg(res, 'Failed to list files from GitHub');
     throw new GitHubError(res.status, msg, 'listFiles');
   }
-
-  const data   = await res.json();
-  const prefix = folder + '/';
-  const tree   = data.tree || [];
-
-  // Step 1: find user-created folder names from marker files
-  const userFolders = new Set();
-  for (const item of tree) {
-    if (item.type !== 'blob') continue;
-    if (!item.path.startsWith(prefix)) continue;
-    const rel   = item.path.slice(prefix.length);   // e.g. "projects/.storegit"
-    const segs  = rel.split('/');
-    // Marker file is exactly 2 segments: "folderName/.storegit"
-    if (segs.length === 2 && FOLDER_MARKERS.includes(segs[1])) {
-      const folderName = segs[0];
-      if (folderName.length > 0 && !folderName.startsWith('.') && !HIDDEN_DIRS.has(folderName)) {
-        userFolders.add(folderName);
-      }
-    }
-  }
-
-  // Step 2: build regular file list — skip hidden system paths and markers
-  const files = [];
-  for (const item of tree) {
-    if (item.type !== 'blob') continue;
-    if (!item.path.startsWith(prefix)) continue;
-    const rel  = item.path.slice(prefix.length);   // e.g. "tetris.c" or ".chunks/x/0"
-    const segs = rel.split('/');
-
-    // Skip if any segment is a hidden system dir
-    if (segs.some(s => HIDDEN_DIRS.has(s))) continue;
-    // Skip if any segment starts with a dot (markers, index files etc)
-    if (segs.some(s => s.startsWith('.'))) continue;
-
-    files.push({ name: rel, size: item.size ?? null, sha: item.sha });
-  }
-
-  // Step 3: prepend folder entries so they appear first
-  const folderEntries = [...userFolders].sort().map(name => ({
-    name:         name + '/',
-    originalName: name + '/',
-    isFolder:     true,
-    size:         null,
-    sha:          null,
-    uploadedAt:   null,
-  }));
-
-  return [...folderEntries, ...files];
+  const data = await res.json();
+  return Array.isArray(data)
+    ? data.filter(f => f.type === 'file' && !f.name.startsWith('.')).map(f => ({ name: f.name, size: f.size, sha: f.sha }))
+    : [];
 }
 
 async function readIndex(sess) {
@@ -1240,7 +1200,6 @@ async function _handleRequest({ request, env, params }) {
           { method: 'GET',    path: '/api/apikeys/list',     auth: ['session'] },
           { method: 'POST',   path: '/api/apikeys/create',   auth: ['session'] },
           { method: 'DELETE', path: '/api/apikeys/revoke',   auth: ['session'] },
-          { method: 'POST',   path: '/api/apikeys/migrate',  auth: ['session'], note: 'One-time migration: copies KV-stored keys into your git repo (idempotent)' },
         ],
       },
     });
@@ -1650,84 +1609,6 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     return jRes({ ok: true, repos: repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo })) });
   }
 
-  // ── POST /api/apikeys/migrate ────────────────────────────────────────────────
-  // One-time migration: copies each API key from KV into the user's git repo.
-  // Idempotent — skips keys already present in git. Safe to run multiple times.
-  // After migration: new keys go to git+KV, revokes hit git+KV, KV stays as cache.
-  // Returns: { ok, migrated, skipped, failed, keys: [{keyId, label, status}] }
-  if (route === 'apikeys/migrate' && method === 'POST') {
-    if (!sess) return jRes({ error: 'Session required' }, 403);
-    const rec = await getUser(sess.username, env);
-    if (!rec) return jRes({ error: ERRS[404] }, 404);
-    const { content: user } = rec;
-    const existingKeys = user.apiKeys || [];
-    if (existingKeys.length === 0) {
-      return jRes({ ok: true, migrated: 0, skipped: 0, failed: 0, keys: [] });
-    }
-    let ghToken;
-    try { ghToken = await aesDecrypt(user.encGhToken, secret, `user-token:${user.username}`); }
-    catch { return jRes({ error: 'Could not decrypt GitHub token' }, 500); }
-    const repos  = getUserRepos(user);
-    const repo   = repos[0];
-    const { ghOwner, ghRepo, ghBranch = 'main', folder = 'uploads' } = repo;
-    const results = [];
-    let migrated = 0, skipped = 0, failed = 0;
-    for (const keyMeta of existingKeys) {
-      const { keyId, label = '', allowedOrigins = [], createdAt } = keyMeta;
-      // Step 1: decrypt encKey → derive sha256
-      let rawKey, sha256hex;
-      try {
-        rawKey    = await aesDecrypt(keyMeta.encKey, secret, `apikey:${sess.username}:${keyId}`);
-        sha256hex = await apiKeyHash(rawKey);
-      } catch {
-        results.push({ keyId, label, status: 'failed', reason: 'Could not decrypt key' });
-        failed++;
-        continue;
-      }
-      // Step 2: skip if already in git (idempotent)
-      const existing = await readApiKeyFromGit(sha256hex, ghToken, ghOwner, ghRepo, ghBranch, folder);
-      if (existing) {
-        // Ensure KV is also fresh
-        if (kv) {
-          await kv.put(
-            apiKeyKvKey(sha256hex),
-            JSON.stringify({ username: sess.username, label, allowedOrigins, keyId }),
-          ).catch(() => {});
-        }
-        results.push({ keyId, label, status: 'skipped', reason: 'Already in git repo' });
-        skipped++;
-        continue;
-      }
-      // Step 3: read from KV to get the most up-to-date record
-      let kvRecord = null;
-      if (kv) kvRecord = await kv.get(apiKeyKvKey(sha256hex), 'json').catch(() => null);
-      const gitRecord = {
-        username:       sess.username,
-        label:          kvRecord?.label          ?? label,
-        allowedOrigins: kvRecord?.allowedOrigins ?? allowedOrigins,
-        keyId:          kvRecord?.keyId          ?? keyId,
-        createdAt:      createdAt ?? new Date().toISOString(),
-      };
-      // Step 4: write to git
-      try {
-        await writeApiKeyToGit(sha256hex, gitRecord, ghToken, ghOwner, ghRepo, ghBranch, folder);
-        // Refresh KV entry too
-        if (kv) {
-          await kv.put(
-            apiKeyKvKey(sha256hex),
-            JSON.stringify({ username: sess.username, label: gitRecord.label, allowedOrigins: gitRecord.allowedOrigins, keyId: gitRecord.keyId }),
-          ).catch(() => {});
-        }
-        results.push({ keyId, label: gitRecord.label, status: 'migrated' });
-        migrated++;
-      } catch (e) {
-        results.push({ keyId, label, status: 'failed', reason: e?.message || 'git write failed' });
-        failed++;
-      }
-    }
-    return jRes({ ok: true, migrated, skipped, failed, keys: results });
-  }
-
   if (route === 'apikeys/list' && method === 'GET') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
     const rec = await getUser(sess.username, env);
@@ -1761,28 +1642,30 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const sha256hex = await apiKeyHash(rawKey);
     const keyRecord = { username: sess.username, label, allowedOrigins, keyId, createdAt: new Date().toISOString() };
 
-    // ── 1. Write to user's git repo (source of truth) ─────────────────────────
-    // Use the already-decrypted token from fullSess — re-decrypting from the
-    // freshly-loaded user record could produce a different token if encGhToken
-    // was updated (e.g. password reset) between session creation and now.
     const ghToken = fullSess.ghToken;
     const repos   = getUserRepos(user);
     const repo    = repos[0];
+
     try {
       await writeApiKeyToGit(sha256hex, keyRecord, ghToken, repo.ghOwner, repo.ghRepo, repo.ghBranch || 'main', repo.folder || 'uploads');
     } catch (gitErr) {
       return jRes({ error: `Failed to write API key to your repository: ${gitErr?.message || 'unknown error'}` }, 502);
     }
-    if (kv) await kv.put(apiKeyKvKey(sha256hex), JSON.stringify({ username: sess.username, label, allowedOrigins, keyId })).catch(() => {});
-    writeApiKeyToRegistry(sha256hex, keyRecord, env).catch(() => {});
-    const encKey = await aesEncrypt(rawKey, secret, `apikey:${sess.username}:${keyId}`);
-    const keyMeta = { keyId, preview, label, allowedOrigins, createdAt: new Date().toISOString(), encKey };
+
+    try {
+      await writeApiKeyToRegistry(sha256hex, keyRecord, env);
+    } catch (regErr) {
+      await deleteApiKeyFromGit(sha256hex, ghToken, repo.ghOwner, repo.ghRepo, repo.ghBranch || 'main', repo.folder || 'uploads').catch(() => {});
+      return jRes({ error: `Failed to register API key: ${regErr?.message || 'unknown error'}` }, 502);
+    }
+
+    const encKey  = await aesEncrypt(rawKey, secret, `apikey:${sess.username}:${keyId}`);
+    const keyMeta = { keyId, preview, label, allowedOrigins, createdAt: keyRecord.createdAt, encKey };
     const updated = { ...user, apiKeys: [...existingKeys, keyMeta] };
     try { await writeReg(userPath(sess.username), updated, `Create API key: ${label}`, env, userSha); }
     catch {
       await deleteApiKeyFromGit(sha256hex, ghToken, repo.ghOwner, repo.ghRepo, repo.ghBranch || 'main', repo.folder || 'uploads').catch(() => {});
-      if (kv) await kv.delete(apiKeyKvKey(sha256hex)).catch(() => {});
-      deleteApiKeyFromRegistry(sha256hex, env).catch(() => {});
+      await deleteApiKeyFromRegistry(sha256hex, env).catch(() => {});
       return jRes({ error: ERRS[502] }, 502);
     }
     return jRes({ ok: true, rawKey, keyId, preview, label, allowedOrigins });
@@ -1798,12 +1681,10 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const existing = user.apiKeys || [];
     const target   = existing.find(k => k.keyId === keyId);
     if (!target) return jRes({ error: 'API key not found' }, 404);
-    // Decrypt raw key → sha256 → delete from git repo + KV
     if (target.encKey) {
       try {
         const rawKey    = await aesDecrypt(target.encKey, secret, `apikey:${sess.username}:${keyId}`);
         const sha256hex = await apiKeyHash(rawKey);
-        // Delete from git (source of truth)
         let ghToken;
         try { ghToken = await aesDecrypt(user.encGhToken, secret, `user-token:${user.username}`); } catch {}
         if (ghToken) {
@@ -1811,8 +1692,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
           const repo  = repos[0];
           await deleteApiKeyFromGit(sha256hex, ghToken, repo.ghOwner, repo.ghRepo, repo.ghBranch || 'main', repo.folder || 'uploads').catch(() => {});
         }
-        if (kv) await kv.delete(apiKeyKvKey(sha256hex)).catch(() => {});
-        deleteApiKeyFromRegistry(sha256hex, env).catch(() => {});
+        await deleteApiKeyFromRegistry(sha256hex, env).catch(() => {});
       } catch {}
     }
     const updated = { ...user, apiKeys: existing.filter(k => k.keyId !== keyId) };
@@ -1820,6 +1700,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     catch { return jRes({ error: ERRS[502] }, 502); }
     return jRes({ ok: true });
   }
+
   if (route === 'share-link' && method === 'GET') {
     const sp    = new URL(request.url).searchParams;
     const nameP = sp.get('name') || '';
@@ -1860,32 +1741,86 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     return jRes({ url, exp });
   }
   if (route === 'files' && method === 'GET') {
-    // ?repoIdx= fetches a specific repo without session mutation
-    const qRepoIdx = parseInt(new URL(request.url).searchParams.get('repoIdx') ?? '', 10);
-    let targetSess = fullSess;
-    if (!isNaN(qRepoIdx) && qRepoIdx >= 0 && qRepoIdx < fullSess.repos.length) {
-      targetSess = getRepoSess(fullSess, qRepoIdx);
-    }
-    try {
+    // A single repo's file+folder list. Shared by both the single-repo path
+    // (?repoIdx=n) and the all-repos aggregate path below.
+    async function listOneRepo(targetSess) {
       const [regular, { data: idx }] = await Promise.all([
         listFiles(targetSess),
         readIndexCached(targetSess, kv).catch(() => ({ data: {} })),
       ]);
+      const folders = idx.__folders__ || [];
       const chunked = Object.entries(idx)
-        .filter(([, info]) => info.totalChunks)
-        .map(([name, info]) => ({ name, originalName: info.originalName || unwrapName(name), size: info.totalSize, sha: '', chunked: true, distributed: info.distributed || false, repoCount: info.repoCount || 1, parts: info.totalChunks, uploadedAt: info.uploadedAt || null }));
+        .filter(([k, info]) => !k.startsWith('__') && info.totalChunks)
+        .map(([name, info]) => ({
+          name, originalName: info.originalName || unwrapName(name),
+          size: info.totalSize, sha: '', chunked: true,
+          distributed: info.distributed || false, repoCount: info.repoCount || 1,
+          parts: info.totalChunks, uploadedAt: info.uploadedAt || null,
+          dir: info.dir || 'root',
+        }));
       const chunkedNames = new Set(chunked.map(f => f.name));
       const cleanRegular = regular
         .filter(f => !chunkedNames.has(f.name))
-        .map(f => ({ ...f, originalName: idx[f.name]?.originalName || unwrapName(f.name), uploadedAt: idx[f.name]?.uploadedAt || null, chunked: false }));
-      const all = [...cleanRegular, ...chunked].sort((a, b) => {
+        .map(f => ({
+          ...f,
+          originalName: idx[f.name]?.originalName || unwrapName(f.name),
+          uploadedAt:   idx[f.name]?.uploadedAt   || null,
+          chunked:      false,
+          dir:          idx[f.name]?.dir           || 'root',
+        }));
+      const files = [...cleanRegular, ...chunked].sort((a, b) => {
         if (!a.uploadedAt && !b.uploadedAt) return 0;
         if (!a.uploadedAt) return 1;
         if (!b.uploadedAt) return -1;
         return new Date(b.uploadedAt) - new Date(a.uploadedAt);
       });
-      return jRes(all);
-    } catch { return jRes({ error: ERRS[502] }, 502); }
+      return { files, folders };
+    }
+
+    const url = new URL(request.url);
+    const hasRepoIdx = url.searchParams.has('repoIdx');
+
+    try {
+      if (hasRepoIdx) {
+        // Explicit single-repo request — unchanged behaviour, plain {files, folders}.
+        const qRepoIdx = parseInt(url.searchParams.get('repoIdx') ?? '', 10);
+        const targetSess = (!isNaN(qRepoIdx) && qRepoIdx >= 0 && qRepoIdx < fullSess.repos.length)
+          ? getRepoSess(fullSess, qRepoIdx)
+          : fullSess;
+        const { files, folders } = await listOneRepo(targetSess);
+        return jRes({ files, folders });
+      }
+
+      // No repoIdx given — aggregate every connected repo into one response.
+      // Each file and folder is tagged with its repoIdx and repoLabel so
+      // callers can tell them apart.
+      const repos = fullSess.repos || [];
+      const results = await Promise.all(
+        repos.map(async (r, i) => {
+          const targetSess = getRepoSess(fullSess, i);
+          try {
+            const { files, folders } = await listOneRepo(targetSess);
+            return {
+              repoIdx: i,
+              repoLabel: r.label || r.ghRepo || String(i),
+              files: files.map(f => ({ ...f, repoIdx: i, repoLabel: r.label || r.ghRepo || String(i) })),
+              folders: folders.map(name => ({ name, repoIdx: i, repoLabel: r.label || r.ghRepo || String(i) })),
+            };
+          } catch (err) {
+            return { repoIdx: i, repoLabel: r.label || r.ghRepo || String(i), files: [], folders: [], error: err?.message || 'Failed to list repo' };
+          }
+        })
+      );
+      const allFiles   = results.flatMap(r => r.files);
+      const allFolders = results.flatMap(r => r.folders);
+      allFiles.sort((a, b) => {
+        if (!a.uploadedAt && !b.uploadedAt) return 0;
+        if (!a.uploadedAt) return 1;
+        if (!b.uploadedAt) return -1;
+        return new Date(b.uploadedAt) - new Date(a.uploadedAt);
+      });
+      return jRes({ files: allFiles, folders: allFolders, repos: results.map(r => ({ repoIdx: r.repoIdx, repoLabel: r.repoLabel, ...(r.error ? { error: r.error } : {}) })) });
+    } catch (err) { return errRes(request, err); }
   }
   if (route === 'upload' && method === 'POST') {
     if (!(request.headers.get('Content-Type')||'').includes('application/json')) return jRes({ error: ERRS[400] },400);
@@ -1923,7 +1858,11 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       }
       try {
         const { data: idx, sha: idxSha } = await readIndex(uploadSess);
-        idx[safe] = { originalName: getOriginalName(rawName, safe), uploadedAt: new Date().toISOString(), size: decodedSize };
+        idx[safe] = { originalName: getOriginalName(rawName, safe), uploadedAt: new Date().toISOString(), size: decodedSize, dir: String(body.dir || 'root') };
+        if (body.dir && body.dir !== 'root') {
+          const folders = idx.__folders__ || [];
+          if (!folders.includes(body.dir)) idx.__folders__ = [...folders, body.dir].sort();
+        }
         await writeIndex(uploadSess, idx, idxSha);
       } catch {}
       return jRes({ ok:true, name:safe, size:decodedSize });
@@ -1983,7 +1922,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
   }
   if (route === 'finalize-upload' && method === 'POST') {
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] },400); }
-    const { name, totalSize, totalChunks, chunkSize, blobs } = body||{};
+    const { name, totalSize, totalChunks, chunkSize, blobs, dir } = body||{};
     if (!name||!totalSize||!totalChunks||!Array.isArray(blobs)) return jRes({ error: ERRS[400] },400);
     if (blobs.length !== totalChunks) return jRes({ error: ERRS[400] },400);
     if (totalChunks > C_MAX_TOTAL_CHUNKS) return jRes({ error: ERRS[413] },413);
@@ -2028,7 +1967,11 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
         await finalizeChunkedUpload(finalSess, safe, blobs, totalSize, chunkSize);
       }
       const { data: idx, sha: idxSha } = await readIndex(finalSess);
-      idx[safe] = { originalName: getOriginalName(name, safe), totalSize, totalChunks, uploadedAt: new Date().toISOString(), ...(dist && { distributed: true, repoCount: fullSess.repos.length }) };
+      idx[safe] = { originalName: getOriginalName(name, safe), totalSize, totalChunks, uploadedAt: new Date().toISOString(), dir: String(dir || 'root'), ...(dist && { distributed: true, repoCount: fullSess.repos.length }) };
+      if (dir && dir !== 'root') {
+        const folders = idx.__folders__ || [];
+        if (!folders.includes(dir)) idx.__folders__ = [...folders, dir].sort();
+      }
       await writeIndex(finalSess, idx, idxSha);
       return jRes({ ok: true, name: safe, distributed: dist, ...(dist && { repoCount: fullSess.repos.length }) });
     } catch { return jRes({ error: ERRS[502] }, 502); }
@@ -2208,84 +2151,39 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
 
   if (route === 'mkdir' && method === 'POST') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
-    let body;
-    try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
+    let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
     const { path: folderPath, repoIdx: ri } = body || {};
     if (!folderPath || typeof folderPath !== 'string') return jRes({ error: ERRS[400] }, 400);
-
-    // Sanitize: allow letters, numbers, underscore, hyphen, dot, slash
-    // Remove leading/trailing slashes, prevent traversal
-    const safe = folderPath
-      .replace(/ /g, '')
-      .replace(/\.\./g, '_')
-      .replace(/^\/+|\/+$/g, '')
-      .replace(/[^a-zA-Z0-9_\-./]/g, '_');
-    if (!safe || safe.startsWith('.')) return jRes({ error: 'Invalid folder name' }, 400);
-
+    const safe = folderPath.replace(/[^a-zA-Z0-9_\-]/g, '_').replace(/^_+|_+$/g, '').slice(0, 50);
+    if (!safe || safe.startsWith('_')) return jRes({ error: 'Invalid folder name' }, 400);
     const dlSess = getRepoSess(fullSess, Number.isInteger(ri) ? ri : 0);
-    const { ghToken, ghOwner, ghRepo, ghBranch, folder } = dlSess;
-
-    // Create .storegit marker file inside the new folder
-    const markerPath = folder + '/' + safe + '/.storegit';
-    let mkRes;
     try {
-      mkRes = await fetch(
-        'https://api.github.com/repos/' + ghOwner + '/' + ghRepo + '/contents/' + markerPath,
-        {
-          method:  'PUT',
-          headers: ghH(ghToken),
-          body:    JSON.stringify({
-            message: 'mkdir ' + safe,
-            content: btoa('storegit-folder'),
-            branch:  ghBranch,
-          }),
-        }
-      );
-    } catch { throw new GitHubError(0, 'Network error creating folder', 'mkdir'); }
-
-    if (!mkRes.ok && mkRes.status !== 422) {
-      const msg = await ghErrMsg(mkRes, 'Failed to create folder');
-      throw new GitHubError(mkRes.status, msg, 'mkdir');
-    }
-    return jRes({ ok: true, path: safe });
+      const { data: idx, sha: idxSha } = await readIndex(dlSess).catch(() => ({ data: {}, sha: null }));
+      const folders = idx.__folders__ || [];
+      if (!folders.includes(safe)) {
+        idx.__folders__ = [...folders, safe].sort();
+        await writeIndex(dlSess, idx, idxSha);
+      }
+      return jRes({ ok: true, path: safe });
+    } catch(err) { return errRes(request, err); }
   }
   if (route === 'rmdir' && method === 'DELETE') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
     const { path: folderPath, repoIdx: ri } = body || {};
     if (!folderPath || typeof folderPath !== 'string') return jRes({ error: ERRS[400] }, 400);
-    const safe = folderPath.replace(/[^a-zA-Z0-9_\-./]/g, '_').replace(/\.{2,}/g, '_').replace(/^\/+|\/+$/g, '');
-    if (!safe) return jRes({ error: 'Invalid folder name' }, 400);
     const dlSess = getRepoSess(fullSess, Number.isInteger(ri) ? ri : 0);
-    const { ghToken, ghOwner, ghRepo, ghBranch, folder } = dlSess;
-    const gh   = ghH(ghToken);
-    const base = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}`;
     try {
-      const dirRes = await fetch(`${base}/contents/${folder}/${safe}?ref=${ghBranch}`, { headers: gh });
-      if (!dirRes.ok) return jRes({ error: 'Folder not found' }, 404);
-      const items = await dirRes.json();
-      if (!Array.isArray(items)) return jRes({ error: 'Not a folder' }, 400);
-      const refRes = await fetch(`${base}/git/ref/heads/${ghBranch}`, { headers: gh });
-      if (!refRes.ok) throw new GitHubError(refRes.status, await ghErrMsg(refRes, 'Failed to read branch ref'), 'rmdir');
-      const { object: { sha: headSha } } = await refRes.json();
-      const commitRes = await fetch(`${base}/git/commits/${headSha}`, { headers: gh });
-      const { tree: { sha: treeSha } } = await commitRes.json();
-      const treeItems = items.filter(f => f.type === 'file').map(f => ({
-        path: f.path, mode: '100644', type: 'blob', sha: null,
-      }));
-      if (!treeItems.length) return jRes({ ok: true, deleted: 0 });
-      const newTreeRes = await fetch(`${base}/git/trees`, { method: 'POST', headers: gh, body: JSON.stringify({ base_tree: treeSha, tree: treeItems }) });
-      if (!newTreeRes.ok) throw new GitHubError(newTreeRes.status, await ghErrMsg(newTreeRes, 'Failed to build delete tree'), 'rmdir');
-      const { sha: newTree } = await newTreeRes.json();
-      const newCommitRes = await fetch(`${base}/git/commits`, { method: 'POST', headers: gh, body: JSON.stringify({ message: `rmdir ${safe}`, tree: newTree, parents: [headSha] }) });
-      if (!newCommitRes.ok) throw new GitHubError(newCommitRes.status, await ghErrMsg(newCommitRes, 'Failed to commit folder delete'), 'rmdir');
-      const { sha: newCommit } = await newCommitRes.json();
-      const upRes = await fetch(`${base}/git/refs/heads/${ghBranch}`, { method: 'PATCH', headers: gh, body: JSON.stringify({ sha: newCommit, force: false }) });
-      if (!upRes.ok) throw new GitHubError(upRes.status, await ghErrMsg(upRes, 'Failed to update branch ref'), 'rmdir');
-      return jRes({ ok: true, deleted: treeItems.length });
+      const { data: idx, sha: idxSha } = await readIndex(dlSess).catch(() => ({ data: {}, sha: null }));
+      idx.__folders__ = (idx.__folders__ || []).filter(f => f !== folderPath);
+      for (const key of Object.keys(idx)) {
+        if (key.startsWith('__')) continue;
+        if (idx[key]?.dir === folderPath) idx[key] = { ...idx[key], dir: 'root' };
+      }
+      await writeIndex(dlSess, idx, idxSha);
+      return jRes({ ok: true, path: folderPath });
     } catch(err) { return errRes(request, err); }
   }
-
   if (route === 'move' && method === 'POST') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
@@ -2294,48 +2192,63 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const srcSess  = getRepoSess(fullSess, Number.isInteger(srcRepoIdx)  ? srcRepoIdx  : 0);
     const destSess = getRepoSess(fullSess, Number.isInteger(destRepoIdx) ? destRepoIdx : 0);
     const safeSrc  = sanitize(String(rawName));
-    // destName can be a path like "projects/file.pdf" — use sanitizePath
-    let rawDestNorm = String(rawDest);
-    if (rawDestNorm.endsWith('/')) rawDestNorm += String(rawName); // trailing slash = move into folder
+    if (!safeSrc) return jRes({ error: ERRS[400] }, 400);
+
+    // Detect if dest is a virtual folder name (no slash, not a filename with extension)
+    const rawDestStr  = String(rawDest).replace(/\/+$/, '');
+    const isVirtFolder = !rawDestStr.includes('/') && !rawDestStr.includes('.');
+
+    if (isVirtFolder && srcRepoIdx === destRepoIdx) {
+      // Fast path: just update the dir field in the index — no GitHub file copy needed
+      try {
+        const { data: idx, sha: idxSha } = await readIndex(srcSess).catch(() => ({ data: {}, sha: null }));
+        if (!idx[safeSrc]) return jRes({ error: 'File not found in index' }, 404);
+        idx[safeSrc] = { ...idx[safeSrc], dir: rawDestStr || 'root' };
+        // Ensure the target folder exists in __folders__
+        const folders = idx.__folders__ || [];
+        if (rawDestStr && rawDestStr !== 'root' && !folders.includes(rawDestStr))
+          idx.__folders__ = [...folders, rawDestStr].sort();
+        await writeIndex(srcSess, idx, idxSha);
+        return jRes({ ok: true, src: safeSrc, dest: rawDestStr, method: 'index-update' });
+      } catch(err) { return errRes(request, err); }
+    }
+
+    // Full path move: copy file on GitHub then update index
+    let rawDestNorm = rawDestStr;
+    if (rawDestNorm.endsWith('/')) rawDestNorm += rawName;
     const safeDest = sanitizePath(rawDestNorm);
-    if (!safeSrc || !safeDest) return jRes({ error: 'Invalid source or destination name' }, 400);
-    if (safeSrc === safeDest && srcRepoIdx === destRepoIdx) return jRes({ error: 'Source and destination are the same' }, 400);
+    if (!safeDest) return jRes({ error: 'Invalid destination path' }, 400);
+    if (safeSrc === safeDest && srcRepoIdx === (Number.isInteger(destRepoIdx) ? destRepoIdx : 0))
+      return jRes({ error: 'Source and destination are the same' }, 400);
     try {
-      // Fetch source content
-      const srcUrl = `https://raw.githubusercontent.com/${srcSess.ghOwner}/${srcSess.ghRepo}/${srcSess.ghBranch}/${srcSess.folder}/${safeSrc.split('/').map(encodeURIComponent).join('/')}`;
-      const srcRes = await fetch(srcUrl, { headers: { Authorization: `token ${srcSess.ghToken}`, 'User-Agent': 'StoreGit/1' } });
-      if (!srcRes.ok) return jRes({ error: `Source file not found: ${safeSrc}` }, 404);
-      const buf = await srcRes.arrayBuffer();
-      // Safe base64 for large buffers (avoids stack overflow with spread)
+      const srcUrl = 'https://raw.githubusercontent.com/' + srcSess.ghOwner + '/' + srcSess.ghRepo + '/' + srcSess.ghBranch + '/' + srcSess.folder + '/' + safeSrc;
+      const srcRes = await fetch(srcUrl, { headers: { Authorization: 'token ' + srcSess.ghToken, 'User-Agent': 'StoreGit/1' } });
+      if (!srcRes.ok) return jRes({ error: 'Source file not found: ' + safeSrc }, 404);
+      const buf  = await srcRes.arrayBuffer();
       const bytes = new Uint8Array(buf);
       let bin = ''; const cs = 8192;
       for (let i = 0; i < bytes.length; i += cs) bin += String.fromCharCode(...bytes.subarray(i, i + cs));
       const b64 = btoa(bin);
-      // Write to destination
       await uploadSmall(destSess, safeDest, b64);
-      // Update destination index
       const { data: idx, sha: idxSha } = await readIndex(srcSess).catch(() => ({ data: {}, sha: null }));
       if (idx[safeSrc]) {
-        try {
-          const { data: destIdx, sha: destIdxSha } = await readIndex(destSess).catch(() => ({ data: {}, sha: null }));
-          destIdx[safeDest] = { ...idx[safeSrc], originalName: rawDestNorm };
-          await writeIndex(destSess, destIdx, destIdxSha);
-        } catch {}
+        const { data: destIdx, sha: destIdxSha } = srcRepoIdx === destRepoIdx
+          ? { data: idx, sha: idxSha }
+          : await readIndex(destSess).catch(() => ({ data: {}, sha: null }));
+        destIdx[safeDest] = { ...idx[safeSrc], originalName: rawDestNorm };
+        await writeIndex(destSess, destIdx, destIdxSha);
+        delete idx[safeSrc];
+        try { await writeIndex(srcSess, idx, idxSha); } catch {}
       }
-      // Delete source from GitHub
-      const delUrl = `https://api.github.com/repos/${srcSess.ghOwner}/${srcSess.ghRepo}/contents/${srcSess.folder}/${safeSrc.split('/').map(encodeURIComponent).join('/')}`;
-      const shaRes = await fetch(`${delUrl}?ref=${srcSess.ghBranch}`, { headers: ghH(srcSess.ghToken) });
+      // Delete source
+      const delUrl = 'https://api.github.com/repos/' + srcSess.ghOwner + '/' + srcSess.ghRepo + '/contents/' + srcSess.folder + '/' + safeSrc;
+      const shaRes = await fetch(delUrl + '?ref=' + srcSess.ghBranch, { headers: ghH(srcSess.ghToken) });
       if (shaRes.ok) {
         const { sha: fileSha } = await shaRes.json();
-        await fetch(delUrl, { method:'DELETE', headers: ghH(srcSess.ghToken),
-          body: JSON.stringify({ message: `mv ${safeSrc} → ${safeDest}`, sha: fileSha, branch: srcSess.ghBranch }) });
-        // Remove from source index
-        if (idx[safeSrc]) {
-          delete idx[safeSrc];
-          try { await writeIndex(srcSess, idx, idxSha); } catch {}
-        }
+        await fetch(delUrl, { method: 'DELETE', headers: ghH(srcSess.ghToken),
+          body: JSON.stringify({ message: 'mv ' + safeSrc, sha: fileSha, branch: srcSess.ghBranch }) });
       }
-      return jRes({ ok: true, src: safeSrc, dest: safeDest });
+      return jRes({ ok: true, src: safeSrc, dest: safeDest, method: 'file-copy' });
     } catch(err) { return errRes(request, err); }
   }
 
