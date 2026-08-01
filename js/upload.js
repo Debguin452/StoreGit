@@ -1,6 +1,6 @@
 import { state }                            from './state.js';
 import { elem, toast, fmtSize, fileExt, fileExtRaw, fileColor } from './util.js';
-import { renderFiles }                      from './files.js';
+import { renderFiles, currentFolder }        from './files.js';
 
 let _loadFilesRef = null;
 export function setLoadFilesRef(fn) { _loadFilesRef = fn; }
@@ -18,6 +18,7 @@ function _appendUploadedToState() {
     state.repoFiles.push(group);
   }
   const now = new Date().toISOString();
+  const dir = currentFolder || 'root';
   for (const item of done) {
     const idx = group.files.findIndex(f => f.name === item.file.name);
     const entry = {
@@ -26,6 +27,7 @@ function _appendUploadedToState() {
       size: item.file.size,
       uploadedAt: now,
       sha: null,
+      dir,
       _repoIdx: repoIdx,
     };
     if (idx >= 0) group.files[idx] = entry;
@@ -147,13 +149,14 @@ export async function startUpload() {
     item.status = 'uploading'; renderQueue();
     try {
       const repoIdx = getSmartRepoIdx();
+      const dir     = currentFolder || 'root';
       if (item.file.size > state.CHUNK_THRESHOLD) {
-        await _uploadChunked(item, repoIdx);
+        await _uploadChunked(item, repoIdx, dir);
       } else {
-        await _uploadFile(item, repoIdx);
+        await _uploadFile(item, repoIdx, dir);
       }
       item.status = 'done'; item.progress = 100;
-    } catch { item.status = 'error'; }
+    } catch (e) { item.status = 'error'; item.error = e?.message || 'Upload failed'; }
     renderQueue();
   }
   state.uploadActive = false;
@@ -169,54 +172,67 @@ export async function startUpload() {
   renderQueue();
 }
 
-async function _uploadFile(item, repoIdx) {
+async function _uploadFile(item, repoIdx, dir = 'root') {
   const content = await readAsBase64(item.file);
   item.progress = 50; renderQueue();
   const r = await fetch('/api/upload', {
     method: 'POST', credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: item.file.name, content, repoIdx }),
+    body: JSON.stringify({ name: item.file.name, content, dir }),
   });
-  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || 'upload failed'); }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || 'Upload failed'); }
   item.progress = 100;
 }
 
-async function _uploadChunked(item, repoIdx) {
+// Stateless blob-token chunked upload — matches the server's actual contract:
+// each chunk is uploaded as an independent Git blob and signed with a
+// blobToken; nothing is committed until POST /api/finalize-upload receives
+// every chunk's { index, blobSha, blobToken, size, repoIdx }. There is no
+// server-side upload session or uploadId — the client holds all the state.
+async function _uploadChunked(item, repoIdx, dir = 'root') {
   const file        = item.file;
   const totalChunks = Math.ceil(file.size / state.CHUNK_SIZE);
   const slices = state.sliceCache.get(file) ||
     Array.from({ length: totalChunks }, (_, i) =>
       file.slice(i * state.CHUNK_SIZE, Math.min((i + 1) * state.CHUNK_SIZE, file.size))
     );
-  const ir = await fetch('/api/upload-chunked/init', {
-    method: 'POST', credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: file.name, totalChunks, totalSize: file.size, repoIdx }),
-  });
-  if (!ir.ok) throw new Error('init failed');
-  const { uploadId } = await ir.json();
+
+  const blobs = new Array(totalChunks);
   let uploaded = 0;
   const conc = state.UPLOAD_CONCURRENCY;
+
   for (let start = 0; start < totalChunks; start += conc) {
     await Promise.all(slices.slice(start, start + conc).map(async (slice, bi) => {
       const idx     = start + bi;
       const content = await readAsBase64(slice);
-      const cr      = await fetch('/api/upload-chunked/chunk', {
+      const cr = await fetch('/api/upload-chunk', {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ uploadId, chunkIndex: idx, content }),
+        body: JSON.stringify({
+          name: file.name, chunkIndex: idx, totalChunks,
+          totalSize: file.size, content,
+        }),
       });
-      if (!cr.ok) throw new Error('chunk failed');
+      if (!cr.ok) {
+        const d = await cr.json().catch(() => ({}));
+        throw new Error(d.error || `Chunk ${idx + 1}/${totalChunks} failed`);
+      }
+      const { blobSha, blobToken, size, repoIdx: chunkRepoIdx } = await cr.json();
+      blobs[idx] = { index: idx, blobSha, blobToken, size, repoIdx: chunkRepoIdx };
       uploaded++; item.progress = Math.round(uploaded / totalChunks * 90); renderQueue();
     }));
   }
+
   item.progress = 92; renderQueue();
-  const fr = await fetch('/api/upload-chunked/finalize', {
+  const fr = await fetch('/api/finalize-upload', {
     method: 'POST', credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ uploadId }),
+    body: JSON.stringify({
+      name: file.name, totalSize: file.size, totalChunks,
+      chunkSize: state.CHUNK_SIZE, blobs, dir,
+    }),
   });
-  if (!fr.ok) throw new Error((await fr.json().catch(() => ({}))).error || 'finalize failed');
+  if (!fr.ok) throw new Error((await fr.json().catch(() => ({}))).error || 'Finalize failed');
 }
 
 export function readAsBase64(blob) {

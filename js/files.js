@@ -390,7 +390,7 @@ export function renderFiles() {
 }
 
 
-export function showCreateFolderModal(repoIdx = 0, afterCreate = null) {
+export function showCreateFolderModal(afterCreate = null) {
   showModalHtml(
     'New Folder',
     `<label class="modal-field-label">Folder name</label>
@@ -401,10 +401,11 @@ export function showCreateFolderModal(repoIdx = 0, afterCreate = null) {
       if (!name) return;
       const safe = name.replace(/[^a-zA-Z0-9_\-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 50);
       try {
+        // Folders are unified across every connected repo — no repoIdx needed.
         const r = await fetch('/api/mkdir', {
           method: 'POST', credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: safe, repoIdx }),
+          body: JSON.stringify({ path: safe }),
         });
         if (r.ok) { toast(`Folder "${safe}" created.`, 'ok'); loadFiles(true); if (afterCreate) afterCreate(safe); }
         else { const d = await r.json().catch(()=>{}); toast(d?.error || 'Failed to create folder.', 'error'); }
@@ -417,14 +418,14 @@ export function showCreateFolderModal(repoIdx = 0, afterCreate = null) {
 export function deleteFolderUI(name) {
   showModal(
     `Delete folder "${name}"`,
-    'This permanently deletes the folder and all its contents.',
+    'Files inside move back to the root. Nothing is deleted from GitHub.',
     'Delete', 'btn-danger',
     async () => {
       try {
         const r = await fetch('/api/rmdir', {
           method: 'DELETE', credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: name, repoIdx: 0 }),
+          body: JSON.stringify({ path: name }),
         });
         if (r.ok) { toast('Folder deleted.', 'ok'); currentFolder = ''; loadFiles(true); }
         else toast('Delete failed.', 'error');
@@ -474,7 +475,7 @@ export function moveFileToFolderUI(f) {
       };
     });
     document.getElementById('move-mkdir-btn')?.addEventListener('click', () => {
-      showCreateFolderModal(f._repoIdx ?? 0, (name) => {
+      showCreateFolderModal((name) => {
         document.getElementById('move-folder-dest').value = name;
       });
     });
