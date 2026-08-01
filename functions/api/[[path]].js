@@ -687,6 +687,32 @@ function getRepoSess(fullSess, repoIdx) {
     activeRepoIdx: idx,
   };
 }
+
+// All connected repos are treated as one unified storage pool — callers
+// should not normally need to know or pass which physical repo a file
+// lives in. When a request doesn't specify repoIdx explicitly, this
+// searches every connected repo (in order) for a file with that name and
+// returns the first match. Checks the index first (cheap, one file read
+// per repo) since every file — chunked or not — has an index entry.
+async function findFileRepoIdx(fullSess, safeName) {
+  const repos = fullSess.repos || [];
+  for (let i = 0; i < repos.length; i++) {
+    const sess = getRepoSess(fullSess, i);
+    try {
+      const { data: idx } = await readIndex(sess);
+      if (idx[safeName]) return i;
+    } catch { /* try the next repo */ }
+  }
+  return repos.length ? 0 : null; // fall back to repo 0 so callers still get a sensible 404 downstream
+}
+
+// Resolves the repo to use for a request that names an existing file.
+// If repoIdx is explicitly given, use it as-is (fast path, no search).
+// Otherwise, search all repos for the file.
+async function resolveFileRepoIdx(fullSess, safeName, explicitRepoIdx) {
+  if (Number.isInteger(explicitRepoIdx)) return explicitRepoIdx;
+  return findFileRepoIdx(fullSess, safeName);
+}
 async function readReg(path, env) {
   const res = await fetch(`${regBase(env)}/contents/${path}?ref=${REGISTRY_BRANCH}`, { headers: regH(env) });
   if (res.status === 404) return null;
@@ -736,11 +762,28 @@ async function listFiles(sess) {
 async function readIndex(sess) {
   const { ghToken, ghOwner, ghRepo, ghBranch, folder } = sess;
   const url = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/contents/${encodeURIComponent(indexP(folder))}?ref=${encodeURIComponent(ghBranch)}`;
-  const res = await fetch(url, { headers: ghH(ghToken) });
+  let res;
+  try {
+    res = await fetch(url, { headers: ghH(ghToken) });
+  } catch {
+    throw new GitHubError(0, 'Network error reading storage index — please try again.', 'readIndex');
+  }
+  // 404 is the ONLY case that legitimately means "no index yet" (new repo/folder).
+  // Every other non-ok status (rate limit, auth failure, 5xx, etc.) is a real
+  // failure and must be surfaced — silently treating it as an empty index would
+  // make the caller think files/folders don't exist when they actually do,
+  // and any subsequent write would risk clobbering real data.
   if (res.status === 404) return { data: {}, sha: null };
-  if (!res.ok) return { data: {}, sha: null };
+  if (!res.ok) {
+    const msg = await ghErrMsg(res, 'Failed to read storage index from GitHub');
+    throw new GitHubError(res.status, msg, 'readIndex');
+  }
   const d = await res.json();
-  return { data: JSON.parse(DEC.decode(b64urlDec(d.content.replace(/\s/g,'')))), sha: d.sha };
+  try {
+    return { data: JSON.parse(DEC.decode(b64urlDec(d.content.replace(/\s/g,'')))), sha: d.sha };
+  } catch {
+    throw new GitHubError(500, 'Storage index is corrupted — contact support or restore from a backup.', 'readIndex');
+  }
 }
 function isDistributed(totalSize, repos) {
   // Distribute when file is large enough that splitting meaningfully equalises repo storage,
@@ -1333,9 +1376,6 @@ async function _handleRequest({ request, env, params }) {
   if (route === 'logout' && method === 'POST') {
     const rawToken = readSessionCookie(request);
     const sess = await verifyToken(rawToken, secret);
-    if (!sess) {
-        return jsonRes(request, { error: "Not logged in" },401);
-    }
     if (sess) {
       const kv = env.RATE_LIMIT_KV || null;
       if (kv) {
@@ -1708,11 +1748,12 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     const sp    = new URL(request.url).searchParams;
     const nameP = sp.get('name') || '';
     const ttlP  = parseInt(sp.get('ttl') || '3600', 10);
-    const rIdx  = parseInt(sp.get('repoIdx') || '0', 10);
     const never = ttlP === 0;
     const safe  = sanitize(nameP);
     if (!safe) return fail(request, 400);
     const ttl = never ? 0 : Math.max(60, Math.min(ttlP, C_SHARE_TTL_MAX));
+    const explicitRepoIdx = sp.has('repoIdx') ? parseInt(sp.get('repoIdx'), 10) : null;
+    const rIdx = await resolveFileRepoIdx(fullSess, safe, explicitRepoIdx);
     const targetSess = getRepoSess(fullSess, rIdx);
     let size = 0, displayName = unwrapName(safe);
     try {
@@ -1744,8 +1785,11 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     return jRes({ url, exp });
   }
   if (route === 'files' && method === 'GET') {
-    // A single repo's file+folder list. Shared by both the single-repo path
-    // (?repoIdx=n) and the all-repos aggregate path below.
+    // Every connected repo is one unified storage pool from the caller's
+    // point of view — this always returns the combined view. repoIdx is
+    // internal plumbing kept on each file only so other routes (download,
+    // delete, move, ...) can resolve it automatically; callers never need
+    // to know or pass it themselves.
     async function listOneRepo(targetSess) {
       const [regular, { data: idx }] = await Promise.all([
         listFiles(targetSess),
@@ -1771,32 +1815,11 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
           chunked:      false,
           dir:          idx[f.name]?.dir           || 'root',
         }));
-      const files = [...cleanRegular, ...chunked].sort((a, b) => {
-        if (!a.uploadedAt && !b.uploadedAt) return 0;
-        if (!a.uploadedAt) return 1;
-        if (!b.uploadedAt) return -1;
-        return new Date(b.uploadedAt) - new Date(a.uploadedAt);
-      });
+      const files = [...cleanRegular, ...chunked];
       return { files, folders };
     }
 
-    const url = new URL(request.url);
-    const hasRepoIdx = url.searchParams.has('repoIdx');
-
     try {
-      if (hasRepoIdx) {
-        // Explicit single-repo request — unchanged behaviour, plain {files, folders}.
-        const qRepoIdx = parseInt(url.searchParams.get('repoIdx') ?? '', 10);
-        const targetSess = (!isNaN(qRepoIdx) && qRepoIdx >= 0 && qRepoIdx < fullSess.repos.length)
-          ? getRepoSess(fullSess, qRepoIdx)
-          : fullSess;
-        const { files, folders } = await listOneRepo(targetSess);
-        return jRes({ files, folders });
-      }
-
-      // No repoIdx given — aggregate every connected repo into one response.
-      // Each file and folder is tagged with its repoIdx and repoLabel so
-      // callers can tell them apart.
       const repos = fullSess.repos || [];
       const results = await Promise.all(
         repos.map(async (r, i) => {
@@ -1804,25 +1827,25 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
           try {
             const { files, folders } = await listOneRepo(targetSess);
             return {
-              repoIdx: i,
-              repoLabel: r.label || r.ghRepo || String(i),
+              repoIdx: i, repoLabel: r.label || r.ghRepo || String(i),
               files: files.map(f => ({ ...f, repoIdx: i, repoLabel: r.label || r.ghRepo || String(i) })),
-              folders: folders.map(name => ({ name, repoIdx: i, repoLabel: r.label || r.ghRepo || String(i) })),
+              folders,
             };
           } catch (err) {
             return { repoIdx: i, repoLabel: r.label || r.ghRepo || String(i), files: [], folders: [], error: err?.message || 'Failed to list repo' };
           }
         })
       );
-      const allFiles   = results.flatMap(r => r.files);
-      const allFolders = results.flatMap(r => r.folders);
-      allFiles.sort((a, b) => {
+      const allFiles = results.flatMap(r => r.files).sort((a, b) => {
         if (!a.uploadedAt && !b.uploadedAt) return 0;
         if (!a.uploadedAt) return 1;
         if (!b.uploadedAt) return -1;
         return new Date(b.uploadedAt) - new Date(a.uploadedAt);
       });
-      return jRes({ files: allFiles, folders: allFolders, repos: results.map(r => ({ repoIdx: r.repoIdx, repoLabel: r.repoLabel, ...(r.error ? { error: r.error } : {}) })) });
+      // Folders are unified — dedupe by name across every repo.
+      const allFolders = [...new Set(results.flatMap(r => r.folders))].sort();
+      const repoErrors  = results.filter(r => r.error).map(r => ({ repoIdx: r.repoIdx, repoLabel: r.repoLabel, error: r.error }));
+      return jRes({ files: allFiles, folders: allFolders, ...(repoErrors.length ? { repoErrors } : {}) });
     } catch (err) { return errRes(request, err); }
   }
   if (route === 'upload' && method === 'POST') {
@@ -1859,16 +1882,31 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       } else {
         await uploadSmall(uploadSess, safe, b64);
       }
-      try {
-        const { data: idx, sha: idxSha } = await readIndex(uploadSess);
-        idx[safe] = { originalName: getOriginalName(rawName, safe), uploadedAt: new Date().toISOString(), size: decodedSize, dir: String(body.dir || 'root') };
-        if (body.dir && body.dir !== 'root') {
-          const folders = idx.__folders__ || [];
-          if (!folders.includes(body.dir)) idx.__folders__ = [...folders, body.dir].sort();
+      // The physical file is already on GitHub at this point — a failure here
+      // only means the folder tag / metadata didn't get recorded. Retry once
+      // (index writes are the most common thing to hit a transient SHA race
+      // when several uploads land close together), then degrade gracefully:
+      // report the upload as successful but flag that the folder tag failed,
+      // so the caller can tell the user rather than have the file silently
+      // end up untagged with no explanation.
+      let dirWarning = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const { data: idx, sha: idxSha } = await readIndex(uploadSess);
+          idx[safe] = { originalName: getOriginalName(rawName, safe), uploadedAt: new Date().toISOString(), size: decodedSize, dir: String(body.dir || 'root') };
+          if (body.dir && body.dir !== 'root') {
+            const folders = idx.__folders__ || [];
+            if (!folders.includes(body.dir)) idx.__folders__ = [...folders, body.dir].sort();
+          }
+          await writeIndex(uploadSess, idx, idxSha);
+          dirWarning = null;
+          break;
+        } catch (idxErr) {
+          dirWarning = idxErr?.message || 'Could not record folder tag';
+          if (attempt === 0) await new Promise(r => setTimeout(r, 300));
         }
-        await writeIndex(uploadSess, idx, idxSha);
-      } catch {}
-      return jRes({ ok:true, name:safe, size:decodedSize });
+      }
+      return jRes({ ok:true, name:safe, size:decodedSize, ...(dirWarning ? { dirWarning } : {}) });
     } catch { return jRes({ error: ERRS[502] }, 502); }
   }
   if (route === 'upload-chunk' && method === 'POST') {
@@ -1963,29 +2001,51 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       const expected = await blobTokenSign(jti, safe, b.index, b.blobSha, secret);
       if (!(await timingSafeEq(b.blobToken, expected))) return jRes({ error: ERRS[403] }, 403);
     }
+    // Phase 1: commit the actual chunk data to GitHub. A failure here is a
+    // real failure — nothing was persisted, safe to report and let the
+    // client retry the whole upload.
     try {
       if (dist) {
         await finalizeDistributedUpload(fullSess, safe, blobs, totalSize, chunkSize);
       } else {
         await finalizeChunkedUpload(finalSess, safe, blobs, totalSize, chunkSize);
       }
-      const { data: idx, sha: idxSha } = await readIndex(finalSess);
-      idx[safe] = { originalName: getOriginalName(name, safe), totalSize, totalChunks, uploadedAt: new Date().toISOString(), dir: String(dir || 'root'), ...(dist && { distributed: true, repoCount: fullSess.repos.length }) };
-      if (dir && dir !== 'root') {
-        const folders = idx.__folders__ || [];
-        if (!folders.includes(dir)) idx.__folders__ = [...folders, dir].sort();
+    } catch (err) { return errRes(request, err); }
+
+    // Phase 2: record the file + folder tag in the index. The file itself is
+    // now safely on GitHub regardless of what happens here, so a failure in
+    // this phase must NOT be reported as an upload failure — that would make
+    // the client retry a multi-chunk upload that already succeeded. Retry
+    // once, then degrade to a warning instead of an error.
+    let dirWarning = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const { data: idx, sha: idxSha } = await readIndex(finalSess);
+        idx[safe] = { originalName: getOriginalName(name, safe), totalSize, totalChunks, uploadedAt: new Date().toISOString(), dir: String(dir || 'root'), ...(dist && { distributed: true, repoCount: fullSess.repos.length }) };
+        if (dir && dir !== 'root') {
+          const folders = idx.__folders__ || [];
+          if (!folders.includes(dir)) idx.__folders__ = [...folders, dir].sort();
+        }
+        await writeIndex(finalSess, idx, idxSha);
+        dirWarning = null;
+        break;
+      } catch (idxErr) {
+        dirWarning = idxErr?.message || 'Could not record folder tag';
+        if (attempt === 0) await new Promise(r => setTimeout(r, 300));
       }
-      await writeIndex(finalSess, idx, idxSha);
-      return jRes({ ok: true, name: safe, distributed: dist, ...(dist && { repoCount: fullSess.repos.length }) });
-    } catch { return jRes({ error: ERRS[502] }, 502); }
+    }
+    return jRes({ ok: true, name: safe, distributed: dist, ...(dist && { repoCount: fullSess.repos.length }), ...(dirWarning ? { dirWarning } : {}) });
   }
   if (route === 'download' && method === 'GET') {
     const sp = new URL(request.url).searchParams;
     const nameParam = sp.get('name') || '';
-    const rIdx = parseInt(sp.get('repoIdx') || '0', 10);
     const forDownload = sp.get('inline') !== '1'; // ?inline=1 → inline preview, no attachment
     const safe = sanitize(nameParam);
     if (!safe) return jRes({ error: ERRS[400] },400);
+    // All repos are one pool — resolve which one has the file unless the
+    // caller explicitly names a repo (rare; kept for advanced/debug use).
+    const explicitRepoIdx = sp.has('repoIdx') ? parseInt(sp.get('repoIdx'), 10) : null;
+    const rIdx = await resolveFileRepoIdx(fullSess, safe, explicitRepoIdx);
     const dlSess = getRepoSess(fullSess, rIdx);
     const { ghToken, ghOwner, ghRepo, ghBranch, folder } = dlSess;
     let manifest = null, serveAs = safe;
@@ -2057,7 +2117,8 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     if (typeof name !== 'string') return jRes({ error: ERRS[400] },400);
     const safe = sanitize(name);
     if (!safe) return jRes({ error: ERRS[400] },400);
-    const delSess = getRepoSess(fullSess, Number.isInteger(delRepoIdx) ? delRepoIdx : 0);
+    const resolvedRepoIdx = await resolveFileRepoIdx(fullSess, safe, Number.isInteger(delRepoIdx) ? delRepoIdx : null);
+    const delSess = getRepoSess(fullSess, resolvedRepoIdx);
     if (chunked) {
       try {
         const { data: idx, sha: idxSha } = await readIndex(delSess);
@@ -2155,104 +2216,200 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
   if (route === 'mkdir' && method === 'POST') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
-    const { path: folderPath, repoIdx: ri } = body || {};
+    const { path: folderPath } = body || {};
     if (!folderPath || typeof folderPath !== 'string') return jRes({ error: ERRS[400] }, 400);
     const safe = folderPath.replace(/[^a-zA-Z0-9_\-]/g, '_').replace(/^_+|_+$/g, '').slice(0, 50);
     if (!safe || safe.startsWith('_')) return jRes({ error: 'Invalid folder name' }, 400);
-    const dlSess = getRepoSess(fullSess, Number.isInteger(ri) ? ri : 0);
-    try {
-      const { data: idx, sha: idxSha } = await readIndex(dlSess).catch(() => ({ data: {}, sha: null }));
+    // Folders are a unified concept across every connected repo — register
+    // the name everywhere so it's visible no matter which repo a future
+    // file in it ends up on. One repo failing doesn't fail the whole
+    // request; the folder still works, just isn't pre-registered there yet
+    // (it'll appear automatically once a file is actually tagged with it).
+    const repos = fullSess.repos || [];
+    const results = await Promise.allSettled(repos.map(async (_, i) => {
+      const sess_i = getRepoSess(fullSess, i);
+      const { data: idx, sha: idxSha } = await readIndex(sess_i);
       const folders = idx.__folders__ || [];
       if (!folders.includes(safe)) {
         idx.__folders__ = [...folders, safe].sort();
-        await writeIndex(dlSess, idx, idxSha);
+        await writeIndex(sess_i, idx, idxSha);
       }
-      return jRes({ ok: true, path: safe });
-    } catch(err) { return errRes(request, err); }
+    }));
+    const allFailed = repos.length > 0 && results.every(r => r.status === 'rejected');
+    if (allFailed) return errRes(request, results[0].reason);
+    return jRes({ ok: true, path: safe });
   }
   if (route === 'rmdir' && method === 'DELETE') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
-    const { path: folderPath, repoIdx: ri } = body || {};
+    const { path: folderPath } = body || {};
     if (!folderPath || typeof folderPath !== 'string') return jRes({ error: ERRS[400] }, 400);
-    const dlSess = getRepoSess(fullSess, Number.isInteger(ri) ? ri : 0);
-    try {
-      const { data: idx, sha: idxSha } = await readIndex(dlSess).catch(() => ({ data: {}, sha: null }));
+    // Remove the folder everywhere it exists — every file that was tagged
+    // with it (in any repo) moves back to root, nothing on GitHub is deleted.
+    const repos = fullSess.repos || [];
+    const results = await Promise.allSettled(repos.map(async (_, i) => {
+      const sess_i = getRepoSess(fullSess, i);
+      const { data: idx, sha: idxSha } = await readIndex(sess_i);
+      const hadFolder = (idx.__folders__ || []).includes(folderPath);
+      const hadFiles  = Object.keys(idx).some(k => !k.startsWith('__') && idx[k]?.dir === folderPath);
+      if (!hadFolder && !hadFiles) return; // nothing to do in this repo
       idx.__folders__ = (idx.__folders__ || []).filter(f => f !== folderPath);
       for (const key of Object.keys(idx)) {
         if (key.startsWith('__')) continue;
         if (idx[key]?.dir === folderPath) idx[key] = { ...idx[key], dir: 'root' };
       }
-      await writeIndex(dlSess, idx, idxSha);
-      return jRes({ ok: true, path: folderPath });
-    } catch(err) { return errRes(request, err); }
+      await writeIndex(sess_i, idx, idxSha);
+    }));
+    const allFailed = repos.length > 0 && results.every(r => r.status === 'rejected');
+    if (allFailed) return errRes(request, results[0].reason);
+    return jRes({ ok: true, path: folderPath });
   }
   if (route === 'move' && method === 'POST') {
     if (!sess) return jRes({ error: 'Session required' }, 403);
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] }, 400); }
-    const { name: rawName, destName: rawDest, srcRepoIdx, destRepoIdx } = body || {};
+    const { name: rawName, destName: rawDest, srcRepoIdx: rawSrcRepoIdx, destRepoIdx } = body || {};
     if (!rawName || !rawDest) return jRes({ error: ERRS[400] }, 400);
-    const srcSess  = getRepoSess(fullSess, Number.isInteger(srcRepoIdx)  ? srcRepoIdx  : 0);
-    const destSess = getRepoSess(fullSess, Number.isInteger(destRepoIdx) ? destRepoIdx : 0);
-    const safeSrc  = sanitize(String(rawName));
+    const safeSrc = sanitize(String(rawName));
     if (!safeSrc) return jRes({ error: ERRS[400] }, 400);
+    // All repos are one pool — find the file automatically unless the caller
+    // explicitly names its repo.
+    const srcRepoIdx = await resolveFileRepoIdx(fullSess, safeSrc, Number.isInteger(rawSrcRepoIdx) ? rawSrcRepoIdx : null);
+    const srcSess  = getRepoSess(fullSess, srcRepoIdx);
+    const destSess = getRepoSess(fullSess, Number.isInteger(destRepoIdx) ? destRepoIdx : srcRepoIdx);
 
-    // Detect if dest is a virtual folder name (no slash, not a filename with extension)
-    const rawDestStr  = String(rawDest).replace(/\/+$/, '');
-    const isVirtFolder = !rawDestStr.includes('/') && !rawDestStr.includes('.');
+    // Every file always lives FLAT at {folder}/{name} on GitHub — folders are
+    // virtual, just a "dir" tag in the index. So no matter how the caller
+    // writes the destination (a bare folder name, a trailing slash, a leading
+    // slash, "folder/samefilename.ext", or "repoN/..."), the only two things
+    // that can actually change are: (a) which virtual folder the file is
+    // tagged under, and (b) its filename, if the caller is renaming it.
+    // Never create a nested path on GitHub.
+    let destStr = String(rawDest).trim();
+    const repoPrefixMatch = destStr.match(/^repo(\d+)\/(.+)$/);
+    const effDestRepoIdx  = repoPrefixMatch ? parseInt(repoPrefixMatch[1], 10) : (Number.isInteger(destRepoIdx) ? destRepoIdx : srcRepoIdx);
+    if (repoPrefixMatch) destStr = repoPrefixMatch[2];
+    destStr = destStr.replace(/^\/+|\/+$/g, ''); // strip leading/trailing slashes
+    if (!destStr) destStr = 'root';
 
-    if (isVirtFolder && srcRepoIdx === destRepoIdx) {
-      // Fast path: just update the dir field in the index — no GitHub file copy needed
-      try {
-        const { data: idx, sha: idxSha } = await readIndex(srcSess).catch(() => ({ data: {}, sha: null }));
-        if (!idx[safeSrc]) return jRes({ error: 'File not found in index' }, 404);
-        idx[safeSrc] = { ...idx[safeSrc], dir: rawDestStr || 'root' };
-        // Ensure the target folder exists in __folders__
-        const folders = idx.__folders__ || [];
-        if (rawDestStr && rawDestStr !== 'root' && !folders.includes(rawDestStr))
-          idx.__folders__ = [...folders, rawDestStr].sort();
-        await writeIndex(srcSess, idx, idxSha);
-        return jRes({ ok: true, src: safeSrc, dest: rawDestStr, method: 'index-update' });
-      } catch(err) { return errRes(request, err); }
+    const lastSlash = destStr.lastIndexOf('/');
+    const hasSlash   = lastSlash >= 0;
+
+    // Three distinct shapes for destStr, each resolved differently:
+    //   "folder/file.ext" → move into folder AND rename
+    //   "folder/"  (already stripped to "folder") or "folder" with no dot
+    //             → move into folder, filename unchanged
+    //   "newname.ext" (no slash, has a dot) → rename in place, folder unchanged
+    let targetDir;   // null means "keep the file's current dir"
+    let finalNameRaw; // null means "keep the file's current name"
+
+    if (hasSlash) {
+      const destDirRaw  = destStr.slice(0, lastSlash);
+      const destBaseRaw = destStr.slice(lastSlash + 1);
+      targetDir    = destDirRaw || 'root';
+      finalNameRaw = destBaseRaw.length > 0 ? destBaseRaw : null;
+    } else if (destStr.includes('.')) {
+      // Looks like a filename (has an extension) — pure rename, folder untouched.
+      targetDir    = null;
+      finalNameRaw = destStr;
+    } else {
+      // Looks like a bare folder name (no dot) — move only, filename untouched.
+      targetDir    = destStr;
+      finalNameRaw = null;
     }
 
-    // Full path move: copy file on GitHub then update index
-    let rawDestNorm = rawDestStr;
-    if (rawDestNorm.endsWith('/')) rawDestNorm += rawName;
-    const safeDest = sanitizePath(rawDestNorm);
-    if (!safeDest) return jRes({ error: 'Invalid destination path' }, 400);
-    if (safeSrc === safeDest && srcRepoIdx === (Number.isInteger(destRepoIdx) ? destRepoIdx : 0))
-      return jRes({ error: 'Source and destination are the same' }, 400);
+    const newBaseSafe = finalNameRaw ? sanitize(finalNameRaw) : null;
+    if (finalNameRaw && !newBaseSafe) return jRes({ error: 'Invalid destination filename' }, 400);
+    const targetDirSafe = targetDir !== null
+      ? (targetDir.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 50) || 'root')
+      : null;
+
+    const effDestRepo = Number.isInteger(effDestRepoIdx) ? effDestRepoIdx : 0;
+    const effSrcRepo  = Number.isInteger(srcRepoIdx) ? srcRepoIdx : 0;
+    const sameRepo    = effSrcRepo === effDestRepo;
+    const finalName   = newBaseSafe || safeSrc;
+
+    if (sameRepo && finalName === safeSrc) {
+      // Pure tag update — no GitHub file operation at all, just the index.
+      // targetDirSafe is always non-null on this path (it's only reached
+      // when finalNameRaw was null, which never happens alongside a null dir).
+      const dirToSet = targetDirSafe ?? 'root';
+      try {
+        const { data: idx, sha: idxSha } = await readIndex(srcSess);
+        if (!idx[safeSrc]) return jRes({ error: `File not found: ${safeSrc}` }, 404);
+        idx[safeSrc] = { ...idx[safeSrc], dir: dirToSet };
+        if (dirToSet !== 'root') {
+          const folders = idx.__folders__ || [];
+          if (!folders.includes(dirToSet)) idx.__folders__ = [...folders, dirToSet].sort();
+        }
+        await writeIndex(srcSess, idx, idxSha);
+        return jRes({ ok: true, src: safeSrc, dest: finalName, dir: dirToSet, method: 'tag-update' });
+      } catch (err) { return errRes(request, err); }
+    }
+
+    // Either the filename is changing (rename) or the repo is changing —
+    // both require an actual content copy on GitHub, but ALWAYS to the flat
+    // {folder}/{finalName} path, never nested under a directory.
     try {
-      const srcUrl = 'https://raw.githubusercontent.com/' + srcSess.ghOwner + '/' + srcSess.ghRepo + '/' + srcSess.ghBranch + '/' + srcSess.folder + '/' + safeSrc;
-      const srcRes = await fetch(srcUrl, { headers: { Authorization: 'token ' + srcSess.ghToken, 'User-Agent': 'StoreGit/1' } });
-      if (!srcRes.ok) return jRes({ error: 'Source file not found: ' + safeSrc }, 404);
-      const buf  = await srcRes.arrayBuffer();
+      const { data: srcIdx, sha: srcIdxSha } = await readIndex(srcSess);
+      if (!srcIdx[safeSrc]) return jRes({ error: `File not found: ${safeSrc}` }, 404);
+
+      const rawUrl = `https://raw.githubusercontent.com/${srcSess.ghOwner}/${srcSess.ghRepo}/${srcSess.ghBranch}/${srcSess.folder}/${encodeURIComponent(safeSrc)}`;
+      let srcRes;
+      try { srcRes = await fetch(rawUrl, { headers: { Authorization: `token ${srcSess.ghToken}`, 'User-Agent': 'StoreGit/1' } }); }
+      catch { throw new GitHubError(0, 'Network error fetching source file from GitHub.', 'move'); }
+      if (!srcRes.ok) return jRes({ error: `Source file not found on GitHub: ${safeSrc}` }, 404);
+
+      const buf   = await srcRes.arrayBuffer();
       const bytes = new Uint8Array(buf);
       let bin = ''; const cs = 8192;
       for (let i = 0; i < bytes.length; i += cs) bin += String.fromCharCode(...bytes.subarray(i, i + cs));
       const b64 = btoa(bin);
-      await uploadSmall(destSess, safeDest, b64);
-      const { data: idx, sha: idxSha } = await readIndex(srcSess).catch(() => ({ data: {}, sha: null }));
-      if (idx[safeSrc]) {
-        const { data: destIdx, sha: destIdxSha } = srcRepoIdx === destRepoIdx
-          ? { data: idx, sha: idxSha }
-          : await readIndex(destSess).catch(() => ({ data: {}, sha: null }));
-        destIdx[safeDest] = { ...idx[safeSrc], originalName: rawDestNorm };
+
+      await uploadSmall(destSess, finalName, b64);
+
+      // targetDirSafe is null on a pure rename ("newname.ext", no slash) —
+      // keep the file's existing dir tag in that case.
+      const dirToSet   = targetDirSafe ?? (srcIdx[safeSrc].dir || 'root');
+      const movedEntry = {
+        ...srcIdx[safeSrc],
+        originalName: finalNameRaw ? finalNameRaw : (srcIdx[safeSrc].originalName || safeSrc),
+        dir: dirToSet,
+      };
+
+      if (sameRepo) {
+        // Single object, single write: add the new key, remove the old one,
+        // update __folders__ — all before the one and only writeIndex call.
+        srcIdx[finalName] = movedEntry;
+        delete srcIdx[safeSrc];
+        if (dirToSet !== 'root') {
+          const folders = srcIdx.__folders__ || [];
+          if (!folders.includes(dirToSet)) srcIdx.__folders__ = [...folders, dirToSet].sort();
+        }
+        await writeIndex(srcSess, srcIdx, srcIdxSha);
+      } else {
+        // Two separate repos, two separate index files — safe to write independently.
+        const { data: destIdx, sha: destIdxSha } = await readIndex(destSess);
+        destIdx[finalName] = movedEntry;
+        if (dirToSet !== 'root') {
+          const folders = destIdx.__folders__ || [];
+          if (!folders.includes(dirToSet)) destIdx.__folders__ = [...folders, dirToSet].sort();
+        }
         await writeIndex(destSess, destIdx, destIdxSha);
-        delete idx[safeSrc];
-        try { await writeIndex(srcSess, idx, idxSha); } catch {}
+        delete srcIdx[safeSrc];
+        try { await writeIndex(srcSess, srcIdx, srcIdxSha); } catch {}
       }
-      // Delete source
-      const delUrl = 'https://api.github.com/repos/' + srcSess.ghOwner + '/' + srcSess.ghRepo + '/contents/' + srcSess.folder + '/' + safeSrc;
-      const shaRes = await fetch(delUrl + '?ref=' + srcSess.ghBranch, { headers: ghH(srcSess.ghToken) });
-      if (shaRes.ok) {
+
+      // Delete the old GitHub blob (flat path — never nested)
+      const delUrl = `https://api.github.com/repos/${srcSess.ghOwner}/${srcSess.ghRepo}/contents/${srcSess.folder}/${encodeURIComponent(safeSrc)}`;
+      const shaRes = await fetch(`${delUrl}?ref=${srcSess.ghBranch}`, { headers: ghH(srcSess.ghToken) }).catch(() => null);
+      if (shaRes && shaRes.ok) {
         const { sha: fileSha } = await shaRes.json();
         await fetch(delUrl, { method: 'DELETE', headers: ghH(srcSess.ghToken),
-          body: JSON.stringify({ message: 'mv ' + safeSrc, sha: fileSha, branch: srcSess.ghBranch }) });
+          body: JSON.stringify({ message: `mv ${safeSrc} -> ${finalName}`, sha: fileSha, branch: srcSess.ghBranch }) }).catch(() => {});
       }
-      return jRes({ ok: true, src: safeSrc, dest: safeDest, method: 'file-copy' });
-    } catch(err) { return errRes(request, err); }
+
+      return jRes({ ok: true, src: safeSrc, dest: finalName, dir: dirToSet, method: 'rename' });
+    } catch (err) { return errRes(request, err); }
   }
 
   return jRes({ error: ERRS[404] }, 404);
