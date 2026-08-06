@@ -1785,11 +1785,6 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     return jRes({ url, exp });
   }
   if (route === 'files' && method === 'GET') {
-    // Every connected repo is one unified storage pool from the caller's
-    // point of view — this always returns the combined view. repoIdx is
-    // internal plumbing kept on each file only so other routes (download,
-    // delete, move, ...) can resolve it automatically; callers never need
-    // to know or pass it themselves.
     async function listOneRepo(targetSess) {
       const [regular, { data: idx }] = await Promise.all([
         listFiles(targetSess),
@@ -1800,7 +1795,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
         .filter(([k, info]) => !k.startsWith('__') && info.totalChunks)
         .map(([name, info]) => ({
           name, originalName: info.originalName || unwrapName(name),
-          size: info.totalSize, sha: '', chunked: true,
+          size: info.totalSize, humanSize: formatBytes(info.totalSize || 0), sha: '', chunked: true,
           distributed: info.distributed || false, repoCount: info.repoCount || 1,
           parts: info.totalChunks, uploadedAt: info.uploadedAt || null,
           dir: info.dir || 'root',
@@ -1811,6 +1806,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
         .map(f => ({
           ...f,
           originalName: idx[f.name]?.originalName || unwrapName(f.name),
+          humanSize:    formatBytes(f.size || 0),
           uploadedAt:   idx[f.name]?.uploadedAt   || null,
           chunked:      false,
           dir:          idx[f.name]?.dir           || 'root',
@@ -1819,7 +1815,32 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       return { files, folders };
     }
 
+    const url = new URL(request.url);
+    const hasRepoIdx = url.searchParams.has('repoIdx');
+
     try {
+      if (hasRepoIdx) {
+        // Scoped to exactly one repo — a single GitHub round-trip, no fan-out.
+        // Used internally by the CLI/web when looping repo-by-repo, and by
+        // any direct API caller that already knows which repo it wants.
+        const qRepoIdx = parseInt(url.searchParams.get('repoIdx') ?? '', 10);
+        const targetSess = (!isNaN(qRepoIdx) && qRepoIdx >= 0 && qRepoIdx < fullSess.repos.length)
+          ? getRepoSess(fullSess, qRepoIdx)
+          : fullSess;
+        const { files, folders } = await listOneRepo(targetSess);
+        const sorted = files.sort((a, b) => {
+          if (!a.uploadedAt && !b.uploadedAt) return 0;
+          if (!a.uploadedAt) return 1;
+          if (!b.uploadedAt) return -1;
+          return new Date(b.uploadedAt) - new Date(a.uploadedAt);
+        });
+        return jRes({ files: sorted, folders });
+      }
+
+      // No repoIdx — aggregate every connected repo into one unified view.
+      // Every file and folder is tagged with its repoIdx/repoLabel so other
+      // routes (download, delete, move, ...) can resolve it automatically;
+      // callers never need to pass repoIdx themselves when using this mode.
       const repos = fullSess.repos || [];
       const results = await Promise.all(
         repos.map(async (r, i) => {
