@@ -14,7 +14,12 @@ export function buildFileRow(f) {
   const nm   = elem('div', 'file-name'); nm.textContent = displayName; nm.title = displayName;
   const date = fmtDate(f.uploadedAt);
   const mt   = elem('div', 'file-meta');
-  mt.textContent = date ? `${fmtSize(f.size)} · ${date}` : fmtSize(f.size);
+  // Storage is unified across every connected repo, so the same filename can
+  // legitimately exist in more than one repo — show which one this entry is
+  // from whenever more than one repo is connected, so that isn't confused
+  // for a duplicate.
+  const repoTag = (state.allRepos.length > 1 && f.repoLabel) ? ` · ${f.repoLabel}` : '';
+  mt.textContent = (date ? `${fmtSize(f.size)} · ${date}` : fmtSize(f.size)) + repoTag;
   const chev = elem('div', 'file-chevron');
   chev.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><polyline points="9 18 15 12 9 6"/></svg>';
   info.append(nm, mt);
@@ -31,24 +36,37 @@ export async function loadFiles(force = false) {
   }
   el.innerHTML = '<div class="loading-row"><span class="spinner"></span> Loading…</div>';
   try {
-    // Server returns { files: [...], folders: [...] } — always pass repoIdx
-    // explicitly, even for the single-repo case, otherwise omitting it
-    // triggers the server's all-repos aggregate mode (different folder shape).
     if (state.allRepos.length <= 1) {
+      // Single repo — pass repoIdx explicitly for the scoped (non-aggregate) shape.
       const r = await fetch('/api/files?repoIdx=0', { credentials: 'same-origin' });
       if (r.status === 401) { window.location.replace('/'); return; }
       if (!r.ok) throw new Error();
       const d = await r.json();
       state.repoFiles = [{ repo: state.allRepos[0] || null, repoIdx: 0, files: d.files || [], folders: d.folders || [] }];
     } else {
-      const results = await Promise.allSettled(
-        state.allRepos.map((repo, i) =>
-          fetch(`/api/files?repoIdx=${i}`, { credentials: 'same-origin' })
-            .then(r => { if (r.status === 401) { window.location.replace('/'); throw new Error(); } return r.json(); })
-            .then(d => ({ repo, repoIdx: i, files: d.files || [], folders: d.folders || [] }))
-        )
-      );
-      state.repoFiles = results.filter(r => r.status === 'fulfilled').map(r => r.value);
+      // Multiple repos — one aggregate request instead of N separate ones.
+      // Each file/folder in the response is already tagged with repoIdx, so
+      // just regroup them back into per-repo buckets for the rest of the UI.
+      const r = await fetch('/api/files', { credentials: 'same-origin' });
+      if (r.status === 401) { window.location.replace('/'); return; }
+      if (!r.ok) throw new Error();
+      const d = await r.json();
+      const byRepo = new Map(state.allRepos.map((repo, i) => [i, { repo, repoIdx: i, files: [], folders: [] }]));
+      for (const f of (d.files || [])) {
+        const bucket = byRepo.get(f.repoIdx ?? 0);
+        if (bucket) bucket.files.push(f);
+      }
+      for (const fo of (d.folders || [])) {
+        // Aggregate folders are plain deduped names — attach to every repo
+        // bucket that actually reports having files with that dir tag, or
+        // fall back to repo 0 if none do (an empty folder created there).
+        let placed = false;
+        for (const bucket of byRepo.values()) {
+          if (bucket.files.some(f => (f.dir || 'root') === fo)) { bucket.folders.push(fo); placed = true; }
+        }
+        if (!placed) byRepo.get(0)?.folders.push(fo);
+      }
+      state.repoFiles = [...byRepo.values()];
     }
     state.filesCachedAt = Date.now();
     renderFiles();
