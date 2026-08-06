@@ -18,6 +18,8 @@
 3. [Security Model](#security-model)
 4. [API Key System](#api-key-system)
 5. [REST API Reference](#rest-api-reference)
+   - [Files](#files)
+   - [Folders](#folders)
 6. [Deployment](#deployment)
 7. [Environment Variables](#environment-variables)
 8. [KV Namespace](#kv-namespace)
@@ -59,11 +61,12 @@ File content never touches Cloudflare KV. KV stores only:
 ## Features
 
 - **Upload / download / delete** — GitHub Contents API for files up to ~50 MB; Git Data API (chunked) for files up to ~5 GB
+- **Folders** — lightweight, index-only: a name list plus a `dir` field per file; no GitHub directories or marker files are created
 - **Multiple repositories** per account — all repos loaded in parallel; files unified into one list with per-repo section headers
 - **Chunked upload** — files above the single-call limit are split into ~14 MB base64 blobs, each committed as a separate blob ref, reassembled on download with SHA verification
 - **Shareable links** — HMAC-SHA-256 signed tokens with configurable expiry (1 hr / 24 hr / 7 days / `ttl=0` = never); shortened to 3–5 char IDs via KV
 - **Share-page previews** — images rendered via `<img>`, video/audio via `<video>`/`<audio>`, text/code fetched and displayed in a `<pre>` block (first 10 KB)
-- **API key system** — 256-bit CSPRNG keys (`sgk_<43 Base64URL chars>`), SHA-256 hashed before KV storage, raw key never persisted, per-origin CORS restriction, 120 req/min rate limit per key
+- **API key system** — 256-bit CSPRNG keys (`sgk_<43 Base64URL chars>`), SHA-256 hashed, stored only in git (registry repo + the user's own repo) — no KV, no migration step
 - **Security middleware** — CSP, HSTS, CORS, bot-blocking, path-traversal rejection, and per-IP rate limiting enforced on every request before any route handler runs
 - **Session JWTs** — HMAC-SHA-256, 192-bit JTI, `HttpOnly; Secure; SameSite=Strict` cookie, auto-refresh within 1 hr of expiry, KV-backed revocation
 - **Upload queue** — concurrent multi-file upload with per-file retry, pause/resume, survives page refresh
@@ -126,18 +129,31 @@ sgk_<43 Base64URL characters>
 | Encoding | RFC 4648 §5, bias-free rejection sampling |
 | Total length | `sgk_` + 43 = **47 characters** |
 
-### Storage — hashed keys, never raw
+### Storage — hashed keys, never raw, always on git
 
-Raw keys are **never stored anywhere**. Only their SHA-256 digest is used as the KV lookup key:
+Raw keys are **never stored anywhere**. Only their SHA-256 digest is used to
+locate the key record. There is no KV storage for API keys and no migration
+step — keys are written straight to git on creation and read straight from
+git on every request.
+
+Two git-backed copies are kept, both keyed by the hash:
 
 ```
-KV key:   "apikey:sha256:<SHA-256(rawKey) as hex>"
-KV value: { username, label, allowedOrigins, keyId }
+Registry repo (lookup index):
+  keys/{sha256[0:2]}/{sha256hex}.json → { username, keyId, label, allowedOrigins }
+
+User's own repo (authoritative copy):
+  {folder}/.sgkeys/{sha256[0:2]}/{sha256hex}.json → { username, keyId, label, allowedOrigins, createdAt }
 ```
 
-Even if KV were fully compromised, no raw keys could be reconstructed.
+The registry entry is what makes it possible to resolve a raw key to its
+owning user without already knowing the username — a random key by itself
+carries no identity, so a lookup index is unavoidable. The user's own repo
+copy is what the user actually owns and can inspect or back up themselves.
 
-The `encKey` field in the user record stores the raw key encrypted with AES-GCM (keyed from `APP_SECRET`) so that revocation can recompute the hash and clean up the KV entry.
+The `encKey` field in the user record stores the raw key encrypted with
+AES-GCM (keyed from `APP_SECRET`) so that revocation can recompute the hash
+and clean up both copies.
 
 ### Origin binding
 
@@ -200,32 +216,84 @@ Returns current user info. Available with API key.
 
 ### Files
 
-#### `GET /api/files`
 #### `GET /api/files?repoIdx=<n>`
 
-List files in the active repo (or a specific repo by index without mutating session state).
+List files and folders in one specific repo by index, without mutating
+session state.
 
 ```json
-[
-  {
-    "name": "report_2025.pdf",
-    "originalName": "report 2025.pdf",
-    "size": 204800,
-    "sha": "abc123…",
-    "chunked": false,
-    "uploadedAt": "2025-01-01T00:00:00.000Z"
-  }
-]
+{
+  "files": [
+    {
+      "name": "report_2025.pdf",
+      "originalName": "report 2025.pdf",
+      "size": 204800,
+      "sha": "abc123…",
+      "chunked": false,
+      "dir": "root",
+      "uploadedAt": "2025-01-01T00:00:00.000Z"
+    },
+    {
+      "name": "invoice.pdf",
+      "originalName": "invoice.pdf",
+      "size": 51200,
+      "sha": "def456…",
+      "chunked": false,
+      "dir": "docs",
+      "uploadedAt": "2025-01-02T00:00:00.000Z"
+    }
+  ],
+  "folders": ["docs"]
+}
 ```
+
+`dir` is `"root"` for files not in any folder, otherwise the folder name.
+`folders` is a plain list of every folder name that currently exists in
+this repo, including empty ones.
+
+#### `GET /api/files`  (no `repoIdx`)
+
+Aggregates every connected repo into a single response. Each file and
+folder is tagged with the repo it came from, and a `repos` summary lists
+every repo that was queried (with an `error` field for any repo that
+failed to list, so one broken repo doesn't fail the whole request).
+
+```json
+{
+  "files": [
+    {
+      "name": "report_2025.pdf", "originalName": "report 2025.pdf",
+      "size": 204800, "sha": "abc123…", "chunked": false, "dir": "root",
+      "uploadedAt": "2025-01-01T00:00:00.000Z",
+      "repoIdx": 0, "repoLabel": "Storage"
+    }
+  ],
+  "folders": [
+    { "name": "docs", "repoIdx": 0, "repoLabel": "Storage" },
+    { "name": "photos", "repoIdx": 1, "repoLabel": "Backups" }
+  ],
+  "repos": [
+    { "repoIdx": 0, "repoLabel": "Storage" },
+    { "repoIdx": 1, "repoLabel": "Backups" }
+  ]
+}
+```
+
+Note the `folders` shape differs between the two modes: a plain string
+array when `repoIdx` is given, an array of `{ name, repoIdx, repoLabel }`
+objects when it's omitted. Clients that need a consistent shape should
+always pass `repoIdx` explicitly and loop over repos themselves, or accept
+the tagged object form when calling without it.
 
 #### `POST /api/upload`
 Upload a file. Content must be Base64-encoded:
 ```json
-{ "name": "notes.txt", "content": "<base64>" }
+{ "name": "notes.txt", "content": "<base64>", "dir": "docs" }
 ```
+`dir` is optional — omit it or send `"root"` to upload to the top level.
 Returns `{ ok: true, name: "notes.txt", size: 1234 }`.
 
-Files larger than the single-call limit are automatically uploaded in chunks. The client handles this transparently.
+Files larger than the single-call limit are automatically uploaded in chunks. The client handles this transparently — pass `dir` to `POST /api/finalize-upload` the same way.
 
 #### `GET /api/download?name=<filename>`
 Streams the file content. For chunked files, streams all parts in order with integrity verification.
@@ -237,6 +305,38 @@ Available with API key. Use the `X-API-Key` header.
 { "name": "notes.txt", "sha": "abc123…", "chunked": false }
 ```
 For chunked files, set `"chunked": true` and omit `sha`.
+
+---
+
+### Folders
+
+Folders are lightweight — a name plus a `dir` field on each file, tracked in
+the repo's index JSON. No GitHub directories or marker files are created.
+
+#### `POST /api/mkdir`
+```json
+{ "path": "docs", "repoIdx": 0 }
+```
+Adds `"docs"` to the folder list. Folder names are sanitised to
+`[a-zA-Z0-9_-]`, max 50 characters, no nesting (flat namespace).
+
+#### `DELETE /api/rmdir`
+```json
+{ "path": "docs", "repoIdx": 0 }
+```
+Removes the folder from the list. Any files that were in it move back to
+`root` — nothing on GitHub is deleted.
+
+#### `POST /api/move`
+```json
+{ "name": "notes.txt", "destName": "docs", "srcRepoIdx": 0, "destRepoIdx": 0 }
+```
+Two behaviours depending on `destName`:
+- **Plain folder name** (e.g. `"docs"`, `"root"`, no dot, no slash) and same
+  source/destination repo → fast path, only the index is updated, no GitHub
+  file operations.
+- **Anything else** (contains a slash, or moving across repos) → the file is
+  copied to the destination path on GitHub and the original deleted.
 
 ---
 
@@ -284,6 +384,10 @@ Any repository can be removed. The only restriction is that you must have at lea
 ```json
 { "label": "My Blog", "allowedOrigins": ["https://myblog.com"] }
 ```
+Writes the key to the registry (lookup index) and the user's own repo
+(authoritative copy) before returning. If either write fails, the other is
+rolled back — a key is never left half-written.
+
 Returns:
 ```json
 { "ok": true, "rawKey": "sgk_…", "keyId": "…", "preview": "sgk_AAAA…zzzz",
@@ -295,6 +399,7 @@ Returns:
 ```json
 { "keyId": "abc123" }
 ```
+Deletes the key from both the registry and the user's own repo.
 
 ---
 
@@ -403,11 +508,11 @@ const KEY  = 'sgk_…';                      // your API key
 **List all files**
 
 ```js
-const files = await fetch(`${BASE}/api/files`, {
+const { files, folders } = await fetch(`${BASE}/api/files`, {
   headers: { 'X-API-Key': KEY }
 }).then(r => r.json());
 
-// Result:
+// files:
 // [
 //   {
 //     name:         "2025-01-15_meeting-notes.md",  // filename in GitHub
@@ -415,10 +520,14 @@ const files = await fetch(`${BASE}/api/files`, {
 //     size:         2048,                            // bytes
 //     sha:          "a1b2c3…",                       // Git blob SHA — needed to delete
 //     chunked:      false,                           // true for files > ~50 MB
+//     dir:          "root",                          // "root" or a folder name
 //     uploadedAt:   "2025-01-15T10:30:00.000Z"
 //   },
 //   …
 // ]
+//
+// folders:
+// ["docs", "photos"]   // every folder name that exists, including empty ones
 ```
 
 **Save a text file**
@@ -639,9 +748,10 @@ async function loadFiles() {
   const list = document.getElementById('file-list');
 
   if (!res.ok) { list.innerHTML = `<p style="color:red">Error: ${data.error}</p>`; return; }
-  if (!data.length) { list.innerHTML = '<p>No files yet.</p>'; return; }
+  const files = data.files || [];
+  if (!files.length) { list.innerHTML = '<p>No files yet.</p>'; return; }
 
-  list.innerHTML = data.map(f => `
+  list.innerHTML = files.map(f => `
     <div class="file-row">
       <span>${f.originalName ?? f.name} &nbsp;<small>${(f.size/1024).toFixed(1)} KB</small></span>
       <div>
@@ -734,6 +844,13 @@ When creating a key for production, always set `allowedOrigins` to your exact do
 Building something with StoreGit? Open a PR to add it to this list.
 
 ## Changelog
+
+### v3.0.0
+
+- **Folders** — `POST /api/mkdir`, `DELETE /api/rmdir`, folder-aware `POST /api/move`; folders are a name list plus a `dir` field per file, both stored in the repo's index JSON; no GitHub directories or marker files (`.gitkeep`, `.storegit`) are created; `GET /api/files` now returns `{ files, folders }` instead of a bare array
+- **`GET /api/files` aggregates all repos when `repoIdx` is omitted** — previously omitting it silently returned only the active repo; now it fetches every connected repo in parallel and returns a merged, tagged result (`repoIdx`/`repoLabel` on each file and folder, plus a `repos` summary). Pass `repoIdx` explicitly to get the original single-repo shape
+- **API keys now git-only** — removed all KV storage for keys; removed `POST /api/apikeys/migrate` entirely (no longer needed — there is nothing to migrate from). Keys are written to the registry repo (lookup index) and the user's own repo (authoritative copy) on creation, with automatic rollback if either write fails
+- **`errRes` helper added** — every GitHub-API-backed route (`mkdir`, `rmdir`, `move`, and others) now returns a proper JSON error with the right status code instead of an unhandled exception surfacing as a generic 500
 
 ### v2.0.0
 
