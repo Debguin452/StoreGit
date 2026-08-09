@@ -412,12 +412,17 @@ export function showCreateFolderModal(afterCreate = null) {
   showModalHtml(
     'New Folder',
     `<label class="modal-field-label">Folder name</label>
-     <input id="new-folder-name" class="modal-input" placeholder="e.g. photos" autocomplete="off">`,
+     <input id="new-folder-name" class="modal-input" placeholder="e.g. photos" autocomplete="off">
+     <div id="new-folder-error" class="modal-field-error" hidden></div>`,
     'Create', 'btn-primary',
     async () => {
-      const name = document.getElementById('new-folder-name')?.value?.trim();
-      if (!name) return;
+      const input    = document.getElementById('new-folder-name');
+      const errEl    = document.getElementById('new-folder-error');
+      const showErr  = msg => { errEl.textContent = msg; errEl.hidden = false; input?.focus(); };
+      const name = input?.value?.trim();
+      if (!name) { showErr('Enter a folder name.'); return false; }
       const safe = name.replace(/[^a-zA-Z0-9_\-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 50);
+      if (!safe) { showErr('That name has no valid characters — try letters, numbers, - or _.'); return false; }
       try {
         // Folders are unified across every connected repo — no repoIdx needed.
         const r = await fetch('/api/mkdir', {
@@ -425,9 +430,19 @@ export function showCreateFolderModal(afterCreate = null) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: safe }),
         });
-        if (r.ok) { toast(`Folder "${safe}" created.`, 'ok'); loadFiles(true); if (afterCreate) afterCreate(safe); }
-        else { const d = await r.json().catch(()=>{}); toast(d?.error || 'Failed to create folder.', 'error'); }
-      } catch { toast('Connection error.', 'error'); }
+        if (r.ok) {
+          toast(`Folder "${safe}" created.`, 'ok');
+          loadFiles(true);
+          if (afterCreate) afterCreate(safe);
+          return true;
+        }
+        const d = await r.json().catch(() => ({}));
+        showErr(d?.error || 'Failed to create folder.');
+        return false;
+      } catch {
+        showErr('Connection error — check your network and try again.');
+        return false;
+      }
     }
   );
   setTimeout(() => document.getElementById('new-folder-name')?.focus(), 80);
@@ -479,9 +494,14 @@ export function moveFileToFolderUI(f) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ name: f.name, destName: dest, srcRepoIdx: f._repoIdx ?? 0, destRepoIdx: f._repoIdx ?? 0 }),
         });
-        if (r.ok) { toast('File moved.', 'ok'); loadFiles(true); }
-        else { const d = await r.json().catch(()=>({})); toast(d?.error || 'Move failed.', 'error'); }
-      } catch { toast('Connection error.', 'error'); }
+        if (r.ok) { toast('File moved.', 'ok'); loadFiles(true); return true; }
+        const d = await r.json().catch(() => ({}));
+        toast(d?.error || 'Move failed.', 'error');
+        return false;
+      } catch {
+        toast('Connection error.', 'error');
+        return false;
+      }
     }
   );
   setTimeout(() => {

@@ -40,7 +40,18 @@ export function showModalHtml(title, htmlContent, confirmLabel, confirmClass, on
   confirmBtn.className   = 'btn ' + confirmClass;
   overlay.classList.add('open');
   const close = () => { overlay.classList.remove('open'); document.getElementById('modal-msg').innerHTML = ''; };
-  confirmBtn.onclick = () => { close(); onConfirm(); };
+  // onConfirm can return `false` (or a Promise resolving to `false`) to keep
+  // the modal open — used for inline validation errors, e.g. an empty name.
+  // Any other return value (including undefined) closes as before.
+  confirmBtn.onclick = async () => {
+    confirmBtn.disabled = true;
+    try {
+      const result = await onConfirm();
+      if (result !== false) close();
+    } finally {
+      confirmBtn.disabled = false;
+    }
+  };
   document.getElementById('modal-cancel-btn').onclick = close;
   overlay.onclick = e => { if (e.target === overlay) close(); };
 }
