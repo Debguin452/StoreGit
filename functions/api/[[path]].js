@@ -2356,8 +2356,26 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       const dirToSet = targetDirSafe ?? 'root';
       try {
         const { data: idx, sha: idxSha } = await readIndex(srcSess);
-        if (!idx[safeSrc]) return jRes({ error: `File not found: ${safeSrc}` }, 404);
-        idx[safeSrc] = { ...idx[safeSrc], dir: dirToSet };
+        if (!idx[safeSrc]) {
+          // No index entry yet — this happens for files uploaded before the
+          // folder/dir-tagging system existed, or whose index write silently
+          // failed at upload time. The file itself may still be perfectly
+          // real on GitHub, so check for that before giving up: a missing
+          // index entry should self-heal, not block the user from tagging
+          // a file they can clearly see and open.
+          const checkUrl = `https://api.github.com/repos/${encodeURIComponent(srcSess.ghOwner)}/${encodeURIComponent(srcSess.ghRepo)}/contents/${encodeURIComponent(srcSess.folder)}/${encodeURIComponent(safeSrc)}?ref=${encodeURIComponent(srcSess.ghBranch)}`;
+          let fileMeta;
+          try {
+            const checkRes = await fetch(checkUrl, { headers: ghH(srcSess.ghToken) });
+            if (!checkRes.ok) return jRes({ error: `File not found: ${safeSrc}` }, 404);
+            fileMeta = await checkRes.json();
+          } catch {
+            return jRes({ error: `File not found: ${safeSrc}` }, 404);
+          }
+          idx[safeSrc] = { originalName: safeSrc, uploadedAt: null, size: fileMeta.size ?? null, dir: dirToSet };
+        } else {
+          idx[safeSrc] = { ...idx[safeSrc], dir: dirToSet };
+        }
         if (dirToSet !== 'root') {
           const folders = idx.__folders__ || [];
           if (!folders.includes(dirToSet)) idx.__folders__ = [...folders, dirToSet].sort();
@@ -2372,7 +2390,12 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     // {folder}/{finalName} path, never nested under a directory.
     try {
       const { data: srcIdx, sha: srcIdxSha } = await readIndex(srcSess);
-      if (!srcIdx[safeSrc]) return jRes({ error: `File not found: ${safeSrc}` }, 404);
+      // No hard "not in index" bail-out here — files uploaded before the
+      // dir-tagging system existed can be real on GitHub with no index
+      // entry at all. The raw fetch just below is the actual existence
+      // check; fall back to a synthesized entry so those files can still
+      // be renamed/moved instead of being permanently stuck.
+      if (!srcIdx[safeSrc]) srcIdx[safeSrc] = { originalName: safeSrc, uploadedAt: null, size: null, dir: 'root' };
 
       const rawUrl = `https://raw.githubusercontent.com/${srcSess.ghOwner}/${srcSess.ghRepo}/${srcSess.ghBranch}/${srcSess.folder}/${encodeURIComponent(safeSrc)}`;
       let srcRes;
