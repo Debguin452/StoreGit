@@ -956,12 +956,30 @@ async function getStorageFromIndex(sess) {
 }
 async function createBlob(sess, b64Content) {
   const { ghToken, ghOwner, ghRepo } = sess;
-  const res = await fetch(
-    `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/git/blobs`,
-    { method:'POST', headers: ghH(ghToken), body: JSON.stringify({ content: b64Content, encoding:'base64' }) }
-  );
-  if (!res.ok) throw new Error('blob_fail');
-  return (await res.json()).sha;
+  const url = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/git/blobs`;
+  let lastErr;
+  // Blob creation over a mobile connection genuinely hits transient GitHub
+  // 5xx/network blips often enough to be worth one retry before surfacing
+  // an error — this is the single call every chunk upload depends on.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let res;
+    try {
+      res = await fetch(url, { method:'POST', headers: ghH(ghToken), body: JSON.stringify({ content: b64Content, encoding:'base64' }) });
+    } catch (e) {
+      lastErr = new GitHubError(0, 'Network error creating file blob on GitHub — please try again.', 'createBlob');
+      if (attempt === 0) { await new Promise(r => setTimeout(r, 500)); continue; }
+      throw lastErr;
+    }
+    if (res.ok) return (await res.json()).sha;
+    const msg = await ghErrMsg(res, 'Failed to create file blob on GitHub');
+    lastErr = new GitHubError(res.status, msg, 'createBlob');
+    if (attempt === 0 && (res.status >= 500 || res.status === 429)) {
+      await new Promise(r => setTimeout(r, 500));
+      continue;
+    }
+    throw lastErr;
+  }
+  throw lastErr;
 }
 // Commit one blob as its own commit; retries on 422 (parallel chunk race on same repo)
 async function commitFileToRepo(sess, filePath, blobSha, message, maxRetries = COMMIT_RETRY_MAX) {
@@ -1010,13 +1028,23 @@ async function uploadSmall(sess, filename, b64) {
   const { ghToken, ghOwner, ghRepo, ghBranch, folder } = sess;
   const url = `https://api.github.com/repos/${encodeURIComponent(ghOwner)}/${encodeURIComponent(ghRepo)}/contents/${encodeURIComponent(folder)}/${encodeURIComponent(filename)}`;
   let sha = null;
-  const chk = await fetch(`${url}?ref=${ghBranch}`, { headers: ghH(ghToken) });
-  if (chk.ok) sha = (await chk.json()).sha;
-  const res = await fetch(url, {
-    method:'PUT', headers: ghH(ghToken),
-    body: JSON.stringify({ message:`Upload ${filename}`, content: b64, branch: ghBranch, ...(sha?{sha}:{}) }),
-  });
-  if (!res.ok) throw new Error('upload_fail');
+  try {
+    const chk = await fetch(`${url}?ref=${ghBranch}`, { headers: ghH(ghToken) });
+    if (chk.ok) sha = (await chk.json()).sha;
+  } catch { /* not fatal — a missing sha just means this is a new file */ }
+  let res;
+  try {
+    res = await fetch(url, {
+      method:'PUT', headers: ghH(ghToken),
+      body: JSON.stringify({ message:`Upload ${filename}`, content: b64, branch: ghBranch, ...(sha?{sha}:{}) }),
+    });
+  } catch {
+    throw new GitHubError(0, 'Network error uploading file to GitHub — please try again.', 'uploadSmall');
+  }
+  if (!res.ok) {
+    const msg = await ghErrMsg(res, 'Failed to upload file to GitHub');
+    throw new GitHubError(res.status, msg, 'uploadSmall');
+  }
 }
 // Single batch commit: all chunk blobs + manifest in ONE tree commit per repo.
 // Previously this only committed the manifest (chunks were committed one-by-one during upload).
@@ -1627,7 +1655,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     repos.push({ label: String(label).slice(0,40), ghOwner, ghRepo, ghBranch, folder });
     const updated = { ...user, repos };
     try { await writeReg(userPath(sess.username), updated, `Add repo ${ghOwner}/${ghRepo}`, env, userSha); }
-    catch { return jRes({ error: ERRS[502] }, 502); }
+    catch (err) { return errRes(request, err); }
     if (kv) await kv.delete(`sess_cache:${sess.jti}`).catch(() => {});
     _sessCache.delete(`sess_cache:${sess.jti}`);
     return jRes({ ok:true, repos: repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo })) });
@@ -1646,7 +1674,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     repos.splice(repoIdx, 1);
     const updated = { ...user, repos };
     try { await writeReg(userPath(sess.username), updated, `Remove repo ${repoIdx}`, env, userSha); }
-    catch { return jRes({ error: ERRS[502] }, 502); }
+    catch (err) { return errRes(request, err); }
     if (kv) await kv.delete(`sess_cache:${sess.jti}`).catch(() => {});
     _sessCache.delete(`sess_cache:${sess.jti}`);
     return jRes({ ok: true, repos: repos.map(r => ({ label: r.label, ghOwner: r.ghOwner, ghRepo: r.ghRepo })) });
@@ -1740,7 +1768,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
     }
     const updated = { ...user, apiKeys: existing.filter(k => k.keyId !== keyId) };
     try { await writeReg(userPath(sess.username), updated, `Revoke API key: ${target.label}`, env, userSha); }
-    catch { return jRes({ error: ERRS[502] }, 502); }
+    catch (err) { return errRes(request, err); }
     return jRes({ ok: true });
   }
 
@@ -1928,7 +1956,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
         }
       }
       return jRes({ ok:true, name:safe, size:decodedSize, ...(dirWarning ? { dirWarning } : {}) });
-    } catch { return jRes({ error: ERRS[502] }, 502); }
+    } catch (err) { return errRes(request, err); }
   }
   if (route === 'upload-chunk' && method === 'POST') {
     if (!(request.headers.get('Content-Type')||'').includes('application/json')) return jRes({ error: ERRS[400] },400);
@@ -1980,7 +2008,7 @@ async function _dispatchRoute(route, method, request, env, fullSess, sess, secre
       const blobSha = await createBlob(targetSess, b64);
       const blobToken = await blobTokenSign(jti, safe, chunkIdx, blobSha, secret);
       return jRes({ ok: true, blobSha, blobToken, index: chunkIdx, size: decodedSize, repoIdx: resolvedRepoIdx, distributed: dist });
-    } catch { return jRes({ error: ERRS[502] }, 502); }
+    } catch (err) { return errRes(request, err); }
   }
   if (route === 'finalize-upload' && method === 'POST') {
     let body; try { body = await request.json(); } catch { return jRes({ error: ERRS[400] },400); }
