@@ -441,6 +441,7 @@ body.files-body .app-footer { margin-top: auto; }
 .folder-chip:hover { background:var(--surface-3,#252840); }
 .folder-chip.active { background:var(--accent,#7c6aff); border-color:var(--accent,#7c6aff); color:#fff; }
 .modal-field-label { color:var(--text-secondary,#888); font-size:.82rem; margin:0 0 6px; display:block; }
+.modal-field-error { color:var(--danger,#f87171); font-size:.82rem; margin-top:8px; }
 .repo-item { display: flex; align-items: center; justify-content: space-between; gap: .5rem; padding: .7rem 0; border-bottom: 1px solid #f0f4ff; }
 .repo-item:last-child { border-bottom: none; }
 .repo-item-info { flex: 1; min-width: 0; }
