@@ -48,7 +48,6 @@ function precacheSlices(file) {
 })();
 
 async function bootApp(me) {
-  fetch('/api/apikeys/migrate', { method: 'POST', credentials: 'same-origin' }).catch(() => {});
   await loadMeta();
   loadFiles();
 }
