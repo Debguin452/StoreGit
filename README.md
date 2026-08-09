@@ -845,14 +845,14 @@ Building something with StoreGit? Open a PR to add it to this list.
 
 ## Changelog
 
-### v3.0.0
+### v1.2.0
 
 - **Folders** — `POST /api/mkdir`, `DELETE /api/rmdir`, folder-aware `POST /api/move`; folders are a name list plus a `dir` field per file, both stored in the repo's index JSON; no GitHub directories or marker files (`.gitkeep`, `.storegit`) are created; `GET /api/files` now returns `{ files, folders }` instead of a bare array
 - **`GET /api/files` aggregates all repos when `repoIdx` is omitted** — previously omitting it silently returned only the active repo; now it fetches every connected repo in parallel and returns a merged, tagged result (`repoIdx`/`repoLabel` on each file and folder, plus a `repos` summary). Pass `repoIdx` explicitly to get the original single-repo shape
 - **API keys now git-only** — removed all KV storage for keys; removed `POST /api/apikeys/migrate` entirely (no longer needed — there is nothing to migrate from). Keys are written to the registry repo (lookup index) and the user's own repo (authoritative copy) on creation, with automatic rollback if either write fails
 - **`errRes` helper added** — every GitHub-API-backed route (`mkdir`, `rmdir`, `move`, and others) now returns a proper JSON error with the right status code instead of an unhandled exception surfacing as a generic 500
 
-### v2.0.0
+### v1.1.0
 
 - **API key system** — `sgk_<43 Base64URL chars>` (256-bit CSPRNG, bias-free rejection sampling); SHA-256 hashed in KV under `apikey:sha256:<hex>`; raw key encrypted with AES-GCM in user record for revocation; per-origin CORS restriction; 120 req/min per-key rate limit; max 10 keys per account
 - **Global security middleware** (`functions/_middleware.js`) — enforces security headers, HTTPS redirect, bad user-agent blocking, 600 req/min per-IP rate limit, method allowlist, path-traversal rejection, scanner probe blocking on every request before any route handler
@@ -865,6 +865,6 @@ Building something with StoreGit? Open a PR to add it to this list.
 - **API key reverse index** — `apikeyid:<username>:<keyId>` → raw KV key stored on create; O(1) lookup on revoke (no KV list scan)
 - **Unicode-safe registry writes** — `btoa()` replaced with `b64urlEnc(ENC.encode())` in `writeReg`, `readReg`, and `readIndex`; eliminates 502 errors when AES-GCM ciphertext contains non-Latin-1 bytes
 
-### v1.x
+### v1.0.0
 
 Initial release — upload, download, delete, chunked upload, multi-repo, share links.
