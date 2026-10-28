@@ -1196,22 +1196,162 @@ async function deleteRegular(sess, filename, sha) {
   );
   if (!res.ok) throw new Error('delete_fail');
 }
+
+// ── Public image embed: GET /api/raw/<shortId> ───────────────────────────────
+// Lets another site (e.g. MiutChat announcements) use a StoreGit share link as <img src>.
+// Differences from /api/dl: resolves the short id itself (one KV read), raster images only,
+// size-capped, sends CORP/CORS so cross-origin <img> works, and is cached at the edge so
+// repeat views never touch KV/GitHub. Links stay revocable: expiry is enforced and the edge
+// TTL never outlives the link.
+const RAW_IMG_EXT   = new Set(['png','jpg','jpeg','gif','webp','avif']);   // no svg/html on purpose
+const RAW_MAX_BYTES = 8 * 1024 * 1024;
+const RAW_EDGE_TTL  = 86400;
+const RAW_ID_RE     = /^[A-Za-z0-9_-]{3,8}$/;
+function rawHeaders(extra = {}) {
+  return {
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'Cross-Origin-Resource-Policy': 'cross-origin',
+    'Access-Control-Allow-Origin': '*',
+    ...extra,
+  };
+}
+const rawErr = (status, msg) => new Response(JSON.stringify({ error: msg }), {
+  status, headers: rawHeaders({ 'Content-Type': 'application/json', 'Cache-Control': status === 404 ? 'public, max-age=60' : 'no-store' }),
+});
+async function serveRawImage(request, env, secret, id, waitUntil) {
+  if (!RAW_ID_RE.test(id)) return rawErr(404, 'Not found');
+  const cache = (typeof caches !== 'undefined' && caches.default) ? caches.default : null;
+  const cacheKey = new Request(new URL('/api/raw/' + id, request.url).toString(), { method: 'GET' });
+  if (cache) { const hit = await cache.match(cacheKey); if (hit) return hit; }
+
+  const ip = getIP(request);
+  if (await checkRate(`raw:${ip}`, 240, env)) return rawErr(429, 'Too many requests');
+
+  const kv = env.RATE_LIMIT_KV || null;
+  if (!kv) return rawErr(503, 'Short links unavailable');
+  let entry = null;
+  try { const raw = await kv.get('sl:' + id); if (raw) entry = JSON.parse(raw); } catch {}
+  if (!entry?.tok) return rawErr(404, 'Not found');
+  if (entry.exp && Date.now() > new Date(entry.exp).getTime()) return rawErr(410, 'Link expired');
+
+  const data = await verifyShareToken(entry.tok, secret);
+  if (!data) return rawErr(403, 'Invalid link');
+  const ext = String(data.displayName || data.filename || '').split('.').pop().toLowerCase();
+  if (!RAW_IMG_EXT.has(ext)) return rawErr(415, 'Only raster images can be embedded');
+  if ((data.size || 0) > RAW_MAX_BYTES) return rawErr(413, 'Image too large to embed');
+
+  const res = await serveSharedFile(request, env, secret, data, false, RAW_MAX_BYTES);
+  if (!res.ok) return rawErr(res.status === 413 ? 413 : (res.status === 404 ? 404 : 502), 'Unavailable');
+  const mime = res.headers.get('Content-Type') || '';
+  if (!mime.startsWith('image/')) return rawErr(415, 'Only raster images can be embedded');
+
+  const remaining = data.exp === 0 ? Infinity : Math.floor((data.exp - Date.now()) / 1000);
+  const edgeTtl = Math.max(0, Math.min(RAW_EDGE_TTL, remaining));
+  const out = new Response(res.body, { status: 200, headers: rawHeaders({
+    'Content-Type': mime,
+    'Content-Disposition': res.headers.get('Content-Disposition') || 'inline',
+    ...(res.headers.get('Content-Length') ? { 'Content-Length': res.headers.get('Content-Length') } : {}),
+    'Cache-Control': `public, max-age=${Math.min(3600, edgeTtl)}, s-maxage=${edgeTtl}, stale-while-revalidate=0`,
+  }) });
+  if (cache && edgeTtl > 0) {
+    const p = cache.put(cacheKey, out.clone()).catch(() => {});
+    if (typeof waitUntil === 'function') waitUntil(p); else await p;
+  }
+  return out;
+}
+// Streams a share-token's file from the owner's GitHub repo. Shared by /api/dl and /api/raw/<id>.
+// maxBytes lets callers (raw) refuse large files before any bytes are streamed.
+async function serveSharedFile(request, env, secret, data, isDownload, maxBytes = Infinity) {
+  const tooLarge = () => new Response(JSON.stringify({ error: 'File too large' }), { status: 413, headers: { ...SEC, 'Content-Type': 'application/json' } });
+  const rec = await getUser(data.username, env);
+  if (!rec) return fail(request, 404);
+  const { content: user } = rec;
+  let ghToken;
+  try { ghToken = await aesDecrypt(user.encGhToken, secret, `user-token:${user.username}`); }
+  catch { return fail(request, 500); }
+  const repos    = getUserRepos(user);
+  const repoIdx  = typeof data.repoIdx === 'number' ? data.repoIdx : 0;
+  const repo     = repos[repoIdx] || repos[0];
+  const { ghOwner, ghRepo, ghBranch, folder } = repo;
+  const safe     = sanitize(data.filename);
+  if (!safe) return fail(request, 400);
+  const fakeSess = { ghToken, ghOwner, ghRepo, ghBranch, folder };
+  let manifest   = null, serveAs = safe;
+  try {
+    const { data: idx } = await readIndex(fakeSess);
+    if (idx[safe]) serveAs = idx[safe].originalName || unwrapName(safe);
+    else serveAs = unwrapName(safe);
+    if (idx[safe]?.totalChunks) {
+      const mRes = await fetch(`https://api.github.com/repos/${ghOwner}/${ghRepo}/contents/${manifestP(folder,safe)}?ref=${ghBranch}`, { headers: ghH(ghToken) });
+      if (mRes.ok) { const mData = await mRes.json(); manifest = JSON.parse(atob(mData.content.replace(/\s/g,''))); }
+    }
+  } catch {}
+  if (manifest && manifest.totalSize > maxBytes) return tooLarge();
+  if (manifest) {
+    const authHeader = { Authorization:`token ${ghToken}`, 'User-Agent':'StoreGit/1' };
+    const dlWindow = Math.max(1, PARALLEL_DL_CHUNKS);
+    const fetchChunkDl = async (i) => {
+      const chunkMeta   = manifest.chunks?.[i];
+      const chunkOwner  = chunkMeta?.ghOwner  || ghOwner;
+      const chunkRepo   = chunkMeta?.ghRepo   || ghRepo;
+      const chunkBranch = chunkMeta?.ghBranch || ghBranch;
+      const chunkFolder = chunkMeta?.folder   || folder;
+      const chunkUrl    = `https://raw.githubusercontent.com/${chunkOwner}/${chunkRepo}/${chunkBranch}/${chunkPath(chunkFolder, safe, i)}`;
+      const res = await fetch(chunkUrl, { headers: authHeader });
+      if (!res.ok) throw new Error(`chunk_${i}_missing`);
+      const buf = await res.arrayBuffer();
+      if (chunkMeta?.blobSha) {
+        const actual = await gitBlobSha(buf);
+        if (actual !== chunkMeta.blobSha) throw new Error(`chunk_${i}_corrupt`);
+      }
+      return new Uint8Array(buf);
+    };
+    const stream = new ReadableStream({
+      async start(controller) {
+        try {
+          const total   = manifest.totalChunks;
+          const pending = new Map();
+          for (let i = 0; i < Math.min(dlWindow, total); i++) pending.set(i, fetchChunkDl(i));
+          for (let i = 0; i < total; i++) {
+            const data = await pending.get(i);
+            pending.delete(i);
+            const next = i + dlWindow;
+            if (next < total) pending.set(next, fetchChunkDl(next));
+            controller.enqueue(data);
+          }
+          controller.close();
+        } catch (e) { controller.error(e); }
+      },
+    });
+    return new Response(stream, { status:200, headers: { ...SEC, 'Content-Type': safeMime(serveAs), 'Content-Disposition': contentDisposition(serveAs, isDownload), 'Content-Length': String(manifest.totalSize), 'Accept-Ranges':'none' } });
+  }
+  const rawUrl = `https://raw.githubusercontent.com/${ghOwner}/${ghRepo}/${ghBranch}/${folder}/${encodeURIComponent(safe)}`;
+  let ghRes;
+  try { ghRes = await fetch(rawUrl, { headers:{ Authorization:`token ${ghToken}`, 'User-Agent':'StoreGit/1' } }); }
+  catch { return fail(request, 502); }
+  if (ghRes.status===404) return fail(request, 404);
+  if (!ghRes.ok) return fail(request, 502);
+  const len = ghRes.headers.get('Content-Length') || '';
+  if (len && Number(len) > maxBytes) { try { ghRes.body?.cancel(); } catch {} return tooLarge(); }
+  return new Response(ghRes.body, { status:200, headers: { ...SEC, 'Content-Type': safeMime(serveAs), 'Content-Disposition': contentDisposition(serveAs, isDownload), ...(len?{'Content-Length':len}:{}), 'Accept-Ranges':'bytes' } });
+}
 const MIMES = {
   pdf:'application/pdf', doc:'application/msword',
   docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   xls:'application/vnd.ms-excel', xlsx:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   ppt:'application/vnd.ms-powerpoint', pptx:'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   txt:'text/plain;charset=utf-8', csv:'text/plain;charset=utf-8', md:'text/plain;charset=utf-8', rtf:'application/rtf',
-  jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', gif:'image/gif', webp:'image/webp', bmp:'image/bmp',
+  jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', gif:'image/gif', webp:'image/webp', bmp:'image/bmp', avif:'image/avif',
   mp3:'audio/mpeg', wav:'audio/wav', ogg:'audio/ogg', flac:'audio/flac', m4a:'audio/mp4', aac:'audio/aac',
   mp4:'video/mp4', webm:'video/webm', mov:'video/quicktime', avi:'video/x-msvideo', mkv:'video/x-matroska',
   zip:'application/zip', gz:'application/gzip', tar:'application/x-tar', '7z':'application/x-7z-compressed', rar:'application/vnd.rar',
   json:'text/plain;charset=utf-8', yaml:'text/plain;charset=utf-8', yml:'text/plain;charset=utf-8',
 };
 const safeMime = name => MIMES[name.split('.').pop()?.toLowerCase()||''] || 'application/octet-stream';
-export async function onRequest({ request, env, params }) {
+export async function onRequest({ request, env, params, waitUntil }) {
   try {
-    return await _handleRequest({ request, env, params });
+    return await _handleRequest({ request, env, params, waitUntil });
   } catch (err) {
     const msg = (err instanceof Error) ? err.message : String(err);
     console.error('[StoreGit] Unhandled error:', msg, err?.stack || '');
@@ -1221,7 +1361,7 @@ export async function onRequest({ request, env, params }) {
     );
   }
 }
-async function _handleRequest({ request, env, params }) {
+async function _handleRequest({ request, env, params, waitUntil }) {
   const method = request.method.toUpperCase();
   const route  = (params.path || []).join('/');
   // API key auth only on real requests, not OPTIONS preflights
@@ -1248,6 +1388,7 @@ async function _handleRequest({ request, env, params }) {
           { method: 'POST',   path: '/api/login' },
           { method: 'POST',   path: '/api/reset-password' },
           { method: 'GET',    path: '/api/dl?tok=<token>' },
+          { method: 'GET',    path: '/api/raw/<shortId>' },
         ],
         authenticated: [
           { method: 'POST',   path: '/api/logout',          auth: ['session'] },
@@ -1416,6 +1557,9 @@ async function _handleRequest({ request, env, params }) {
     }
     return jsonRes(request, { ok:true }, 200, { 'Set-Cookie': buildSetCookie(request, '', 0) });
   }
+  if (route.startsWith('raw/') && (method === 'GET' || method === 'HEAD')) {
+    return serveRawImage(request, env, secret, route.slice(4), waitUntil);
+  }
   if (route === 'dl' && method === 'GET') {
     const sp       = new URL(request.url).searchParams;
     const tok      = sp.get('tok') || '';
@@ -1433,75 +1577,7 @@ async function _handleRequest({ request, env, params }) {
       const page = buildSharePage(data.filename, data.displayName || data.filename, data.size || 0, data.exp === 0 ? null : new Date(data.exp).toISOString(), tok, spNonce);
       return new Response(page, { status:200, headers:{'Content-Type':'text/html;charset=utf-8','X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'no-referrer','Cache-Control':'no-store','Content-Security-Policy':`default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${spNonce}'; img-src 'self'; media-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none';`} });
     }
-    const rec = await getUser(data.username, env);
-    if (!rec) return fail(request, 404);
-    const { content: user } = rec;
-    let ghToken;
-    try { ghToken = await aesDecrypt(user.encGhToken, secret, `user-token:${user.username}`); }
-    catch { return fail(request, 500); }
-    const repos    = getUserRepos(user);
-    const repoIdx  = typeof data.repoIdx === 'number' ? data.repoIdx : 0;
-    const repo     = repos[repoIdx] || repos[0];
-    const { ghOwner, ghRepo, ghBranch, folder } = repo;
-    const safe     = sanitize(data.filename);
-    if (!safe) return fail(request, 400);
-    const fakeSess = { ghToken, ghOwner, ghRepo, ghBranch, folder };
-    let manifest   = null, serveAs = safe;
-    try {
-      const { data: idx } = await readIndex(fakeSess);
-      if (idx[safe]) serveAs = idx[safe].originalName || unwrapName(safe);
-      else serveAs = unwrapName(safe);
-      if (idx[safe]?.totalChunks) {
-        const mRes = await fetch(`https://api.github.com/repos/${ghOwner}/${ghRepo}/contents/${manifestP(folder,safe)}?ref=${ghBranch}`, { headers: ghH(ghToken) });
-        if (mRes.ok) { const mData = await mRes.json(); manifest = JSON.parse(atob(mData.content.replace(/\s/g,''))); }
-      }
-    } catch {}
-    if (manifest) {
-      const authHeader = { Authorization:`token ${ghToken}`, 'User-Agent':'StoreGit/1' };
-      const dlWindow = Math.max(1, PARALLEL_DL_CHUNKS);
-      const fetchChunkDl = async (i) => {
-        const chunkMeta   = manifest.chunks?.[i];
-        const chunkOwner  = chunkMeta?.ghOwner  || ghOwner;
-        const chunkRepo   = chunkMeta?.ghRepo   || ghRepo;
-        const chunkBranch = chunkMeta?.ghBranch || ghBranch;
-        const chunkFolder = chunkMeta?.folder   || folder;
-        const chunkUrl    = `https://raw.githubusercontent.com/${chunkOwner}/${chunkRepo}/${chunkBranch}/${chunkPath(chunkFolder, safe, i)}`;
-        const res = await fetch(chunkUrl, { headers: authHeader });
-        if (!res.ok) throw new Error(`chunk_${i}_missing`);
-        const buf = await res.arrayBuffer();
-        if (chunkMeta?.blobSha) {
-          const actual = await gitBlobSha(buf);
-          if (actual !== chunkMeta.blobSha) throw new Error(`chunk_${i}_corrupt`);
-        }
-        return new Uint8Array(buf);
-      };
-      const stream = new ReadableStream({
-        async start(controller) {
-          try {
-            const total   = manifest.totalChunks;
-            const pending = new Map();
-            for (let i = 0; i < Math.min(dlWindow, total); i++) pending.set(i, fetchChunkDl(i));
-            for (let i = 0; i < total; i++) {
-              const data = await pending.get(i);
-              pending.delete(i);
-              const next = i + dlWindow;
-              if (next < total) pending.set(next, fetchChunkDl(next));
-              controller.enqueue(data);
-            }
-            controller.close();
-          } catch (e) { controller.error(e); }
-        },
-      });
-      return new Response(stream, { status:200, headers: { ...SEC, 'Content-Type': safeMime(serveAs), 'Content-Disposition': contentDisposition(serveAs, isDownload), 'Content-Length': String(manifest.totalSize), 'Accept-Ranges':'none' } });
-    }
-    const rawUrl = `https://raw.githubusercontent.com/${ghOwner}/${ghRepo}/${ghBranch}/${folder}/${encodeURIComponent(safe)}`;
-    let ghRes;
-    try { ghRes = await fetch(rawUrl, { headers:{ Authorization:`token ${ghToken}`, 'User-Agent':'StoreGit/1' } }); }
-    catch { return fail(request, 502); }
-    if (ghRes.status===404) return fail(request, 404);
-    if (!ghRes.ok) return fail(request, 502);
-    const len = ghRes.headers.get('Content-Length') || '';
-    return new Response(ghRes.body, { status:200, headers: { ...SEC, 'Content-Type': safeMime(serveAs), 'Content-Disposition': contentDisposition(serveAs, isDownload), ...(len?{'Content-Length':len}:{}), 'Accept-Ranges':'bytes' } });
+    return serveSharedFile(request, env, secret, data, isDownload);
   }
   if (route === 'reset-password' && method === 'POST') {
     const ip = getIP(request);
